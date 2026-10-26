@@ -172,8 +172,10 @@ jq .env ~/.claude/settings.json
 
 Verified on 2026-10-24 in throwaway herdr panes: a named agent on each account was replaced with the same name,
 flags, live model, effort and account, and the new agent read its handoff. Live takeovers happened the same day for
-a Sonnet worker (`vid-extract`) and for the Opus session that built these hooks. The decision log and lineage folders
-(2026-10-26) are covered by the offline tests; a live takeover with them is still to be run.
+a Sonnet worker (`vid-extract`) and for the Opus session that built these hooks. The decision log and lineage folders were
+verified live on 2026-10-26 after installing on all three machines: a Sonnet agent in a throwaway pane on account 2
+logged two decisions and wrote its handoff, and its replacement got the same lineage through `HANDOFF_LINEAGE`, read
+the log and then `gen-01.md`, and found the `## Generation 2` line the hook had added.
 
 ## Known gaps
 
