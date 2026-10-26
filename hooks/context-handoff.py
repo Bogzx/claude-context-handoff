@@ -12,10 +12,15 @@ flags, live model and effort, and account (CLAUDE_CONFIG_DIR, as set by claude-a
 prompts it to continue from the (archived) handoff.
 Outside herdr, SessionStart (clear/compact) injects the handoff into the fresh context.
 
+Each piece of work gets a lineage folder that the agents taking it over share,
+~/.claude/handoffs/<project>/<pane>-<started>-<session>/: handoff.md (the current state,
+rewritten each time), decisions.md (an append-only decision log across all of them) and
+gen-NN.md (consumed handoffs). A takeover passes the folder on through HANDOFF_LINEAGE; a
+/clear or compaction that consumes a pending handoff keeps it; any other start begins a new
+one at its first notice.
+
 Thresholds can be overridden per project in that project's .claude/settings.local.json
-"env" block. Handoffs live in ~/.claude/handoffs/, one file per project directory and
-herdr pane (several agents often share one worktree); respawns are logged to
-~/.claude/handoffs/respawn.log.
+"env" block. Respawns are logged to ~/.claude/handoffs/respawn.log.
 """
 import json
 import os
@@ -47,6 +52,7 @@ SOFT = tokens_env("HANDOFF_SOFT_TOKENS", 400_000)
 URGENT = tokens_env("HANDOFF_URGENT_TOKENS", COMPACT - 50_000)
 INLINE_LIMIT = 9_000  # Claude Code caps injected context at 10,000 characters
 ROOT = Path.home() / ".claude" / "handoffs"
+SEALED = ".decisions.sealed"  # the log as of the last handoff, for the append-only check
 POLICY = "Context handoff policy (configured by the user in ~/.claude/settings.json)"
 IN_HERDR = os.environ.get("HERDR_ENV") == "1" and bool(os.environ.get("HERDR_PANE_ID"))
 
@@ -63,12 +69,33 @@ started, with how it was verified (exact commands and results).
 4. Specs and key facts: exact file paths, functions, line numbers, interfaces, data shapes, \
 commands and config values the remaining work depends on. Structural detail rather than \
 paraphrase; reference files instead of pasting large content.
-5. Decisions: what was chosen and why, including user-approved choices that are settled.
-6. Ruled out: approaches and hypotheses already rejected, one line each with the reason.
-7. Open questions, risks and blockers, including decisions that belong to the user.
-8. Ideas: recommendations, suspicions and improvements noticed but not acted on.
-9. Next steps: an ordered list whose first item is concrete and can be started immediately.
-10. Verify first: the claims a fresh agent re-checks before building on them."""
+5. Open questions, risks and blockers, including decisions that belong to the user.
+6. Ideas: recommendations, suspicions and improvements noticed but not acted on.
+7. Next steps: an ordered list whose first item is concrete and can be started immediately.
+8. Verify first: the claims a fresh agent re-checks before building on them."""
+
+LOG_RULES = """\
+Decisions and ruled-out approaches go in the decision log at {log}, not in the handoff. The \
+log covers this piece of work across every agent that takes it over, and each new agent reads \
+it in full. It is append-only: earlier entries are never edited, shortened or removed, and a \
+decision that changes gets a new entry naming the one it replaces. One entry per decision, \
+numbered D1, D2, ... continuing from the last one: date and time, who decided (the user, \
+quoted verbatim, or the agent), what was chosen or ruled out, and why, with the evidence \
+behind a ruled-out approach. Before the handoff is written, the log holds every decision this \
+session made or learned: the user's instructions and choices, the agent's own design \
+decisions, and the approaches ruled out."""
+
+LOG_HEADER = """\
+# Decision log
+
+Started {started}. It covers this piece of work across every agent that takes it over, and \
+each new agent reads it in full. Append-only: entries are never edited, shortened or removed, \
+and a decision that changes gets a new entry naming the one it replaces. Each entry: D<n>, \
+date and time, who decided (the user, quoted verbatim, or the agent), what was chosen or ruled \
+out, and why.
+
+## Generation 1
+"""
 
 if IN_HERDR:
     AFTER = ("After writing it, the agent ends its turn. A fresh agent with the same settings "
@@ -83,11 +110,12 @@ else:
              "continues.")
 
 NEXT_PROMPT = (
-    "Context handoff: the previous agent in this pane reached its context threshold and "
-    "wrote a handoff to {path}. Read it in full, re-check the claims in its Verify first "
-    "section, then continue from its next steps. Continue only work the user already asked "
-    "for; if the work is complete or the next step needs the user's decision, summarize "
-    "where things stand and wait.")
+    "Context handoff: the previous agent in this pane reached its context threshold. Read "
+    "the decision log {log} in full, then its handoff {path}. Re-check the claims in the "
+    "handoff's Verify first section, then continue from its next steps, adding entries to the "
+    "decision log as decisions are made (append-only; the rules are at its top). Continue "
+    "only work the user already asked for; if the work is complete or the next step needs "
+    "the user's decision, summarize where things stand and wait.")
 
 # claude flags dropped when relaunching: session identity, the old initial prompt, and the
 # model/effort, which are re-added from the live session.
@@ -150,15 +178,21 @@ def clock(ts):
     return time.strftime("%H:%M", time.localtime(ts))
 
 
-def soft_message(tokens, handoff):
+def structure(lineage):
+    return f"{TEMPLATE}\n\n{LOG_RULES.format(log=lineage / 'decisions.md')}"
+
+
+def soft_message(tokens, lineage):
     return (f"{POLICY}: this conversation is at {tokens // 1000}K tokens, past the "
             f"{SOFT // 1000}K handoff threshold; auto-compaction runs at {COMPACT // 1000}K. "
             "The handoff belongs at the next logical stopping point, once the current unit of "
             "work is complete and verified, not in the middle of it. It is written to "
-            f"{handoff}, replacing any older version. {AFTER}\n\n{TEMPLATE}")
+            f"{lineage / 'handoff.md'}, replacing any older version. {AFTER}\n\n"
+            f"{structure(lineage)}")
 
 
-def urgent_message(tokens, handoff, state):
+def urgent_message(tokens, lineage, state):
+    handoff = lineage / "handoff.md"
     if "soft" in state and written_since(handoff, state["soft"]):
         status = (f"The handoff was last written at {clock(handoff.stat().st_mtime)} and does "
                   "not cover work since then.")
@@ -166,14 +200,67 @@ def urgent_message(tokens, handoff, state):
         status = "No handoff has been written yet."
     return (f"{POLICY}: this conversation is at {tokens // 1000}K tokens and auto-compaction "
             f"runs at {COMPACT // 1000}K. {status} The handoff at {handoff} is due now, before "
-            f"the current task continues, so that it survives compaction. {AFTER}\n\n{TEMPLATE}")
+            "the current task continues, so that it survives compaction. "
+            f"{AFTER}\n\n{structure(lineage)}")
 
 
-def archive(handoff):
-    target = ROOT / "archive" / f"{handoff.stem}.{time.strftime('%Y%m%d-%H%M%S')}.md"
-    target.parent.mkdir(parents=True, exist_ok=True)
-    handoff.rename(target)
-    return target
+def slot():
+    """Where this session runs: its herdr pane (agents often share a worktree), else local."""
+    return os.environ["HERDR_PANE_ID"].replace(":", "-") if IN_HERDR else "local"
+
+
+def new_lineage(base, session):
+    # The session that starts it makes the name unique (a session starts at most one).
+    lineage = base / f"{slot()}-{time.strftime('%Y%m%d-%H%M%S')}-{session[:8]}"
+    lineage.mkdir(parents=True, exist_ok=True)
+    (lineage / "decisions.md").write_text(
+        LOG_HEADER.format(started=time.strftime("%Y-%m-%d %H:%M")))
+    seal(lineage)
+    return lineage
+
+
+def seal(lineage):
+    shutil.copyfile(lineage / "decisions.md", lineage / SEALED)
+
+
+def log_problem(lineage):
+    """What keeps the decision log from being ready for the next agent, if anything."""
+    try:
+        sealed = (lineage / SEALED).read_text(errors="replace").rstrip()
+    except OSError:
+        return None
+    try:
+        log = (lineage / "decisions.md").read_text(errors="replace")
+    except OSError:
+        log = ""
+    if not log.startswith(sealed):
+        return (f"no longer starts with its content as of the last handoff, kept in "
+                f"{lineage / SEALED}, so earlier entries were edited or removed. They are "
+                "restored from that copy, and a change to one goes in a new entry that names "
+                "the entry it replaces.")
+    if log.rstrip() == sealed:
+        return ("has no entries from this session. Every decision this session made or "
+                "learned goes in it, by the rules at its top; if there were none, one line "
+                "says so.")
+    return None
+
+
+def pending(base):
+    """The newest unconsumed handoff from this pane (outside herdr: from this project)."""
+    found = sorted(base.glob(f"{slot()}-*/handoff.md"), key=lambda p: p.stat().st_mtime)
+    return found[-1] if found else None
+
+
+def consume(lineage, how):
+    """Archive the pending handoff as the next generation and mark the new one in the log."""
+    n = len(list(lineage.glob("gen-*.md"))) + 1
+    gen = lineage / f"gen-{n:02d}.md"
+    (lineage / "handoff.md").rename(gen)
+    with open(lineage / "decisions.md", "a") as f:
+        f.write(f"\n## Generation {n + 1}: {how}, {time.strftime('%Y-%m-%d %H:%M')}, "
+                f"from {gen.name}\n")
+    seal(lineage)
+    return gen
 
 
 def claude_pid():
@@ -211,15 +298,16 @@ def relaunch_args(argv, model, effort):
     return out + (["--model", model] if model else []) + (["--effort", effort] if effort else [])
 
 
-def start_respawn(data, handoff, model):
+def start_respawn(data, lineage, model):
     pid = claude_pid()
     if not pid:
         return False
     argv = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")[1:]
     effort = (data.get("effort") or {}).get("level") or os.environ.get("CLAUDE_EFFORT")
-    job = {"pane": os.environ["HERDR_PANE_ID"], "pid": pid, "handoff": str(handoff),
+    env = {k: os.environ[k] for k in ("CLAUDE_CONFIG_DIR",) if os.environ.get(k)}
+    job = {"pane": os.environ["HERDR_PANE_ID"], "pid": pid, "dir": str(lineage),
            "args": relaunch_args([a.decode() for a in argv if a], model, effort),
-           "env": {k: os.environ[k] for k in ("CLAUDE_CONFIG_DIR",) if os.environ.get(k)}}
+           "env": {"HANDOFF_LINEAGE": str(lineage), **env}}
     subprocess.Popen([sys.executable, os.path.abspath(__file__), "--respawn", json.dumps(job)],
                      stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                      stderr=subprocess.DEVNULL, start_new_session=True)
@@ -277,12 +365,12 @@ def respawn(job):
                 break
             time.sleep(1)
         time.sleep(1)
-        handoff = Path(job["handoff"])
-        saved = archive(handoff) if handoff.exists() else None
-        if not saved:
-            return fail(f"{handoff} vanished before the respawn")
+        lineage = Path(job["dir"])
+        if not (lineage / "handoff.md").exists():
+            return fail(f"{lineage / 'handoff.md'} vanished before the respawn")
+        saved = consume(lineage, f"takeover by {name or 'an unnamed agent'} in herdr pane {pane}")
         # Typed into the pane's shell, like the original launch; the env prefix keeps the
-        # account that claude-acc selected for this session only.
+        # account that claude-acc selected, and the lineage, for this session only.
         prefix = "".join(f"{k}={shlex.quote(v)} " for k, v in job.get("env", {}).items())
         command = prefix + " ".join(shlex.quote(a) for a in ["claude", *job["args"]])
         herdr("pane", "run", pane, command)
@@ -296,24 +384,34 @@ def respawn(job):
         time.sleep(2)  # let the input box settle before prompting
         if name:
             herdr("agent", "rename", pane, name)
-        herdr("agent", "prompt", pane, NEXT_PROMPT.format(path=saved))
+        herdr("agent", "prompt", pane,
+              NEXT_PROMPT.format(log=lineage / "decisions.md", path=saved))
         say(f"respawned {name or '(unnamed)'}: {command}; handoff {saved}")
     except Exception as e:  # never leave the pane silently empty
         fail(repr(e))
 
 
-def threshold(event, data, handoff, state_path):
+def threshold(event, data, base, state_path):
     tokens, model = last_call(data.get("transcript_path") or "")
     state = load(state_path)
-    handoff = Path(state.setdefault("path", str(handoff)))  # fixed once per session
+    if "path" in state:  # from the flat layout before lineages: notify again with the new paths
+        state = {}
+    lineage = Path(state["dir"]) if state.get("dir") else None  # fixed once per session
     now = time.time()
 
     def save():
         state_path.parent.mkdir(parents=True, exist_ok=True)
         state_path.write_text(json.dumps(state))
 
-    if (event == "Stop" and IN_HERDR and "soft" in state and "respawned" not in state
-            and written_since(handoff, state["soft"])):
+    written = (lineage is not None and "soft" in state
+               and written_since(lineage / "handoff.md", state["soft"]))
+    problem = event == "Stop" and written and not state.get("stop_log") and log_problem(lineage)
+    if problem:
+        state["stop_log"] = True
+        save()
+        return {"decision": "block", "systemMessage": "Handoff written; the decision log is not.",
+                "reason": f"{POLICY}: the decision log {lineage / 'decisions.md'} {problem}"}
+    if event == "Stop" and IN_HERDR and written and "respawned" not in state:
         tasks = data.get("background_tasks") or []
         if tasks:  # exiting would kill them; the Stop after the last one ends retries
             waiting = (f"Handoff written; the respawn waits for {len(tasks)} background "
@@ -334,70 +432,92 @@ def threshold(event, data, handoff, state_path):
                 "last task is gone.")}
         state["respawned"] = now
         save()
-        if start_respawn(data, handoff, model):
+        if start_respawn(data, lineage, model):
             return {"systemMessage": "Handoff written: a fresh agent with the same settings "
                                      "takes over this pane in a few seconds."}
     if event == "Stop" and data.get("stop_hook_active"):
         return None
-    if tokens >= URGENT and "urgent" not in state:
-        stage, message = "urgent", urgent_message(tokens, handoff, state)
+    due = ("urgent" if tokens >= URGENT and "urgent" not in state
+           else "soft" if tokens >= SOFT and "soft" not in state else None)
+    if due and lineage is None:
+        lineage = new_lineage(base, data.get("session_id") or "unknown")
+        state["dir"] = str(lineage)
+    if due == "urgent":
+        stage, message = "urgent", urgent_message(tokens, lineage, state)
         state.setdefault("soft", now)
         state["urgent"] = now
-    elif tokens >= SOFT and "soft" not in state:
-        stage, message = "soft", soft_message(tokens, handoff)
+    elif due == "soft":
+        stage, message = "soft", soft_message(tokens, lineage)
         state["soft"] = now
         if event == "Stop":
             message += "\n\nThe turn is ending, which is such a stopping point."
     elif event == "Stop":
         stage = "urgent" if "urgent" in state else "soft" if "soft" in state else None
-        if not stage or written_since(handoff, state[stage]) or state.get(f"stop_{stage}"):
+        if (not stage or written_since(lineage / "handoff.md", state[stage])
+                or state.get(f"stop_{stage}")):
             return None
         limit = URGENT if stage == "urgent" else SOFT
         message = (f"{POLICY}: the handoff requested at {limit // 1000}K tokens has not been "
-                   f"written to {handoff}, and the turn is ending, which is the stopping point "
-                   f"it was waiting for. It is due now, with the structure from the earlier "
-                   f"notice. {AFTER}")
+                   f"written to {lineage / 'handoff.md'}, and the turn is ending, which is the "
+                   "stopping point it was waiting for. It is due now, with the structure from "
+                   f"the earlier notice. {AFTER}")
     else:
         return None
     if event == "Stop":
         state[f"stop_{stage}"] = True
     save()
-    notice = f"Context at {tokens // 1000}K tokens: {stage} handoff requested ({handoff.name})"
+    notice = f"Context at {tokens // 1000}K tokens: {stage} handoff requested ({lineage.name})"
     if event == "Stop":
         return {"decision": "block", "reason": message, "systemMessage": notice}
     return {"systemMessage": notice,
             "hookSpecificOutput": {"hookEventName": event, "additionalContext": message}}
 
 
-def session_start(source, handoff, state_path):
+def session_start(source, base, state_path):
     for old in (ROOT / "state").glob("*.json"):
         if old.stat().st_mtime < time.time() - 7 * 86400:
             old.unlink(missing_ok=True)
-    if source == "compact":
-        handoff = Path(load(state_path).get("path", handoff))
-        state_path.unlink(missing_ok=True)  # re-arm the thresholds for the shrunk context
-    if not handoff.exists():
+    lineage = None
+    if source == "compact":  # the same session: keep its lineage, re-arm the thresholds
+        lineage = load(state_path).get("dir")
+        handoff = Path(lineage) / "handoff.md" if lineage else None
+    elif source == "startup" and os.environ.get("HANDOFF_LINEAGE"):
+        lineage, handoff = os.environ["HANDOFF_LINEAGE"], None  # a takeover; it prompts next
+    elif source in ("startup", "clear"):
+        handoff = pending(base)
+        if handoff and source == "clear":
+            lineage = str(handoff.parent)
+    else:
+        return None
+    if lineage:
+        state_path.parent.mkdir(parents=True, exist_ok=True)
+        state_path.write_text(json.dumps({"dir": lineage}))
+    else:
+        state_path.unlink(missing_ok=True)
+    if not handoff or not handoff.exists():
         return None
     written = time.strftime("%Y-%m-%d %H:%M", time.localtime(handoff.stat().st_mtime))
     if source == "startup":
         context = (f"An unread handoff from an earlier session in this project, written "
                    f"{written}, is at {handoff}. It applies only if this session continues "
                    "that work.")
-    elif source in ("clear", "compact"):
+    else:
         text = handoff.read_text(errors="replace")
-        saved = archive(handoff)
+        saved = consume(handoff.parent, "after /clear" if source == "clear" else
+                        "after compaction")
         after = ("; work after that time appears only in the compaction summary"
                  if source == "compact" else "")
         context = (f"Handoff from the previous context of this project, written {written}"
                    f"{after}. Its claims are re-checked before building on them. Archived "
-                   f"copy: {saved}.")
+                   f"copy: {saved}. The decision log for this work, "
+                   f"{handoff.parent / 'decisions.md'}, is read in full too, and gets new "
+                   "entries as decisions are made (append-only; the rules are at its top).")
         if len(context) + len(text) + 2 <= INLINE_LIMIT:
             context += "\n\n" + text
         else:
-            context += (f" It is {len(text):,} characters, over the inline limit, so it is not "
-                        "shown here; reading that file in full comes before anything else.")
-    else:
-        return None
+            context += (f" The handoff is {len(text):,} characters, over the inline limit, so "
+                        "it is not shown here; reading that file in full comes before anything "
+                        "else.")
     return {"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": context}}
 
 
@@ -409,14 +529,12 @@ def main():
         return
     event = data.get("hook_event_name")
     project = os.environ.get("CLAUDE_PROJECT_DIR") or data.get("cwd") or os.getcwd()
-    if IN_HERDR:
-        project += "--" + os.environ["HERDR_PANE_ID"]
-    handoff = ROOT / (project.replace("/", "-").replace(":", "-") + ".md")
+    base = ROOT / project.strip("/").replace("/", "-").replace(":", "-")
     state_path = ROOT / "state" / f"{data.get('session_id') or 'unknown'}.json"
     if event == "SessionStart":
-        out = session_start(data.get("source"), handoff, state_path)
+        out = session_start(data.get("source"), base, state_path)
     else:
-        out = threshold(event, data, handoff, state_path)
+        out = threshold(event, data, base, state_path)
     if out:
         print(json.dumps(out))
 
