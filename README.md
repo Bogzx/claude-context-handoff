@@ -13,7 +13,7 @@ reads and adds to (see [Decision log](#decision-log)).
 `orch` (in `hooks/orch.py`) keeps a herdr orchestration moving across those takeovers: a run registered per
 orchestrator pane, one shared wait, parked workers and a watchdog timer (see [Orchestration runs](#orchestration-runs-orch)).
 
-Installed on dev1, dev2 and ob1 since 2026-10-24.
+In daily use on three machines since 2026-10-24.
 
 ## Stages
 
@@ -61,8 +61,8 @@ At the first Stop after the handoff has been written, the hook starts a detached
 The relaunch keeps the original command-line flags but drops the session identity (`--resume`, `--continue`,
 `--session-id`, `--fork-session`) and the old initial prompt. The model is taken from the transcript, so a `/model`
 switch carries over, and the effort comes from the hook input or `$CLAUDE_EFFORT`. The account carries over through
-`CLAUDE_CONFIG_DIR`, which `claude-acc N` sets for accounts above 1 (`pibo2`). It goes in as a prefix on the
-command only, so a later `pibo` in the same pane is not affected.
+`CLAUDE_CONFIG_DIR`, which `claude-acc N` sets for accounts above 1. It goes in as a prefix on the
+command only, so a later command in the same pane is not affected.
 
 Every takeover is logged in `~/.claude/handoffs/respawn.log` and `events.jsonl`. A failure is logged there too,
 raises a herdr notification and goes to the owner's notify command (see [Alerts](#alerts)). A postponed takeover is
@@ -93,8 +93,8 @@ Now each piece of work gets a lineage folder, and its decisions go in `decisions
 - What a new agent reads: the whole log while it is up to 30 KB. Past that, `decisions-index.md` (the first 160
   characters of every entry, written at each takeover) and the log from the generation that just finished, plus the
   one before it if both fit in 60 KB. Older entries are looked up by D-number. Reading every log in full had made each
-  new AlphaProve orchestrator start at 140–190K of its 400K tokens (177 KB log), and the bg3-ai log reached 587 KB.
-  So the first line of an entry has to say on its own what was decided and by whom.
+  new orchestrator of one large project start at 140–190K of its 400K tokens (177 KB log), and another project's
+  log reached 587 KB. So the first line of an entry has to say on its own what was decided and by whom.
 
 - One entry per decision, numbered D1, D2, … across generations: date and time, who decided (the user, quoted
   verbatim, or the agent), what was chosen or ruled out, and why, with the evidence for a ruled-out approach.
@@ -128,13 +128,15 @@ the whole fleet overnight (11.8 h), and "today's work is done" with three worker
 | `orch run start --until 09:00 --goal "..." --workers w17:pB7=builder,...` | Registers the run of the orchestrator in this pane (`--until` takes `HH:MM`, `YYYY-MM-DD HH:MM` or `+4h`). `run set`, `run stop` and `run show` change, end or show it. |
 | `orch wait` | The orchestrator's one background watcher. It returns when a worker's turn ended with nothing left running, a worker is blocked at a dialog, a pane lost its agent (3 min), a worker has waited 90 min on its own job, a `--check '<cmd>'` exits 0, or after the 30 min heartbeat. It prints one line per worker. An event is reported once: the next wait doesn't repeat it (`--reset` does). |
 | `orch park <pane> --reason "..." [--until HH:MM]` | Standby with a reason. It ends at the worker's next turn end or at `--until`. `orch unpark` ends it. |
-| `orch ask "<question>" [--option "Deploy" --danger deploy --option "Not yet"]` | Logs a question for the owner in the run and pushes it, with an id and the options the owner's app shows as buttons. `--danger` (`none`, `deploy`, `prod`, `destructive`) applies to the option before it. |
+| `orch ask "<question>" [--option "Deploy" --danger deploy --option "Not yet"]` | Logs a question for the owner in the run and pushes it, with an id and the options the owner's app shows as buttons. `--danger` (`none`, `deploy`, `prod`, `destructive`) applies to the option before it. `--kind plan` marks a new orchestrator's plan question (see orch new); it replaces the pane's open plan question. |
 | `orch answer <id> "<text>"` | Records the owner's answer and prompts the agent that asked. An answered question can't be answered again. |
 | `orch status [--json]`, `orch last <pane>` | The fleet, and a worker's last message and background tasks. `--json` also has the open questions, each agent's latest report and account, and pending account switches. |
-| `orch decisions [--pane P] [--json]` | The pane's newest decision log, parsed: id, time, who (user or agent), the user's quote, what (first sentence), why, and `superseded_by` when a later entry says "replaces D7", "instead of D7" or "supersedes D7". The user's decisions come first. |
-| `orch account [<pane> <N>] [--now \| --when-idle \| --at-handoff]`, `orch account --default N` | Which Claude account (`claude-acc N`) an agent runs on, and moving it to another one (see Accounts). |
+| `orch decisions [--pane P] [--json]` | The pane's newest decision log, parsed: id, time, who (user or agent), the user's quote, what, why (only from an explicit "Why:" or "because"; everything else stays in what), and `superseded_by` when a later entry says "replaces D7", "instead of D7" or "supersedes D7". In log order. |
+| `orch account [<pane> <N>] [--now \| --when-idle \| --at-handoff]`, `orch account --default N`, `orch account --name N NAME` | Which Claude account (`claude-acc N`) an agent runs on, and moving it to another one (see Accounts). |
 | `orch usage [--json] [--hours 24]`, `orch usage capture` | Account limits and tokens per agent (see Usage). |
 | `orch watchdog [--dry-run]` | One watchdog pass. A systemd user timer runs it every 5 minutes. |
+| `orch new --cwd DIR --goal "..." --until +8h [--model M] [--effort E] [--account N\|auto] [--plan-first] [--rules "..."] [--id ID] [--dry-run]` | Starts a new orchestrator on this machine (see New orchestrator). |
+| `orch serve`, `orch pair [--allow NODE] [--new]` | The HTTP gateway for the owner's phone app, and its pairing token (see Gateway). |
 
 Inside herdr, the Stop hook writes `~/.claude/handoffs/agents/<pane>.json` at every turn end, with the session, the
 background tasks still running and the last message. SessionStart writes it too. This is how `orch` tells a finished
@@ -155,10 +157,36 @@ minutes or has been at a dialog for 10. When the run's end time passes, it marks
 
 ### Alerts
 
-Everything goes to `~/.claude/handoffs/events.jsonl`, one JSON object per line (`time`, `host`, `kind`, `pane`,
-`title`, `body`, plus fields of the kind: `id` and `options` for `ask`, `report` for `report`, `account` and `when`
-for `account`). Alerts for the owner (a failed takeover or account switch, an `orch ask`, an orchestrator gone,
-blocked or not acting, a run that ended) also raise a herdr notification and run the notify command, if there is one:
+Everything goes to `~/.claude/handoffs/events.jsonl`, one JSON object per line: `time`, `host` (the hostname; the
+gateway's history shows the machine name instead), `kind`, `pane` (null when no agent is concerned), `title`, `body`,
+plus the fields of its kind:
+
+| Kind | Written when | `pane` | Extra fields | Alert |
+| --- | --- | --- | --- | --- |
+| `run-start`, `run-set`, `run-stop` | `orch run` changes a run | orchestrator | | |
+| `run-ended` | the watchdog finds the run past its end | orchestrator | | yes |
+| `orch-missing`, `orch-blocked` | the orchestrator pane has no agent, or sits at a dialog | orchestrator | | yes |
+| `nudge` | the watchdog prompts an idle orchestrator | orchestrator | | |
+| `orch-not-acting` | the same problem after several nudges, or the nudge could not be sent | orchestrator | | yes |
+| `ask` | `orch ask` or the MCP `ask_owner` | the agent that asks | `id`, `question`, `options` (`label`, `danger`), `question_kind` (`plan` or null) | yes |
+| `answer` | `orch answer` or the app answers | the agent that asked | `id` | |
+| `report` | the MCP `report` tool | the agent | `report` | |
+| `account` | a switch is queued, asked, resumed or done, or the default changes | the agent; null for the default | `account`; `when` (`handoff`, `idle`, `now`); `how` (`handoff`, `resume`) when a switch starts; `reason` (`spill`, `limit`) when the spill rule queued it; `session` after a resume | |
+| `account-failed`, `respawn-failed` | a switch or takeover failed | the agent | | yes |
+| `respawn` | a takeover started its fresh agent | the agent | | |
+| `respawn-dialog` | a takeover's or `orch new`'s new agent waits at a dialog (not for a start from the app, which has its `start` push) | the agent | `action` for `orch new` | yes |
+| `spill` | the spill rule is set, turned off, fires or clears | null | when it fires: `window`, `used`, `since` | when it fires |
+| `start` | a step of `orch new` or the gateway's `start` action is doing, ok or failed | the new orchestrator, once its tab exists | `action` (the start's id), `step`, `status`, `error`; the `pane` step also `folder`, `goal`, `by` (`cli`, `phone`) | when it fails |
+| `start-cancel` | a start was cancelled (the app's `start_cancel`, or "No" at its trust question) | the new orchestrator, or null | `action`, `by` | |
+| `trust` | the app answered a new orchestrator's folder-trust question | the new orchestrator | `action`, `choice` (`allow`, `deny`), `by` (the phone), `source` | |
+| `test` | `orch notify` | null | | yes |
+| `pair` | a phone pairs or unpairs with the gateway | null | | |
+| `action` | the gateway handles an app action | its agent or orchestrator, else null | `action` (its kind), `id`, `status` (`delivered`, `rejected`, `failed`), `error`, `source` (`app`, `relay`), `fields` (the action's other fields) | |
+| `push-failed` | a push could not be sent | the orchestrator, or null | | |
+| `push-token` | FCM refused a phone's token | null | | |
+| `relay-rejected` | a relay message does not open with this machine's key | null | | |
+
+The alerts for the owner also raise a herdr notification and run the notify command, if there is one:
 `$ORCH_NOTIFY_CMD`, else an executable `~/.claude/handoffs/notify`. It is called as `<command> <title> <body>` with
 `ORCH_EVENT_KIND` set and the whole event as JSON in `ORCH_EVENT`. That is where a phone push plugs in.
 `orch notify <title> <body>` sends a test.
@@ -174,7 +202,7 @@ as `orch`. It takes the agent's pane from `HERDR_PANE_ID` and offers no tools ou
 
   | Role | Fields |
   | --- | --- |
-  | orchestrator | `state` (`working`, `waiting_on_workers`, `waiting_on_owner`, `done`), `progress` {`done`, `total`, `label`}, `waiting_on` [{`who`, `what`, `eta`}], `next` [text], `roadmap` [{`id`, `title`, `status` (`done`, `doing`, `next`, `later`, `blocked`), `owner`, `eta`}], `risks` [text], `milestones` [{`kind` (`pr_merged`, `deploy`, `release`, `other`), `ref`, `url`}] |
+  | orchestrator | `state` (`working`, `waiting_on_workers`, `waiting_on_owner`, `done`), `progress` {`done`, `total`, `label`}, `waiting_on` [{`who`, `what`, `eta`}], `next` [text], `roadmap` [{`id`, `title`, `status` (`done`, `doing`, `next`, `later`, `blocked`), `owner`, `eta`, `why`}], `risks` [text], `milestones` [{`kind` (`pr_merged`, `deploy`, `release`, `other`), `ref`, `url`}], `suggestions` [text: messages the owner might send next] |
   | worker | `status` (`done`, `partial`, `blocked`), `tests` [{`cmd`, `passed`, `failed`}], `changed_files`, `needs_live_test`, `issues_for_others` [text] |
 
   `role` is taken from the pane's run (orchestrator or worker) unless the call sets it. A report that doesn't fit the
@@ -204,16 +232,42 @@ which shares everything with `~/.claude` except the login and `.claude.json`. Ea
 
 - `--at-handoff` (the default): the next takeover starts under account N. It costs nothing extra but may be hours
   away.
-- `--when-idle`: the watchdog does a `--now` switch the next time the agent is idle with no background tasks, one
-  switch per pass.
+- `--when-idle`: at the agent's next turn end (the Stop hook) or, if it is already idle, at the next watchdog pass.
+  An agent with 60K tokens of context or more is asked for its handoff, and the takeover starts the fresh agent on
+  account N, which reads the handoff instead of re-reading the whole conversation there. A smaller context, an agent
+  that hit its usage limit, or a handoff still unwritten 30 minutes after the request gets a `--now` switch instead
+  (the watchdog spends up to 200 s per pass on those). Each choice is logged with its reason.
 - `--now`: only for an idle agent with no background tasks. The agent exits, `claude-acc N --resume <session>` starts
   in the same pane with the same flags, model and effort, and orch checks that it came up. The first turn after it
   re-reads the whole context uncached on the new account.
 
 Pending switches are kept in `accounts.json` and shown by `orch status --json`. Every switch is logged as kind
-`account`; a failed one is pushed. When the new account hasn't trusted the folder yet, the restarted agent stops at
-Claude Code's trust question; orch reports that at once and the question has to be answered in the pane.
-`orch account --default N` records the account for new agents.
+`account`; a failed one is pushed. When the new account hasn't trusted the folder yet, the new agent stops at Claude
+Code's trust question, and the question has to be answered in the pane. A `--now` switch reports that at once. A
+takeover pushes a `respawn-dialog` alert and waits up to 15 minutes for the answer, then sends its prompt.
+`orch account --default N` records the account for new agents. `orch account --name N NAME` gives account N a short
+name (default "Acct N"; `""` resets it), shown by `orch account`, `orch status --json` (`account_names`), `orch usage`
+and the gateway.
+
+`orch account --spill 1:98:2` uses account 1 until it is nearly full, then moves its agents to account 2. When
+account 1's week or 5-hour window reaches 98%, every agent on account 1 gets a pending `--when-idle` switch to
+account 2. Only fresh data counts: a stale `usage.json` or a window that has already reset is treated as unknown.
+The trigger is pushed once (kind `spill`). An agent on account 1 whose last turn ended with Claude Code's limit
+message ("You've hit your weekly limit · resets ...", an API error `rate_limit` in the transcript) is resumed on
+account 2 at the next pass. The account of each agent is read from its claude process (`CLAUDE_CONFIG_DIR`).
+`--spill off` turns the rule off and drops the switches it queued. The rule and whether it has fired show in
+`orch account --json`, `orch status --json` and the gateway's fleet.
+
+On a machine with a spill rule, a takeover starts on the pending switch's account if there is one. Otherwise it
+starts on account 2 while the rule is active, and on the default account (`orch account --default`, 1 unless set)
+once account 1 is back under the threshold. New agents should start with `claude-acc $(orch account --for-new) ...`;
+an agent started on account 1 while the rule is active is moved by the watchdog anyway.
+
+The rule's progress shows as `spill` in `orch status --json` and the gateway's fleet (when it fired, `moved` of
+`total`). Each agent also gets a `spill` entry:
+- `moved_idle` or `moved_limit`, with how (handoff or resume) and when;
+- `waiting`, with what on: working, own job running, writing its handoff, or the next watchdog pass;
+- `cant_move`, with the error. A resume that failed is not retried until the rule fires again.
 
 ### Usage
 
@@ -231,12 +285,152 @@ at most every 5 minutes per account. It prints nothing and ignores input it can'
 `orch usage --json` reports, per account and window, the percentage used, the reset time, the burn rate over the last
 1-2 hours of history, the projected time to 100% and whether that comes before the reset. It also counts tokens
 (input, output, cache read, cache write) and an API-equivalent cost per agent, orchestrator and worker, run, day,
-account and machine, plus each agent's share of the window, from the transcripts in `~/.claude/projects`. Sessions are
+account and machine, from the transcripts in `~/.claude/projects`. Each window lists the agents that spent in it
+(`agents`): their share of this machine's cost there, the points that share stands for (`estimated_points`), and their
+points in the last hour and today (`points_last_hour`, `points_today`: their cost then times the window's points per
+dollar). Every account orch knows is listed, with `windows: {}` until a statusline has run on it. Sessions are
 matched to panes through the status files, herdr and the lineage folders, and to accounts through the status files
 and the statusline. The cost is an estimate from list prices (`PRICES` in `hooks/orch_usage.py`), not a bill, and the
 shares only count this machine. Transcripts are read incrementally (`usage-cache.json` keeps the offsets and 10-minute
-buckets for 8 days, and older files are skipped). On dev1, with 4.4 GB of transcripts, the first pass took 7 s and
+buckets for 8 days, and older files are skipped). On one machine, with 4.4 GB of transcripts, the first pass took 7 s and
 the next one under a second.
+
+### New orchestrator (orch new)
+
+`orch new --cwd DIR --goal TEXT --until T` starts an orchestrator in a new herdr tab in `DIR` and prints its pane
+first. The gateway's `start` action runs the same code. Each step is `doing`, `ok` or `failed`:
+
+1. `pane`: with `--worktree`, `git worktree add <DIR>-<name> -b orch/<name>` first. Then a herdr tab in the folder
+   (its root pane is the orchestrator's), a new decision log for that pane that starts with the goal (D1) and each
+   `--rules` text (D2, ...) as the owner's entries, and a brief at `~/.claude/orch/new/<id>/brief.md` with the goal,
+   the rules, the run and the worker limits (`--worker-model`, `--max-workers`).
+2. `claude`: `claude-acc N` in the pane (`--account auto`, the default, is the account for new agents: the spill
+   target while the rule is active, else the default), with a session id chosen up front, `--model`, `--effort` and
+   `HANDOFF_LINEAGE` pointing at the new log. `--name` names the herdr agent.
+3. `trust`, only when the new agent stops at a dialog (Claude Code's folder trust question on that account): it
+   waits up to 15 minutes for an answer in the pane, as a takeover does. From the CLI it also pushes
+   `respawn-dialog`.
+4. `run`: the run is registered (goal, `--until`, cwd, no workers) with the start's settings in `run.settings`.
+5. `brief`, or `read` with `--plan-first`: the agent is prompted to read the brief, with the same Enter-and-resend
+   check as a takeover prompt. With `--plan-first` the brief asks for a roadmap in a `report` and
+   `orch ask --kind plan` with the options "Approve and start workers" and "Cancel the run", before any other work.
+   That question makes `read` ok and `plan` doing; the owner's answer (`orch answer` or the app) makes `plan` ok.
+   While the plan question is open the watchdog doesn't nudge the run. A revised plan asked again replaces the open
+   question.
+
+Each step is a `start` event, and the start's state is kept in `~/.claude/orch/new/<id>/new.json`. The same `--id`
+again starts nothing and prints that state. `--dry-run` prints every step, the brief and the command, and changes
+nothing.
+
+### Gateway (orch serve)
+
+`hooks/orch_serve.py` is the HTTP gateway the phone app (orch-app) calls on each machine. The contract is orch-app's
+`docs/API.md` (v1), and `docs/PUSH.md` for pushes and the relay. Its HTTP side uses only the standard library and runs
+on Python 3.8; the push and relay code (`hooks/orch_push.py`) also needs the `cryptography` package (see Pushes).
+
+- It listens on port 7433, on the machine's Tailscale IPv4 (`tailscale ip -4`) only, never on 0.0.0.0, and won't
+  start without one.
+- A request must come from a tailnet node in the allow-list, checked with `tailscale whois` against the node's
+  StableID, short name or full name. It must also carry the pairing token as `Authorization: Bearer <token>`. An
+  unknown node gets 403 and a missing or wrong token gets 401, both with an empty body.
+- `orch pair --allow <phone's tailnet name>` writes the token and the allow-list to `~/.config/orch/.env` (mode 600,
+  directory 700) and prints the token and a pairing string for a QR code
+  (`orch://pair?machine=...&addr=...&port=7433&token=...&key=...&project=...`). `key` is the AES-256 key of pushes and
+  relay messages; `project` is the Firebase project, printed once the service account key is installed. Run it again to
+  change the list; `--new` replaces the token and the key. The gateway reads the file on every request, so changes take
+  effect without a restart.
+- The machine's name in the API, pushes and the relay is `ORCH_MACHINE` from that file, else its Tailscale device
+  name (`tailscale status --json`, `Self.HostName`), else its hostname.
+- `orch serve --allow-self` also admits the machine's own node. It is off by default and meant for a local test.
+- `GET /v1/health` (version, clock, push and relay state, `can_start` and `cannot_start`; the `Server` header is
+  `orch/<version>`), `POST /v1/pair`
+  (the phone's FCM token and relay uid; a node of the machine's own Tailscale user with the right token joins the
+  allow-list by StableID, then gets a `test` push) and `DELETE /v1/pair` (leaves the allow-list, token forgotten).
+  The gateway keeps the phones in `~/.config/orch/phones.json` (600).
+- Reads: `GET /v1/fleet` (runs with their orchestrator and workers, reports, open questions, blocked dialogs with the
+  screen text, stall reasons with proposed fixes, accounts with today's samples, pending switches, recent actions),
+  `/v1/usage?hours=168`, `/v1/orchestrators/<pane>/decisions`, `/v1/orchestrators/<pane>/history?since=&limit=`,
+  `/v1/panes/<pane>/screen?lines=15`, `/v1/actions/<id>` and `/v1/folders?q=&limit=50` (see Starts from the app).
+- Writes: `POST /v1/actions`, one JSON action with the app's `id` (a UUID), `time` and `kind`: `prompt`, `answer`,
+  `interrupt` (Esc), `park`, `unpark`, `run` (`extend` from the current end, or `stop`), `nudge`, `account` (`now`,
+  `idle`, `handoff`), `default_account`, `spill`, `ack` (decisions seen), `push_token` (a rotated FCM token),
+  `dialog` (only a new orchestrator's folder-trust question), or `start`, `start_cancel` and `start_retry` (see
+  Starts from the app). An id runs once: a retry with the same body gets the
+  first result, and the same id with a different body is refused. Actions older than 10 minutes are refused. The
+  answer is 202 `delivered`, 4xx `rejected` or 502 `failed`, with a sentence the app can show. An action becomes
+  `picked` once its target agent starts a turn (for an agent that was already working, at its next state change). A
+  switch `now` runs in the background, and its action ends `picked` or `failed`.
+- The gateway appends every action, refused ones included, to `events.jsonl` as kind `action` with `source: "app"`
+  (or `"relay"`).
+- `install.sh` installs `orch-serve.service` (systemd user unit) enabled but not started. It only runs once
+  `~/.config/orch/.env` has the token: `orch pair`, then `systemctl --user start orch-serve`. Before that the file
+  may hold other settings (`ORCH_START_ROOTS`): `orch serve` then exits 3, which the unit counts as a clean stop.
+
+Not in the gateway yet: answering a permission dialog (`dialog` answers only a new orchestrator's folder-trust
+question), the diff view, the activity lanes and the per-agent model.
+
+#### Starts from the app
+
+- They are off until `ORCH_START_ROOTS` is set in `~/.config/orch/.env`: comma-separated folders, `~` allowed.
+  `ORCH_START_EXCLUDE` lists folders a start may never use, such as live production checkouts. Both stay in that
+  file, never in the repo.
+- `start` takes `{folder, worktree?, name?, goal, until ("+4h" or a time), account ("auto" or N), model, effort,
+  worker_model, max_workers (0-16), rules: [text], plan_first}` and runs `orch new` with them. It is refused (409,
+  with the reason) for a folder outside the roots, under an excluded folder, or one an active run works in already
+  (unless `worktree`). The action's id is the start's id. The gateway runs the start detached and answers 202 with
+  `pane` once the new tab exists (or `pane: null` after 20 s), or 502 `failed` when the start failed before it had a
+  pane. Only that request waits: reads and other actions go on, and `/v1/actions/<id>` shows the pane as soon as it
+  exists. The steps then arrive as `start` pushes.
+- `start_cancel {action}` cancels a start that isn't done: it ends the run, quits the new Claude ("No" at the trust
+  question, else Esc and `/exit`, up to 15 s) and closes the pane the start opened. herdr drops the tab with its last
+  pane; a tab someone else split stays, and so does a worktree. A start still running stops at its next step. The
+  action ends `picked`, and the start leaves `starting`.
+- `start_retry {action, account?}` runs a failed start again, detached, from its failed step, and also a start
+  whose process is gone (it would otherwise stay `doing`). With another `account`, Claude quits and starts again on
+  that account with a new session id. A restart of the gateway (an install) doesn't stop running starts: the unit
+  has `KillMode=process`.
+- `dialog {pane, change, choice}` answers Claude Code's folder-trust question, and only for the pane a start opened
+  while that start is at its `trust` step: `allow` picks "Yes", `deny` picks "No" (Claude exits) and cancels the
+  start. The gateway checks that the agent is still blocked at the same `change` and that the screen shows a trust
+  question with Yes and No, and it logs who answered (a `trust` event). Any other dialog is answered in the pane.
+- `/v1/health` has `can_start` and, when false, `cannot_start`: ORCH_START_ROOTS not set, herdr not running, or
+  claude-acc missing.
+- `/v1/fleet` shows an unfinished start (the last day's, until `brief` or `plan` is ok) as an orchestrator with
+  activity `starting` and `start: {action, goal, plan_first, until, steps: [{step, status, time, error?}]}`; its
+  agent's dialog during the `trust` step has `kind: "trust"` and the folder as `cwd`. Questions carry `kind`
+  (`"plan"`), runs started this way `run.settings`, and a `start` action's status its `pane`.
+- `/v1/folders` lists the git checkouts that are a root or directly under one, plus the herdr agents' checkouts
+  deeper under a root, never an excluded one, newest work first: `path` (`~` form), `branch` (a short sha when
+  detached), `last_activity` (git index, HEAD or reflog, or a Claude transcript of the folder), `orchestrator`
+  (`{pane, name}` of an active run there) and `trusted` (the folder or a parent is trusted in the `.claude.json` of
+  the account a new agent would use). `q` filters on the path, `limit` is 1-200.
+- Not done: closing the tab of a run that stopped with no worker (on purpose), and `Health.capacity`.
+
+### Pushes and the relay (orch_push.py)
+
+The gateway's background loop also pushes to the paired phones and polls the relay mailbox, so notifications and quick
+answers work off the tailnet. The app side is orch-app `docs/PUSH.md`.
+
+- Down: FCM HTTP v1 data messages sent by the machine itself with the `orch-push` service account
+  (`~/.config/orch/firebase-sa.json`, 600). The payload is zlib-compressed JSON sealed with AES-256-GCM under the
+  pairing key (`ORCH_KEY`), so Google relays only `{v, machine, nonce, ct}`. What is pushed: questions and dialogs open
+  30 s (high priority); stalls 5 minutes after the watchdog's nudge, ended runs, usage running out before its reset,
+  spill events, failures (`system`), action statuses, the steps of a start (`start`, high priority only when one
+  failed); a state snapshot per orchestrator on change (at most one a minute), accounts on a whole-percent change (at
+  most every 5 minutes) and a heartbeat every 10 minutes (collapsible).
+  The gateway trims a message over FCM's 4 KB in fixed steps and lists them in its `trimmed`. A passing FCM
+  failure is retried on the next pass; a dead token stops pushes to that phone until the app sends a new one.
+- Up: the phone writes sealed actions to Firestore at `mailboxes/<its anonymous uid>/<machine>/<id>`. The gateway
+  polls its paired phones' mailboxes (every 30 s, every 5 s for 10 minutes after a push that may get an answer), runs
+  each action through the same code as `POST /v1/actions` (`source: "relay"`) and deletes it.
+- The crypto uses the `cryptography` package from the system (Debian/Ubuntu: python3-cryptography; 2.8, Ubuntu
+  20.04's, is enough). Nothing else imports it: without it the gateway still serves HTTP and `/v1/health` says
+  why pushes are off.
+- `cloud/firebase_setup.py` sets up the Firebase project (`--project`, else the one in
+  `~/.config/orch/google-services.json`) once, idempotently (`--dry-run` shows what it would change):
+  APIs, the Firestore database (eur3 unless `--location`), Anonymous sign-in, the `orchPush` role (FCM send;
+  Firestore get, list and delete) held by the `orch-push` service account, its key, and `cloud/firestore.rules`.
+  `--copy-to host2 user@host3` copies the key. It uses the Firebase CLI's own login and keeps no secret.
 
 ## Outside herdr
 
@@ -247,18 +441,18 @@ one-line pointer to an unread handoff.
 
 ## Install
 
-Requirements: Linux (`/proc`), Python 3.8 or newer (ob1 runs 3.8, so keep the script 3.8-compatible), and herdr for
+Requirements: Linux (`/proc`), Python 3.8 or newer (Ubuntu 20.04 has 3.8, so keep the scripts 3.8-compatible), and herdr for
 the takeover.
 
 ```bash
 git clone https://github.com/Bogzx/claude-context-handoff.git
 cd claude-context-handoff
 ./install.sh                          # this machine
-./install.sh bogdan@dev2 ubuntu@ob1   # other machines over ssh
+./install.sh user@host2 user@host3   # other machines over ssh
 ```
 
 `install.sh` copies `hooks/` into `~/.claude/hooks/`, links `~/.local/bin/orch` to `orch.py`, installs and starts the
-`orch-watchdog.timer` systemd user unit, registers the `orch` MCP server at user scope in every account
+`orch-watchdog.timer` systemd user unit, installs `orch-serve.service` enabled but not started (see Gateway), registers the `orch` MCP server at user scope in every account
 (`claude mcp add --scope user orch -- python3 ~/.claude/hooks/orch_mcp.py`, skipped where it is already there), and
 runs `context-handoff-install.py`, which merges the hooks and env into `~/.claude/settings.json`. For other hosts it copies the files to `~/.cache/claude-context-handoff` there and runs the
 same script. It is idempotent and backs up the settings to `settings.json.bak-<timestamp>`
@@ -292,7 +486,7 @@ quick test, set it inline: `HANDOFF_SOFT_TOKENS=1000 claude …`.
 All under `~/.claude/handoffs/`:
 
 - `<project-path>/<pane>-<started>-<session>/`: one lineage folder, for example
-  `home-bogdan-Repo-AlphaProve/w17-p8B-20261026-134442-45643f64/`. The pane part is `local` outside herdr; several
+  `home-me-Repo-myapp/w17-p8B-20261026-134442-45643f64/`. The pane part is `local` outside herdr; several
   workers often share one worktree, so lineages are kept apart by pane. The session part is the first 8 characters of
   the session that started it, which also finds its transcript.
   - `handoff.md`: the pending handoff.
@@ -306,7 +500,11 @@ All under `~/.claude/handoffs/`:
   relaunch flags) and its latest `report`.
 - `runs/<orchestrator pane>.json`: an `orch` run (end time, goal, workers, parked workers, questions with their ids,
   options and answers), and `runs/<pane>.seen.json`, the events its waits already reported.
-- `accounts.json`: pending account switches and the default account.
+- `~/.claude/orch/new/<id>/`: one `orch new` or app start: `new.json` (its request, steps and retries),
+  `brief.md`, `start.log` (the detached run's output, for a start from the app) and `cancelled.json` once cancelled.
+- `accounts.json`: pending account switches, the default account, the spill rule and the account names.
+- `gateway-actions.json`: the gateway's actions of the last 24 h by id (result, status), and `decisions-seen.json`,
+  the decisions the app marked as seen.
 - `usage.json` (latest limits per account, and each session's account), `usage-history.jsonl`, `usage-cache.json`.
 - `events.jsonl`: takeovers, failures, nudges, alerts and run changes. `watchdog.json`: the watchdog's memory.
 - `archive/` and `<project-path>--<pane>.md`: the flat layout used before 2026-10-26. The hook no longer reads them.
@@ -314,14 +512,13 @@ All under `~/.claude/handoffs/`:
 ## Checking it works
 
 ```bash
-uv run --no-project --with pytest pytest -q                 # offline tests
-uv run --python 3.8 --no-project --with pytest pytest -q    # the Python that ob1 runs
+uv run --no-project --with pytest --with cryptography pytest -q        # offline tests
+uv run --python 3.8 --no-project --with pytest --with cryptography==2.8 pytest -q  # the oldest Python and cryptography
 tail ~/.claude/handoffs/respawn.log ~/.claude/handoffs/events.jsonl
 systemctl --user list-timers orch-watchdog.timer
 orch watchdog --dry-run
 sha256sum ~/.claude/hooks/context-handoff.py hooks/context-handoff.py
-ssh bogdan@dev2 'sha256sum ~/.claude/hooks/context-handoff.py'
-ssh ubuntu@ob1 'sha256sum ~/.claude/hooks/context-handoff.py'
+ssh user@host2 'sha256sum ~/.claude/hooks/context-handoff.py'
 jq .env ~/.claude/settings.json
 ```
 
@@ -356,6 +553,6 @@ the log and then `gen-01.md`, and found the `## Generation 2` line the hook had 
 Research on long contexts (Chroma's "Context Rot", Du et al. at EMNLP 2025, Anthropic's context-engineering post) shows
 quality dropping as context grows, and the common rule of thumb is to reset at 40–60% of the window. On that basis
 the first recommendation was a handoff at about 120K and a hard stop at about 200K. The owner chose 400K and 600K
-instead, because the current models hold up well at high context and the projects (AlphaProve in particular) are
+instead, because the current models hold up well at high context and the projects (one in particular) are
 large. Limits based on project size were considered and dropped: what fills the context is the task, not the size of
 the repo. Per-project overrides cover the exceptions.

@@ -6,6 +6,7 @@ import os
 import sys
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -65,6 +66,8 @@ def world(tmp_path, monkeypatch):
     monkeypatch.setattr(orch, "agents", lambda: dict(w.agents))
     monkeypatch.setattr(orch, "prompt", lambda pane, text: w.prompts.append((pane, text)) or True)
     monkeypatch.setattr(orch, "herdr", lambda *a, **k: w.herdr_calls.append(a))
+    monkeypatch.setattr(orch, "CONFIG", tmp_path / "config" / ".env")
+    monkeypatch.setattr(orch, "_TAILNET_NAME", ["box1"])  # as if `tailscale status` said so
     monkeypatch.delenv("ORCH_NOTIFY_CMD", raising=False)
     w.agent(BOSS, "idle", seq=1)
     return w
@@ -264,6 +267,21 @@ def test_watchdog_wakes_an_orchestrator_that_nothing_would_wake(world):
     assert "nothing would wake you" in text
 
 
+def test_watchdog_leaves_an_orchestrator_alone_while_its_plan_waits_for_the_owner(world):
+    world.run("run", "start", "--until", "+8h", "--goal", "new run")  # no workers yet
+    world.turn_end(BOSS, ago=2 * 3600)  # idle two hours: past ORCH_SILENT
+    world.run("ask", "--kind", "plan", "--option", "Approve and start workers", "Plan ready")
+
+    world.run("watchdog")
+    assert world.prompts == []
+
+    [q] = json.loads((world.root / "runs" / "w1-p0.json").read_text())["questions"]
+    world.run("answer", q["id"], "Approve and start workers")
+    world.prompts.clear()
+    world.run("watchdog")  # approved: idle with no workers is worth a nudge again
+    assert [p for p, _ in world.prompts] == [BOSS]
+
+
 def test_watchdog_tells_the_owner_when_nudges_are_ignored(world, tmp_path, monkeypatch):
     pushed = push_log(tmp_path, monkeypatch)
     start_run(world)
@@ -452,12 +470,17 @@ def test_status_json_shows_open_questions_reports_and_accounts(world, capsys):
     world.run("status", "--json")
 
     data = json.loads(capsys.readouterr().out)
-    assert [q["text"] for q in data["questions"]] == ["Second?"]
+    answered, second = data["questions"]  # answered: shown for 10 minutes, with the answer
+    assert answered["text"] == "First?" and answered["answer"] == "ok"
+    assert answered["answered"] == world.t and second["answered"] is None
     assert data["report"]["progress"] == {"done": 3, "total": 5}
     w1 = data["workers"][0]
     assert w1["report"]["summary"] == "fixed #12" and w1["account"] == "2"
     assert w1["last"] == "all green"  # the report kept the Stop hook's fields
     assert [e["kind"] for e in world.events()].count("report") == 2
+    world.t += 10 * 60 + 1
+    world.run("status", "--json")
+    assert [q["text"] for q in json.loads(capsys.readouterr().out)["questions"]] == ["Second?"]
 
 
 # --- decisions --------------------------------------------------------------------------------
@@ -474,7 +497,7 @@ Started 2026-11-05 10:00. Append-only.
 
 ## Generation 2: takeover by w1 in herdr pane w1:p0, 2026-11-05 12:00, from gen-01.md
 - D4 12:05, orchestrator: sample every 30 s instead of D3, because 15 s cost too much CPU.
-- **D5** 2026-11-05 12:10, the user (Bogdan): "drop the widget". Replaces **D2** and D1.
+- **D5** 2026-11-05 12:10, the user (Alex): "drop the widget". Replaces **D2** and D1.
 - **D6** 2026-11-05 ~12:20, user proposed: "ship it today". Agent agreed.
 - **D7** 2026-11-05 12:30 EET (10:30 UTC), agent: shipped.
 - **D8** 2026-11-05 12:40 EET (date), agent: tagged v1.
@@ -484,7 +507,7 @@ Started 2026-11-05 10:00. Append-only.
 
 
 def write_log(world, name, text, mtime):
-    lineage = world.root / "home-bogdan-Repo-x" / name
+    lineage = world.root / "home-me-Repo-x" / name
     lineage.mkdir(parents=True)
     (lineage / "decisions.md").write_text(text)
     os.utime(lineage / "decisions.md", (mtime, mtime))
@@ -506,18 +529,20 @@ def test_decisions_parses_the_newest_log_of_the_pane(world, capsys):
     assert data["log"] == str(log)
     d = {e["id"]: e for e in data["decisions"]}
     assert [e["id"] for e in data["decisions"]] == [
-        "D1", "D5", "D6", "D9", "D10", "D2", "D3", "D4", "D7", "D8"]  # owner first
+        "D1", "D2", "D3", "D4", "D5", "D6", "D7", "D8", "D9", "D10"]  # log order
     assert d_of(data, "D9")["by"] == "user (checking in at 12:49)"
     assert d_of(data, "D9")["quote"] == "keep going"
-    assert d_of(data, "D10")["by"] == "" and d_of(data, "D10")["who"] == "user"
+    assert d_of(data, "D10")["by"] == "user" and d_of(data, "D10")["who"] == "user"
     assert d["D1"]["who"] == "user" and d["D1"]["quote"] == "Use the MCP tool, not a CLI"
     assert d["D1"]["what"] == "Agent built orch_mcp.py." and d["D1"]["time"] == "2026-11-05 10:40"
     assert d["D2"]["who"] == "agent" and d["D2"]["what"] == "question ids are random hex."
-    assert d["D2"]["why"] == "no counter file to lock."
-    assert d["D3"]["why"] == "The gateway samples state for the activity strip."
+    assert d["D2"]["why"] == "no counter file to lock"
+    assert d["D3"]["what"] == "poll herdr every 15 s. The gateway samples state for the activity strip."
+    assert d["D3"]["why"] == ""  # no "Why" or "because": nothing is a reason
     assert d["D4"]["by"] == "orchestrator" and d["D4"]["time"] == "12:05"
-    assert d["D4"]["why"] == "15 s cost too much CPU." and d["D4"]["generation"] == 2
-    assert d["D5"]["who"] == "user" and d["D5"]["by"] == "the user (Bogdan)"
+    assert d["D4"]["what"] == "sample every 30 s instead of D3."
+    assert d["D4"]["why"] == "15 s cost too much CPU" and d["D4"]["generation"] == 2
+    assert d["D5"]["who"] == "user" and d["D5"]["by"] == "the user (Alex)"
     assert {k: d[k]["superseded_by"] for k in d if d[k]["superseded_by"]} == {
         "D1": "D5", "D2": "D5", "D3": "D4"}
     assert (d["D6"]["who"], d["D6"]["time"], d["D6"]["quote"]) == ("user", "2026-11-05 ~12:20",
@@ -525,6 +550,55 @@ def test_decisions_parses_the_newest_log_of_the_pane(world, capsys):
     assert (d["D7"]["who"], d["D7"]["time"], d["D7"]["what"]) == ("agent", "2026-11-05 12:30 EET",
                                                                   "shipped.")
     assert (d["D8"]["by"], d["D8"]["what"]) == ("agent", "tagged v1.")
+
+
+# Real entries (an orchestrator's log, 2026-11-05) that the first parser got wrong; project, account,
+# machine and app names replaced.
+REAL = """\
+- **D5** 2026-11-05 11:05, agent: decision log onboarding = full log up to 30 KB, else index (first 160 chars of each entry) + latest 1-2 generations up to 60 KB. Ruled out keeping "read in full" (140-190K tokens per takeover) and model-written summaries (lossy, the reason the log exists).
+- **D25** 2026-11-05 12:15, user created Firebase project my-app-123 (owner owner@example.com) in the console. Agent registered Android app com.example.app (App ID 1:000000000000:android:0000) and saved google-services.json to ~/.config/orch/google-services.json (600, outside git). The earlier GCP-only project my-app (created by the agent, empty) is left in place; user not asked yet whether to delete it. Service account key + Firestore come with the push/relay task.
+- **D29** 2026-11-05 12:33, user: "it's okay" (to: keep the All page before the per-orchestrator pages, app opens on it when something needs him). Forwarded to ui to mark decided in DESIGN.md.
+- **D34** 2026-11-05 12:49, user: "1 ok as you reccomend": production deploy 'yes' from a notification opens the app's hold-to-confirm; staging stays one tap after unlock. Live Update on lock screen = progress only (agent default, user did not answer explicitly). Sent to ui and native.
+- **D36** 2026-11-05 13:20, user: "make sure to use main fully". So no early move to spare: backend task 3 part A = orch account --spill 1:98:2 (watchdog moves agents at idle once main 7d/5h >= 98%, fresh takeover from handoff preferred over --resume, immediate switch if a limit message is hit), installed + enabled on box1/box2 (not box3, different login); part B = cloud setup (FCM, Firestore eur3, anonymous auth, orch-push SA key in ~/.config/orch on 3 machines) + push sender/relay/pairing + docs/PUSH.md. Committed ui task 3 (82a743c: setup/pairing, settings, widgets + QS tile, light theme, N14 prod deploy opens app). ui task 4: spill-over UI, then APP-QA.
+- **D37** 2026-11-05 13:21, agent: at the 400K handoff threshold, stopped my background tasks (orch wait, the demo http.server on 127.0.0.1:8765) and relaunched emulator-5554 detached (setsid nohup, log ~/Android/emulator-OnePlus13R.log) because the takeover waits for background tasks and native depends on the emulator; told native. orch-serve branch is pushed but no PR is open for it yet (deliberately held until the app tests against the gateway). Handoff written to handoff.md in this lineage.
+"""
+
+
+def test_decisions_keep_log_order_and_take_only_explicit_reasons(world):
+    d = {e["id"]: e for e in world.orch.parse_decisions(REAL)}
+    assert [e["id"] for e in world.orch.parse_decisions(REAL)] == [
+        "D5", "D25", "D29", "D34", "D36", "D37"]
+    assert [d[k]["line"] for k in d] == [1, 2, 3, 4, 5, 6]
+    # D5: "the reason the log exists" is not a reason; "Ruled out ..." stays with the decision
+    assert d["D5"]["why"] == "" and d["D5"]["what"].endswith("(lossy, the reason the log exists).")
+    assert d["D5"]["what"].startswith("decision log onboarding = full log up to 30 KB")
+    # D25: no "user:" prefix, but the entry is the user's
+    assert (d["D25"]["who"], d["D25"]["by"], d["D25"]["why"]) == ("user", "user", "")
+    assert d["D25"]["what"].startswith("user created Firebase project my-app-123")
+    # D29, D34: after the quote, no ": " or "(" tying it to the quote
+    assert d["D29"]["quote"] == "it's okay"
+    assert d["D29"]["what"] == ("to: keep the All page before the per-orchestrator pages, app opens "
+                                "on it when something needs him. Forwarded to ui to mark decided in "
+                                "DESIGN.md.")
+    assert d["D34"]["quote"] == "1 ok as you reccomend"
+    assert d["D34"]["what"].startswith("production deploy 'yes' from a notification")
+    assert d["D34"]["what"].endswith("Sent to ui and native.") and d["D34"]["why"] == ""
+    # D36: the commit note at the end is not the reason
+    assert d["D36"]["quote"] == "make sure to use main fully" and d["D36"]["why"] == ""
+    assert d["D36"]["what"].startswith("So no early move to spare: backend task 3 part A")
+    assert d["D36"]["what"].endswith("ui task 4: spill-over UI, then APP-QA.")
+    # D37: the "because" clause is the reason; the rest of its sentence stays in `what`
+    assert d["D37"]["why"] == ("the takeover waits for background tasks and native depends on the "
+                               "emulator")
+    assert d["D37"]["what"] == (
+        "at the 400K handoff threshold, stopped my background tasks (orch wait, the demo http.server "
+        "on 127.0.0.1:8765) and relaunched emulator-5554 detached (setsid nohup, log "
+        "~/Android/emulator-OnePlus13R.log); told native. orch-serve branch is pushed but no PR is "
+        "open for it yet (deliberately held until the app tests against the gateway). Handoff "
+        "written to handoff.md in this lineage.")
+    for e in d.values():
+        assert e["by"] and (e["who"] == "user") == ("user" in e["by"] or "owner" in e["by"])
+        assert not e["what"].startswith((":", "("))
 
 
 def test_decisions_without_a_log(world):
@@ -545,17 +619,35 @@ def accounts(world, tmp_path, monkeypatch):
         (account_dir(n) / ".credentials.json").write_text("{}")
     monkeypatch.setattr(world.orch, "account_dir", account_dir)
     monkeypatch.setattr(world.orch, "is_claude", lambda pid: pid == 4242)
-    jobs = []
+    jobs = Jobs()
     monkeypatch.setattr(world.orch, "run_switch", lambda job: jobs.append(job) or
                         type("R", (), {"returncode": 0, "stderr": ""})())
+
+    def claudes():  # pane -> (pid, account) of its claude process, here from its status file
+        out = {}
+        for path in (world.root / "agents").glob("*.json"):
+            st = json.loads(path.read_text())
+            out[st["pane"]] = (st.get("pid"), st.get("account", "1"))
+        return out
+    monkeypatch.setattr(world.orch, "pane_claudes", claudes)
+    jobs.handoffs = []
+
+    def request_handoff(pane, session, cwd, sw):
+        jobs.handoffs.append((pane, session, cwd, sw["account"], sw.get("why")))
+        return f"write your handoff for account {sw['account']}"
+    monkeypatch.setattr(world.orch, "request_handoff", request_handoff)
     return jobs
+
+
+class Jobs(list):
+    pass
 
 
 def idle_with_status(world, pane, **extra):
     world.agent(pane, "idle", session="s-new")
     world.turn_end(pane, session="s-new")
     path = world.root / "agents" / f"{pane.replace(':', '-')}.json"
-    st = dict(json.loads(path.read_text()), pid=4242, account="1",
+    st = dict(json.loads(path.read_text()), pid=4242, account="1", context_tokens=20_000,
               relaunch=["--dangerously-skip-permissions", "--model", "claude-haiku-5-5"])
     path.write_text(json.dumps(dict(st, **extra)))
 
@@ -571,7 +663,7 @@ def test_account_switch_at_handoff_is_queued(world, accounts, capsys):
     with pytest.raises(SystemExit):  # not logged in
         world.run("account", W1, "3")
     with pytest.raises(SystemExit):
-        world.run("account", W1, "pibo2")
+        world.run("account", W1, "work2")
 
 
 def test_account_switch_now_resumes_an_idle_agent(world, accounts, capsys):
@@ -612,7 +704,45 @@ def test_account_default_and_listing(world, accounts, capsys):
     assert data["default"] == "2" and data["switch"][W2]["account"] == "1"
 
 
-def test_account_switch_when_idle_is_done_by_the_watchdog(world, accounts, capsys):
+def test_status_shows_the_context_size_the_hook_keeps_during_the_turn(world, capsys):
+    start_run(world)
+    world.agent(W1, "working")
+    world.turn_end(W1)
+    path = world.root / "agents" / "w1-p1.json"
+    path.write_text(json.dumps(dict(json.loads(path.read_text()), context_tokens=50_000)))
+    live = world.root / "agents" / "context" / "w1-p1.json"
+    live.parent.mkdir()
+    live.write_text(json.dumps({"session": "s-old", "context_tokens": 300_000}))
+    capsys.readouterr()
+
+    world.run("status", "--json")
+    assert json.loads(capsys.readouterr().out)["workers"][0]["context_tokens"] == 50_000
+    live.write_text(json.dumps({"session": f"s-{W1}", "context_tokens": 80_000}))
+    world.run("status", "--json")
+    assert json.loads(capsys.readouterr().out)["workers"][0]["context_tokens"] == 80_000
+
+
+def test_accounts_are_named_in_account_status_and_usage(world, accounts, capsys, tmp_path,
+                                                        monkeypatch):
+    world.run("account", "--name", "2", "spare")
+    world.run("account", "--name", "1", "main")
+    world.run("account", "--name", "1", "")  # back to the default
+    with pytest.raises(SystemExit):
+        world.run("account", "--name", "two", "x")
+    capsys.readouterr()
+
+    world.run("account", "--json")
+    names = {k: a["name"] for k, a in json.loads(capsys.readouterr().out)["accounts"].items()}
+    assert names == {"1": "Acct 1", "2": "spare", "3": "Acct 3"}
+    world.run("status", "--json")
+    assert json.loads(capsys.readouterr().out)["account_names"] == names
+    monkeypatch.setenv("HOME", str(tmp_path))  # no transcripts
+    world.run("usage", "--json")  # no reading for any account yet: each one is still listed
+    assert json.loads(capsys.readouterr().out)["accounts"]["2"] == {
+        "id": "2", "name": "spare", "updated": None, "stale": True, "windows": {}}
+
+
+def test_account_switch_when_idle_resumes_a_small_context(world, accounts, capsys):
     start_run(world)
     world.agent(W1, "working")
     world.run("account", W1, "2", "--when-idle")
@@ -628,15 +758,64 @@ def test_account_switch_when_idle_is_done_by_the_watchdog(world, accounts, capsy
     world.run("watchdog")  # idle, but waiting on its own job
     assert accounts == []
 
-    idle_with_status(world, W1)
+    idle_with_status(world, W1)  # 20K tokens of context
     world.run("watchdog")
 
     [job] = accounts
     assert job["pane"] == W1 and job["account"] == "2" and job["resume"] == "s-new"
-    assert job["when"] == "idle"
+    assert job["when"] == "idle" and accounts.handoffs == []
     assert json.loads((world.root / "accounts.json").read_text())["switch"] == {}
+    why = [e for e in world.events() if e["title"] == f"Account switch: resuming {W1}"]
+    assert "20K tokens" in why[0]["body"]
     world.run("watchdog")
     assert len(accounts) == 1
+
+
+def test_a_large_context_switches_through_a_handoff(world, accounts):
+    world.run("account", W1, "2", "--when-idle")
+    idle_with_status(world, W1, context_tokens=300_000, cwd="/work/proj")
+
+    world.run("watchdog")
+
+    assert accounts == [] and accounts.handoffs == [
+        (W1, "s-new", "/work/proj", "2", None)]
+    assert world.prompts == [(W1, "write your handoff for account 2")]
+    sw = json.loads((world.root / "accounts.json").read_text())["switch"][W1]
+    assert sw["handoff"] == T0
+    asked = world.events()[-1]
+    assert asked["how"] == "handoff" and "reads the handoff" in asked["body"]
+    world.t += 29 * 60
+    world.run("watchdog")  # the takeover follows the handoff; nothing more to do
+    assert accounts == [] and len(accounts.handoffs) == 1
+    world.t += 2 * 60
+    world.run("watchdog")  # still idle with no handoff 31 min later: resume instead
+    [job] = accounts
+    assert job["resume"] == "s-new"
+    assert any("no handoff 30 min after" in e["body"] for e in world.events())
+
+
+def test_an_agent_at_its_usage_limit_is_resumed_whatever_its_context(world, accounts):
+    idle_with_status(world, W1, context_tokens=300_000)
+    acc = {"switch": {W1: {"account": "2", "time": T0, "when": "idle", "reason": "limit"}}}
+    (world.root / "accounts.json").write_text(json.dumps(acc))
+
+    world.run("watchdog")
+
+    assert [j["pane"] for j in accounts] == [W1] and accounts.handoffs == []
+
+
+def test_the_watchdog_resumes_several_agents_within_its_budget(world, accounts, monkeypatch):
+    world.run("account", W1, "2", "--when-idle")
+    world.run("account", W2, "2", "--when-idle")
+    idle_with_status(world, W1)
+    idle_with_status(world, W2)
+    monkeypatch.setattr(world.orch, "SWITCH_BUDGET", -1)  # spent: the next pass does them
+
+    world.run("watchdog")
+    assert accounts == []
+    monkeypatch.setattr(world.orch, "SWITCH_BUDGET", 200)
+    world.run("watchdog")
+    assert [j["pane"] for j in accounts] == [W1, W2]
 
 
 def test_status_json_shows_the_orchestrators_pending_switch(world, accounts, capsys):
@@ -647,18 +826,6 @@ def test_status_json_shows_the_orchestrators_pending_switch(world, accounts, cap
     capsys.readouterr()
     world.run("status", "--json")
     assert json.loads(capsys.readouterr().out)["switch"]["when"] == "handoff"
-
-
-def test_the_watchdog_switches_one_agent_per_pass(world, accounts):
-    world.run("account", W1, "2", "--when-idle")
-    world.run("account", W2, "2", "--when-idle")
-    idle_with_status(world, W1)
-    idle_with_status(world, W2)
-
-    world.run("watchdog")
-    assert [j["pane"] for j in accounts] == [W1]
-    world.run("watchdog")
-    assert [j["pane"] for j in accounts] == [W1, W2]
 
 
 def test_a_failed_idle_switch_is_dropped(world, accounts, monkeypatch):
@@ -694,6 +861,174 @@ def test_a_switch_now_clears_a_pending_one(world, accounts):
     assert json.loads((world.root / "accounts.json").read_text())["switch"] == {}
 
 
+def usage_at(world, pct, window="seven_day", age=30, resets_in=86400):
+    (world.root / "usage.json").write_text(json.dumps({"accounts": {"1": {
+        "time": world.t - age, "windows": {window: {"used_percentage": pct,
+                                                    "resets_at": world.t + resets_in}}}}}))
+
+
+def test_spill_moves_account_one_agents_once_it_reaches_the_threshold(world, accounts, capsys):
+    world.agent(BOSS, "working")
+    world.agent(W1, "working")
+    idle_with_status(world, W1)
+    idle_with_status(world, W2, account="2", context_tokens=300_000)
+    world.agent(W1, "working")
+    world.run("account", "--spill", "1:98:2")
+    capsys.readouterr()
+    world.run("account", "--json")
+    listed = json.loads(capsys.readouterr().out)
+    assert listed["spill"] == {"from": "1", "at": 98, "to": "2", "time": T0, "active": None,
+                               "since": None, "moved": 0, "total": 0}
+    assert listed["for_new"] == "1"
+
+    usage_at(world, 97)
+    world.run("watchdog")
+    assert "switch" not in json.loads((world.root / "accounts.json").read_text()) or not json.loads(
+        (world.root / "accounts.json").read_text())["switch"]
+    usage_at(world, 99, age=20 * 60)  # stale: unknown, not reached
+    world.run("watchdog")
+    assert not json.loads((world.root / "accounts.json").read_text()).get("spill")["active"]
+    usage_at(world, 98, resets_in=-60)  # that window already reset
+    world.run("watchdog")
+    assert not json.loads((world.root / "accounts.json").read_text()).get("spill")["active"]
+
+    usage_at(world, 98)
+    world.run("watchdog")
+
+    acc = json.loads((world.root / "accounts.json").read_text())
+    assert acc["spill"]["active"] == {"window": "seven_day", "used": 98, "since": world.t}
+    assert set(acc["switch"]) == {W1}  # on account 1; W2 is on 2, BOSS has no claude here
+    assert acc["switch"][W1]["reason"] == "spill" and acc["switch"][W1]["when"] == "idle"
+    assert "98% of its seven_day window" in acc["switch"][W1]["why"]
+    [spill] = [e for e in world.events() if e["kind"] == "spill" and "moving" in e["title"]]
+    assert spill["title"] == "Account 1 at 98%: moving to 2" and world.herdr_calls  # pushed
+    world.run("watchdog")  # once
+    assert len([e for e in world.events() if e["kind"] == "spill" and "moving" in e["title"]]) == 1
+    capsys.readouterr()
+    world.run("status", "--json")
+    assert json.loads(capsys.readouterr().out)["spill"]["active"]["used"] == 98
+
+    usage_at(world, 3, resets_in=7 * 86400)  # the week reset
+    world.run("watchdog")
+    assert json.loads((world.root / "accounts.json").read_text())["spill"]["active"] is None
+
+
+def test_spill_off_drops_its_pending_switches_and_bad_rules_are_refused(world, accounts, capsys):
+    world.run("account", "--spill", "1:98.5:2")
+    world.run("account", W2, "2", "--when-idle")  # by hand: kept
+    acc = json.loads((world.root / "accounts.json").read_text())
+    assert acc["spill"]["at"] == 98.5
+    acc["switch"][W1] = {"account": "2", "time": T0, "when": "idle", "reason": "spill"}
+    (world.root / "accounts.json").write_text(json.dumps(acc))
+    world.run("account", "--spill", "off")
+    acc = json.loads((world.root / "accounts.json").read_text())
+    assert "spill" not in acc and set(acc["switch"]) == {W2}
+    for bad in ("1:98", "1:98:1", "2:98:3", "main:98:spare"):
+        with pytest.raises(SystemExit):
+            world.run("account", "--spill", bad)
+
+
+def test_spill_states_per_agent_and_the_runs_progress(world, accounts, capsys, tmp_path,
+                                                       monkeypatch):
+    monkeypatch.setattr(world.orch, "PROJECTS", tmp_path / "projects")
+    start_run(world)
+    world.agent(BOSS, "working")
+    idle_with_status(world, W1)  # 20K: resumed at the pass
+    world.agent(W2, "working")
+    world.turn_end(W2)
+    path = world.root / "agents" / f"{W2.replace(':', '-')}.json"
+    path.write_text(json.dumps(dict(json.loads(path.read_text()), pid=4242, account="1",
+                                    session="s-w1:p2", context_tokens=20_000)))
+    world.run("account", "--spill", "1:98:2")
+    usage_at(world, 98)
+
+    world.run("watchdog")
+    capsys.readouterr()
+    world.run("account", "--for-new")
+    assert capsys.readouterr().out.strip() == "2"
+    world.run("status", "--json")
+    status = json.loads(capsys.readouterr().out)
+    w1, w2 = status["workers"]
+    assert w1["spill"] == {"state": "moved_idle", "reason": "resume", "time": world.t,
+                           "account": "2"}
+    assert w2["spill"] == {"state": "waiting", "reason": "working", "time": world.t,
+                           "account": "2"}
+    assert status["spill"]["since"] == world.t
+    assert (status["spill"]["moved"], status["spill"]["total"]) == (1, 2)
+
+    world.agent(W2, "idle")  # done, but its resume fails
+    monkeypatch.setattr(world.orch, "run_switch", lambda job: type(
+        "R", (), {"returncode": 1, "stderr": "the new agent is at a dialog"})())
+    world.run("watchdog")
+    world.run("status", "--json")
+    w2 = json.loads(capsys.readouterr().out)["workers"][1]
+    assert w2["spill"]["state"] == "cant_move" and "at a dialog" in w2["spill"]["reason"]
+    world.run("watchdog")  # not queued again
+    assert W2 not in json.loads((world.root / "accounts.json").read_text())["switch"]
+
+
+def transcript(world, session, *entries):
+    path = world.orch.PROJECTS / "-work-proj" / f"{session}.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("".join(json.dumps(e) + "\n" for e in entries))
+
+
+LIMIT = {"type": "assistant", "isApiErrorMessage": True, "error": "rate_limit",
+         "message": {"model": "<synthetic>", "content": [
+             {"type": "text", "text": "You've hit your weekly limit · resets 7am (Europe/Bucharest)"}]}}
+PROMPT = {"type": "user", "message": {"content": "fix #12"}}
+REPLY = {"type": "assistant", "message": {"content": [{"type": "text", "text": "done"}]}}
+
+
+def test_limit_hit_reads_the_last_turn_of_the_transcript(world, tmp_path, monkeypatch):
+    monkeypatch.setattr(world.orch, "PROJECTS", tmp_path / "projects")
+    transcript(world, "s1", PROMPT, LIMIT)
+    assert world.orch.limit_hit("s1").startswith("You've hit your weekly limit")
+    transcript(world, "s1", PROMPT, LIMIT, PROMPT)  # a prompt sent since runs into it again
+    assert world.orch.limit_hit("s1")
+    transcript(world, "s1", PROMPT, LIMIT, PROMPT, REPLY)  # the limit is over
+    assert world.orch.limit_hit("s1") is None
+    other = dict(LIMIT, error="server_error", message={"content": "API Error: Connection lost"})
+    transcript(world, "s1", PROMPT, other)
+    assert world.orch.limit_hit("s1") is None
+    assert world.orch.limit_hit("missing") is None and world.orch.limit_hit(None) is None
+
+
+def test_an_agent_at_its_limit_is_switched_at_the_next_pass(world, accounts, tmp_path,
+                                                             monkeypatch):
+    monkeypatch.setattr(world.orch, "PROJECTS", tmp_path / "projects")
+    world.run("account", "--spill", "1:98:2")
+    usage_at(world, 90)  # not reached: the limit alone moves it
+    idle_with_status(world, W1, context_tokens=300_000)
+    transcript(world, "s-new", PROMPT, LIMIT)
+
+    world.run("watchdog")
+
+    acc = json.loads((world.root / "accounts.json").read_text())
+    assert not acc["spill"]["active"]
+    assert [j["pane"] for j in accounts] == [W1] and accounts.handoffs == []
+    assert any("usage limit" in e["body"] for e in world.events() if e["kind"] == "account")
+
+
 def test_is_claude(world):
     assert world.orch.is_claude(os.getpid()) is False  # pytest
     assert world.orch.is_claude(None) is False and world.orch.is_claude(2 ** 30) is False
+
+
+def test_the_tailnet_name_is_tailscales_self_hostname_asked_once(world, monkeypatch):
+    calls = []
+
+    def run(cmd, **kw):
+        calls.append(cmd)
+        return SimpleNamespace(stdout=json.dumps({"Self": {"HostName": "box3",
+                                                           "DNSName": "box3.tail.ts.net."}}))
+    monkeypatch.setattr(world.orch, "_TAILNET_NAME", [])
+    monkeypatch.setattr(world.orch.subprocess, "run", run)
+    assert world.orch.machine_name() == "box3" and world.orch.machine_name() == "box3"
+    assert calls == [["tailscale", "status", "--json"]]
+    world.orch.CONFIG.parent.mkdir(parents=True)
+    world.orch.CONFIG.write_text("ORCH_TOKEN=x\nORCH_MACHINE=build-box\n")
+    assert world.orch.machine_name() == "build-box"
+    monkeypatch.setattr(world.orch, "_TAILNET_NAME", [])
+    monkeypatch.setattr(world.orch.subprocess, "run", lambda cmd, **kw: SimpleNamespace(stdout=""))
+    assert world.orch.tailnet_name() is None

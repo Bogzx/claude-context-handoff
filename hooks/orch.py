@@ -19,6 +19,9 @@ at every turn end (background tasks still running, last message). From those two
   orch account    which Claude account (claude-acc N) an agent runs on, and switching it: now,
                   when it is next idle (the watchdog does it) or at its next handoff.
   orch usage      account windows from the statusline and tokens per agent (orch_usage.py).
+  orch new        a new orchestrator in a new herdr tab: brief, decision log, run (orch_new.py).
+  orch serve      the HTTP gateway for the owner's phone app, on the tailnet only, and
+  orch pair       its pairing token (orch_serve.py).
 
 Agents report at turn end through the orch MCP server (orch_mcp.py), into
 ~/.claude/handoffs/agents/<pane>.json next to the Stop hook's status.
@@ -26,7 +29,7 @@ Agents report at turn end through the orch MCP server (orch_mcp.py), into
 Events go to ~/.claude/handoffs/events.jsonl. Owner alerts also go to the notify command:
 $ORCH_NOTIFY_CMD, else an executable ~/.claude/handoffs/notify, called as
 `<command> <title> <body>` with ORCH_EVENT_KIND set and the whole event as JSON in
-ORCH_EVENT. Python 3.8 compatible (ob1).
+ORCH_EVENT. Python 3.8 compatible (Ubuntu 20.04).
 """
 import argparse
 import json
@@ -52,7 +55,14 @@ NUDGE_EVERY = 15 * 60
 NUDGE_BACKOFF = 60 * 60  # after IGNORED nudges in a row on the same problem
 IGNORED = 3
 DANGER = ("none", "deploy", "prod", "destructive")  # what saying yes to an option does
+ANSWERED_SHOWN = 10 * 60  # an answered question stays in status this long (other devices)
 HOOK = Path(__file__).resolve().parent / "context-handoff.py"
+PROJECTS = Path.home() / ".claude" / "projects"  # the transcripts
+STARTS = Path.home() / ".claude" / "orch" / "new"  # orch new: <id>/new.json and <id>/brief.md
+START_SHOWN = 86400  # an unfinished start shows in the fleet this long
+SMALL_CONTEXT = 60_000  # a switching agent with less context is resumed, not handed off
+HANDOFF_WAIT = 30 * 60  # a switch handoff not written by then: resume the agent instead
+SWITCH_BUDGET = 200  # seconds of resumes per watchdog pass (its unit times out at 300)
 
 
 def now():
@@ -93,9 +103,17 @@ def save(path, data):
     os.replace(tmp, path)
 
 
+class Refused(SystemExit):
+    """Why a command can't be carried out: the CLI prints it and exits 2, the gateway (orch
+    serve) answers the app with it."""
+
+    def __init__(self, text):
+        super().__init__(2)
+        self.text = text
+
+
 def die(text):
-    print(f"orch: {text}", file=sys.stderr)
-    sys.exit(2)
+    raise Refused(text)
 
 
 # --- herdr ------------------------------------------------------------------------------
@@ -118,6 +136,60 @@ def agents():
 def prompt(pane, text):
     result = herdr("agent", "prompt", pane, text)
     return result.returncode == 0
+
+
+def screen_lines(pane, lines, source="recent"):
+    """The pane's last `lines` lines of terminal text, or None when herdr can't read it."""
+    try:
+        r = herdr("agent", "read", pane, "--source", source, "--lines", str(lines),
+                  "--format", "text", timeout=20)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if not r or r.returncode != 0:
+        return None
+    return r.stdout.rstrip("\n").split("\n")[-lines:]
+
+
+# --- this machine ------------------------------------------------------------------------
+
+CONFIG = Path.home() / ".config" / "orch" / ".env"  # the gateway's: token, key, allow-list
+
+
+def read_env(path=None):
+    """KEY=value lines of ~/.config/orch/.env (or path); {} when it is missing."""
+    out = {}
+    try:
+        text = Path(path or CONFIG).read_text()
+    except OSError:
+        return out
+    for line in text.splitlines():
+        line = line.strip()
+        if line and not line.startswith("#") and "=" in line:
+            key, _, value = line.partition("=")
+            out[key.strip()] = value.strip().strip("'\"")
+    return out
+
+
+_TAILNET_NAME = []
+
+
+def tailnet_name():
+    """This machine's Tailscale device name (Self.HostName), looked up once per process."""
+    if not _TAILNET_NAME:
+        try:
+            out = subprocess.run(["tailscale", "status", "--json"], capture_output=True,
+                                 text=True, timeout=5, check=False).stdout
+            _TAILNET_NAME.append(json.loads(out)["Self"].get("HostName") or None)
+        except (OSError, subprocess.SubprocessError, ValueError, KeyError, TypeError):
+            _TAILNET_NAME.append(None)
+    return _TAILNET_NAME[0]
+
+
+def machine_name(env=None):
+    """The name the owner's app knows this machine by: ORCH_MACHINE in ~/.config/orch/.env, else
+    its Tailscale device name, else the hostname."""
+    env = read_env() if env is None else env
+    return env.get("ORCH_MACHINE") or tailnet_name() or socket.gethostname()
 
 
 # --- events -----------------------------------------------------------------------------
@@ -228,7 +300,9 @@ def view(pane, agent, run, at):
     st = status_of(pane)
     session = ((agent or {}).get("agent_session") or {}).get("value")
     fresh = st if st and session and st.get("session") == session else {}
+    live = load(ROOT / "agents" / "context" / f"{slug(pane)}.json")  # the hook, mid-turn
     park = ((run or {}).get("parked") or {}).get(pane)
+    accounts = load(ROOT / "accounts.json")
     seq = (agent or {}).get("completion_seq")
     if park and ((park.get("until") and at >= park["until"])
                  or (seq is not None and park.get("seq") is not None and seq > park["seq"])):
@@ -247,7 +321,10 @@ def view(pane, agent, run, at):
         "park": park,
         "report": st.get("report"),  # the latest, whichever session wrote it (it has its time)
         "account": fresh.get("account"),
-        "switch": (load(ROOT / "accounts.json").get("switch") or {}).get(pane),  # pending
+        "context_tokens": (live.get("context_tokens") if session and live.get("session") == session
+                           else fresh.get("context_tokens")),
+        "switch": (accounts.get("switch") or {}).get(pane),  # pending
+        "spill": spill_state(pane, agent, fresh, accounts),
     }
 
 
@@ -282,9 +359,8 @@ def cmd_run(args):
     if args.action == "start":
         if not args.until:
             die("--until is required (HH:MM, 'YYYY-MM-DD HH:MM' or +4h)")
-        run = {"orchestrator": orch, "host": socket.gethostname(), "cwd": os.getcwd(),
-               "created": at, "until": parse_until(args.until, at), "goal": args.goal or "",
-               "workers": parse_workers(args.workers), "parked": {}, "ended": None}
+        run = new_run(orch, parse_until(args.until, at), args.goal or "",
+                      parse_workers(args.workers), os.getcwd(), at)
     elif args.action in ("set", "stop", "show") and not run:
         die(f"no run registered for {orch}: orch run start --until ... --workers ...")
     if args.action == "set":
@@ -303,10 +379,7 @@ def cmd_run(args):
     if args.action == "stop":
         run["ended"] = at
     if args.action != "show":
-        save(run_path(orch), run)
-        emit(f"run-{args.action}", f"Run {args.action}: {orch}",
-             f"until {clock(run['until'], True)}; {len(run['workers'])} workers; {run['goal']}",
-             orch)
+        save_run(orch, run, args.action)
     if args.json:
         print(json.dumps(run, indent=1))
         return 0
@@ -318,44 +391,71 @@ def cmd_run(args):
     return 0
 
 
-def cmd_park(args):
-    orch = orchestrator(args)
+def new_run(orch, until, goal, workers, cwd, at):
+    return {"orchestrator": orch, "host": socket.gethostname(), "cwd": cwd, "created": at,
+            "until": until, "goal": goal, "workers": workers, "parked": {}, "ended": None}
+
+
+def save_run(orch, run, action):
+    save(run_path(orch), run)
+    emit(f"run-{action}", f"Run {action}: {orch}",
+         f"until {clock(run['until'], True)}; {len(run['workers'])} workers; {run['goal']}", orch)
+
+
+def park(orch, pane, action, reason=None, until=None):
+    """Park (with a reason and an optional end) or unpark a worker of the orchestrator's run;
+    returns the run."""
     run = load_run(orch)
     if not run:
         die(f"no run registered for {orch}")
-    if args.pane not in run["workers"]:
-        die(f"{args.pane} is not a worker of this run (orch run set --add {args.pane}=label)")
-    if args.action == "unpark":
-        run.setdefault("parked", {}).pop(args.pane, None)
+    if pane not in run["workers"]:
+        die(f"{pane} is not a worker of this run (orch run set --add {pane}=label)")
+    if action == "unpark":
+        run.setdefault("parked", {}).pop(pane, None)
     else:
-        agent = (agents() or {}).get(args.pane) or {}
-        run.setdefault("parked", {})[args.pane] = {
-            "reason": args.reason, "since": now(), "seq": agent.get("completion_seq"),
-            "until": parse_until(args.until, now()) if args.until else None}
+        agent = (agents() or {}).get(pane) or {}
+        run.setdefault("parked", {})[pane] = {
+            "reason": reason, "since": now(), "seq": agent.get("completion_seq"),
+            "until": parse_until(until, now()) if until else None}
     save(run_path(orch), run)
+    return run
+
+
+def cmd_park(args):
+    run = park(orchestrator(args), args.pane, args.action, getattr(args, "reason", None),
+               getattr(args, "until", None))
     print(f"{args.action}ed {args.pane}" if args.action == "unpark" else
           f"parked {args.pane} until its next task"
           + (f" or {clock(run['parked'][args.pane]['until'])}" if args.until else ""))
     return 0
 
 
-def ask(pane, text, options=()):
+def ask(pane, text, options=(), kind=None):
     """Log a question for the owner in the pane's run and events.jsonl and push it; returns its
-    id. options: [{"label", "danger"}], the answers the owner's app offers as buttons."""
+    id. options: [{"label", "danger"}], the answers the owner's app offers as buttons. kind
+    "plan": the plan of a new orchestrator (`orch new --plan-first`), drawn from its report."""
     options = [{"label": o["label"], "danger": o.get("danger") or "none"} for o in options]
     qid = "q" + os.urandom(4).hex()
     run, _ = run_of(pane)
     if run:
-        run.setdefault("questions", []).append(
+        for q in run.setdefault("questions", []):  # a revised plan replaces the open one
+            if kind == "plan" and q.get("kind") == "plan" and q.get("pane") == pane \
+                    and not q.get("answered"):
+                q.update(answer=f"(replaced by {qid})", answered=now())
+        run["questions"].append(
             {"id": qid, "time": now(), "pane": pane, "text": text, "options": options,
-             "answer": None, "answered": None})
+             "kind": kind, "answer": None, "answered": None})
         save(run_path(run["orchestrator"]), run)
     body = text
     if options:
         body += "\nOptions: " + " / ".join(
             o["label"] + (f" [{o['danger']}]" if o["danger"] != "none" else "") for o in options)
-    emit("ask", f"Question from {pane} on {socket.gethostname()}", body, pane, push=True, id=qid,
-         question=text, options=options)
+    emit("ask", f"Question from {pane} on {machine_name()}", body, pane, push=True, id=qid,
+         question=text, options=options, question_kind=kind)
+    start = start_of(pane) if kind == "plan" else {}
+    if start.get("plan_first"):
+        start_step(start, "read", "ok")
+        start_step(start, "plan", "doing", f"waiting for the owner's OK ({qid})")
     return qid
 
 
@@ -374,7 +474,7 @@ class OptionAction(argparse.Action):
 
 
 def cmd_ask(args):
-    qid = ask(orchestrator(args), args.text, args.options or [])
+    qid = ask(orchestrator(args), args.text, args.options or [], args.kind)
     print(f"sent to the owner as {qid}; keep the rest of the fleet working while you wait for the "
           "answer")
     return 0
@@ -402,7 +502,8 @@ def find_question(qid):
                 if e.get("kind") == "ask":
                     found = {"id": qid, "time": e.get("time"), "pane": e.get("pane"),
                              "text": e.get("question") or e.get("body"),
-                             "options": e.get("options") or [], "answer": None, "answered": None}
+                             "options": e.get("options") or [], "kind": e.get("question_kind"),
+                             "answer": None, "answered": None}
                 elif e.get("kind") == "answer" and found:
                     found.update(answer=e.get("body"), answered=e.get("time"))
     except OSError:
@@ -410,21 +511,76 @@ def find_question(qid):
     return None, found
 
 
-def cmd_answer(args):
-    run, q = find_question(args.id)
+def answer(qid, text):
+    """Record the owner's answer to question qid and prompt the agent that asked; returns its
+    pane. A closed question or a failed prompt is refused and nothing is recorded."""
+    run, q = find_question(qid)
     if not q:
-        die(f"no question {args.id}")
+        die(f"no question {qid}")
     if q.get("answered"):
-        die(f"{args.id} was already answered at {clock(q['answered'], True)}: {q.get('answer')!r}")
+        die(f"{qid} was already answered at {clock(q['answered'], True)}: {q.get('answer')!r}")
     pane = q.get("pane") or (run or {}).get("orchestrator")
-    text = (f"The owner answered your question {args.id} ({first_line(q.get('text') or '', 160)!r}):"
-            f" {args.text}")
-    if not prompt(pane, text):
+    message = (f"The owner answered your question {qid} "
+               f"({first_line(q.get('text') or '', 160)!r}): {text}")
+    if not prompt(pane, message):
         die(f"could not prompt {pane}; the answer is not recorded")
-    q.update(answer=args.text, answered=now())
+    q.update(answer=text, answered=now())
     if run:
         save(run_path(run["orchestrator"]), run)
-    emit("answer", f"Answer to {args.id}", args.text, pane, id=args.id)
+    emit("answer", f"Answer to {qid}", text, pane, id=qid)
+    start = start_of(pane) if q.get("kind") == "plan" else {}
+    if any(s["step"] == "plan" for s in start.get("steps") or []):
+        start_step(start, "plan", "ok", f"answered: {first_line(text, 160)}")
+    return pane
+
+
+# --- starts (orch new) -----------------------------------------------------------------------
+
+def start_of(pane):
+    """The newest `orch new` start whose orchestrator is in the pane, or {}."""
+    found = {}
+    for path in STARTS.glob("*/new.json") if STARTS.is_dir() else ():
+        rec = load(path)
+        if rec.get("pane") == pane and (rec.get("time") or 0) >= (found.get("time") or 0):
+            found = rec
+    return found
+
+
+def start_step(rec, step, status, text="", **extra):
+    """A step of a start (pane, claude, trust, run, read or brief, plan) is doing, ok or failed:
+    kept in its new.json and logged as a `start` event (a failure alerts)."""
+    at, error = now(), text if status == "failed" else None
+    entry = {"step": step, "status": status, "time": at, **({"error": error} if error else {})}
+    steps = rec.setdefault("steps", [])
+    for i, s in enumerate(steps):
+        if s["step"] == step:
+            steps[i] = entry
+            break
+    else:
+        steps.append(entry)
+    rec.update(step=step, status=status, updated=at, **({"error": error} if error else {}))
+    save(STARTS / rec["id"] / "new.json", rec)
+    folder = os.path.basename(rec.get("cwd") or "")
+    emit("start", f"Start of {folder}: {step} {status}", text, rec.get("pane"),
+         push=status == "failed", action=rec["id"], step=step, status=status, error=error,
+         **extra)
+
+
+def start_cancelled(rec):
+    """{time, by} once the start was cancelled, else {}. A file of its own (<id>/cancelled.json),
+    so a running start's saves of new.json can't drop it."""
+    return load(STARTS / rec["id"] / "cancelled.json")
+
+
+def start_done(rec):
+    """Whether a start got through its last step: the plan answered with --plan-first, else the
+    brief sent."""
+    last = "plan" if rec.get("plan_first") else "brief"
+    return any(s["step"] == last and s["status"] == "ok" for s in rec.get("steps") or [])
+
+
+def cmd_answer(args):
+    pane = answer(args.id, args.text)
     print(f"answered {args.id}; prompted {pane}")
     return 0
 
@@ -452,6 +608,13 @@ def cmd_last(args):
     return 0
 
 
+def shown_questions(run, at):
+    """The run's open questions, and those answered in the last ANSWERED_SHOWN seconds (with
+    `answer` and `answered`), so another device sees the answer."""
+    return [q for q in (run or {}).get("questions") or []
+            if not q.get("answered") or q["answered"] >= at - ANSWERED_SHOWN]
+
+
 def fleet(orch, run, workers, at):
     ags = agents()
     if ags is None:
@@ -472,8 +635,9 @@ def cmd_status(args):
         print(json.dumps({"run": run, "orchestrator": ags.get(orch), "workers": views,
                           "report": lead["report"], "account": lead["account"],
                           "switch": lead["switch"],
-                          "questions": [q for q in (run or {}).get("questions") or []
-                                        if not q.get("answered")]},
+                          "spill": spill_summary(load(ROOT / "accounts.json")),
+                          "account_names": {k: a["name"] for k, a in account_list().items()},
+                          "questions": shown_questions(run, at)},
                          indent=1))
         return 0
     if run:
@@ -573,9 +737,12 @@ def cmd_wait(args):
 
 
 def nudge_reasons(run, ags, at, ws):
-    """Why the run's idle orchestrator should act now (empty when it shouldn't)."""
+    """Why the run's idle orchestrator should act now (empty when it shouldn't, as while its
+    plan waits for the owner's OK: no workers start before it)."""
     orch = run["orchestrator"]
     reasons = {}
+    if any(q.get("kind") == "plan" and not q.get("answered") for q in run.get("questions") or []):
+        return reasons
     first = ws.setdefault("first_seen", {})
     seen_now = set()
     any_free = False
@@ -623,11 +790,13 @@ def cmd_watchdog(args):
     ags = agents()
     if ags is None:
         return 0  # herdr is down; there is nothing to prompt
-    idle_switches(ags, args.dry_run)
+    claudes = pane_claudes()
+    spill_pass(ags, claudes, args.dry_run)
+    idle_switches(ags, claudes, args.dry_run)
     state_path = ROOT / "watchdog.json"
     state = load(state_path)
     at = now()
-    host = socket.gethostname()
+    host = machine_name()
     for run in all_runs():
         orch = run.get("orchestrator")
         if not orch or run.get("ended"):
@@ -700,7 +869,9 @@ QUOTE = re.compile(r"\s*([\"\u201c])(.*?)[\"\u201d]\.?\s*", re.DOTALL)
 REPLACES = re.compile(r"\b(?:replaces|replacing|supersedes|superseding|instead of|overrides|"
                       r"overriding)\s+((?:\*\*)?D\d+(?:\*\*)?(?:\s*(?:,|and|&|/)\s*(?:\*\*)?D\d+"
                       r"(?:\*\*)?)*)", re.IGNORECASE)
-WHY = re.compile(r"\b(?:why|because|reason)\b:?\s*", re.IGNORECASE)
+# A reason is only what an entry marks as one: "Why: ...", a sentence starting "Why", "because ..."
+WHY = re.compile(r"(?:(?:^|(?<=[.!?;]\s))why\b|\bwhy(?=:))\s*:?\s*|\bbecause\s+", re.IGNORECASE)
+SENTENCE_END = re.compile(r"[.!?](?=\s+[A-Z\"(`]|\s*$)")
 
 
 def lineage_of(pane):
@@ -710,13 +881,44 @@ def lineage_of(pane):
     return max(logs, key=lambda p: p.stat().st_mtime) if logs else None
 
 
-def sentences(text):
-    return [x for x in re.split(r"(?<=[.!?])\s+(?=[A-Z\"(`])", text.strip()) if x]
+def split_why(body):
+    """(what, why) of an entry's text. `why` is only an explicit reason: the rest of a "Why:" (or
+    "Why ...") sentence, or a "because" clause up to its ";" or full stop. Everything else stays
+    in `what`."""
+    m = WHY.search(body)
+    if not m:
+        return body.strip(), ""
+    because = m.group(0).lower().startswith("because")
+    rest = body[m.end():]
+    stop = SENTENCE_END.search(rest)
+    end = stop.start() if stop else len(rest)
+    if because and 0 <= rest.find(";") < end:
+        end = rest.find(";")
+    why, before, after = rest[:end].strip(), body[:m.start()].rstrip(), rest[end:]
+    if because:  # "X because Y; Z." -> "X; Z."
+        what = before.rstrip(" ,") + after
+    else:  # the "Why: ..." sentence goes whole, its full stop with it
+        what = " ".join(x for x in (before, after[1:].strip() if after[:1] in ".!?" else
+                                    after.strip()) if x)
+    return what.strip(), why
+
+
+def after_quote(body):
+    """The text after a quoted user line, without the ": " or "( ... )" that tie it to the quote."""
+    body = re.sub(r"^\s*[:\u2013\u2014-]\s*", "", body)
+    if body.startswith("("):
+        depth = 0
+        for i, ch in enumerate(body):
+            depth += {"(": 1, ")": -1}.get(ch, 0)
+            if depth == 0:
+                return (body[1:i] + body[i + 1:]).strip()
+    return body.strip()
 
 
 def parse_decisions(text):
-    """Entries of a decision log: id, time, who (user or agent), by (as written), quote (the
-    user's words), what (first sentence), why, superseded_by, generation, line."""
+    """Entries of a decision log, in log order: id, time, who (user or agent), by (as written,
+    else who), quote (the user's words), what (the entry, without its reason), why (only an
+    explicit reason), superseded_by, generation, line."""
     entries, generation, current = [], 1, None
     for number, line in enumerate(text.splitlines(), 1):
         if line.startswith("#"):
@@ -740,16 +942,15 @@ def parse_decisions(text):
         who = WHO.match(rest)
         e["by"] = who.group(1).strip() if who else ""
         rest = rest[who.end():] if who else rest
-        user = bool(re.search(r"\b(?:user|owner)\b", e["by"], re.IGNORECASE) if e["by"] else
-                    re.match(r"(?:the\s+)?(?:user|owner)\b", rest, re.IGNORECASE))
+        lead = None if e["by"] else re.match(r"(?:the\s+)?(?:user|owner)\b", rest, re.IGNORECASE)
+        user = bool(re.search(r"\b(?:user|owner)\b", e["by"], re.IGNORECASE) if e["by"] else lead)
         e["who"] = "user" if user else "agent"
+        e["by"] = e["by"] or (lead.group(0) if lead else "agent")
         quote = QUOTE.match(rest) if user else None
         e["quote"] = quote.group(2).strip() if quote else None
-        body = rest[quote.end():] if quote else rest
-        parts = sentences(body) or sentences(e["quote"] or "")
-        e["what"] = parts[0] if parts else body.strip()
-        why = WHY.search(body)
-        e["why"] = (body[why.end():] if why else " ".join(parts[1:])).strip()[:1000]
+        body = after_quote(rest[quote.end():]) if quote else rest
+        what, why = split_why(body)
+        e["what"], e["why"] = what or e["quote"] or "", why[:1000]
         e["superseded_by"] = None
         for ref in REPLACES.findall(rest):
             for old in re.findall(r"D\d+", ref):
@@ -757,7 +958,7 @@ def parse_decisions(text):
                     latest[old]["superseded_by"] = e["id"]
         latest[e["id"]] = e
         out.append(e)
-    return sorted(out, key=lambda e: e["who"] != "user")  # owner rules first, then log order
+    return out
 
 
 def cmd_decisions(args):
@@ -777,6 +978,97 @@ def cmd_decisions(args):
 
 
 # --- account switching -----------------------------------------------------------------------
+
+def account_list():
+    """Account number -> {dir, logged_in, name}: ~/.claude, then ~/.claude-2, ... while they
+    exist."""
+    names = load(ROOT / "accounts.json").get("names") or {}
+    n, accounts = 1, {}
+    while account_dir(n).exists():
+        accounts[str(n)] = {"dir": str(account_dir(n)),
+                            "logged_in": (account_dir(n) / ".credentials.json").exists(),
+                            "name": account_name(str(n), names)}
+        n += 1
+    return accounts
+
+
+def account_name(account, names):
+    """The name `orch account --name` gave the account, else "Acct N"."""
+    return names.get(account) or f"Acct {account}"
+
+
+def set_name(account, name):
+    """`orch account --name N NAME`; an empty NAME goes back to "Acct N"."""
+    if not re.fullmatch(r"\d+", account):
+        die(f"accounts are numbers (claude-acc N), not {account!r}")
+    path = ROOT / "accounts.json"
+    acc = load(path)
+    names = acc.setdefault("names", {})
+    if name.strip():
+        names[account] = name.strip()
+    else:
+        names.pop(account, None)
+    save(path, acc)
+    return account_name(account, names)
+
+
+def pane_claudes():
+    """herdr pane -> (pid, account) of the claude processes running in herdr panes, from
+    /proc (the account is the process's CLAUDE_CONFIG_DIR, as claude-acc sets it)."""
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import orch_usage
+    out = {}
+    for proc in Path("/proc").iterdir():
+        if not proc.name.isdigit():
+            continue
+        try:
+            if (proc / "comm").read_text().strip() != "claude":
+                continue
+            env = dict(x.split("=", 1) for x in
+                       (proc / "environ").read_bytes().decode(errors="replace").split("\0")
+                       if "=" in x)
+        except OSError:
+            continue
+        if env.get("HERDR_PANE_ID"):
+            out[env["HERDR_PANE_ID"]] = (int(proc.name),
+                                         orch_usage.account_of(env.get("CLAUDE_CONFIG_DIR")))
+    return out
+
+
+def limit_hit(session):
+    """The usage-limit message ("You've hit your weekly limit · resets ...") the session's last
+    turn ended with, else None. Claude Code writes it to the transcript as an API error."""
+    paths = list(PROJECTS.glob(f"*/{session}.jsonl")) if session else []
+    if not paths:
+        return None
+    try:
+        with open(paths[0], "rb") as f:
+            f.seek(max(0, f.seek(0, os.SEEK_END) - (256 << 10)))
+            lines = f.read().splitlines()
+    except OSError:
+        return None
+    for line in reversed(lines):
+        try:
+            e = json.loads(line)
+        except ValueError:
+            continue
+        if e.get("type") not in ("user", "assistant") or e.get("isSidechain") or e.get("isMeta"):
+            continue
+        if e["type"] == "user":
+            content = (e.get("message") or {}).get("content")
+            if isinstance(content, list) and any(isinstance(c, dict) and c.get("type") ==
+                                                 "tool_result" for c in content):
+                return None  # a tool ran after it
+            continue  # a prompt sent after the limit runs into it again
+        content = (e.get("message") or {}).get("content")
+        text = content if isinstance(content, str) else " ".join(
+            c.get("text", "") for c in content or [] if isinstance(c, dict))
+        if e.get("isApiErrorMessage") and (e.get("error") == "rate_limit"
+                                           or re.match(r"You've hit your \w+ limit", text)):
+            return text
+        return None
+    return None
+
 
 def check_account(account):
     if not re.fullmatch(r"\d+", account):
@@ -821,7 +1113,12 @@ def apply_switch(job):
         return (result.stderr or "").strip() or "see ~/.claude/handoffs/respawn.log"
     path = ROOT / "accounts.json"
     acc = load(path)
-    if (acc.get("switch") or {}).pop(job["pane"], None):
+    sw = (acc.get("switch") or {}).pop(job["pane"], None)
+    if (sw or {}).get("reason"):  # moved by the spill rule: the app shows it
+        acc.setdefault("moved", {})[job["pane"]] = {"account": job["account"], "time": now(),
+                                                    "how": "resume", "reason": sw["reason"]}
+        (acc.get("failed") or {}).pop(job["pane"], None)
+    if sw:
         save(path, acc)
     return None
 
@@ -843,31 +1140,225 @@ def switch_now(pane, account):
     return 0
 
 
-def idle_switches(ags, dry_run):
-    """Watchdog: carry out one pending --when-idle switch whose agent is idle now (a switch can
-    take two minutes, so one per pass). A switch that fails is dropped: the failure was pushed."""
+def idle_switches(ags, claudes, dry_run):
+    """Watchdog: carry out the pending --when-idle switches (by hand or the spill rule) of idle
+    agents. A large context goes through a handoff: the agent is asked for it, and its takeover
+    starts the fresh agent on the new account. An agent that hit its usage limit, a small
+    context, or a handoff still unwritten after HANDOFF_WAIT is resumed on the new account
+    instead, for up to SWITCH_BUDGET seconds per pass. A resume that fails is dropped (the
+    failure was pushed). Every choice is logged with its reason."""
     path = ROOT / "accounts.json"
-    acc = load(path)
-    for pane, sw in sorted((acc.get("switch") or {}).items()):
-        if sw.get("when") != "idle":
+    started, at = time.monotonic(), now()
+    for pane, sw in sorted((load(path).get("switch") or {}).items()):
+        agent = ags.get(pane)
+        if sw.get("when") != "idle" or (agent or {}).get("agent_status") not in ("idle", "done"):
             continue
-        job, why = switch_job(pane, sw["account"], ags.get(pane))
-        if not job:
-            if why.endswith(f"already runs on account {sw['account']}"):
-                acc["switch"].pop(pane)
-                save(path, acc)
+        if (claudes.get(pane) or (None, None))[1] == str(sw["account"]):
+            drop_switch(pane)  # already there
             continue
+        session = (agent.get("agent_session") or {}).get("value")
+        st = status_of(pane)
+        fresh = st if session and st.get("session") == session else {}
+        if fresh.get("background_tasks"):
+            continue
+        tokens = fresh.get("context_tokens")
+        how, why = "handoff", "a fresh agent there reads the handoff, not the whole conversation"
+        if sw.get("reason") == "limit":
+            how, why = "resume", "it hit its usage limit, so it can't write a handoff first"
+        elif tokens is not None and tokens < SMALL_CONTEXT:
+            how, why = "resume", (f"its context is {tokens // 1000}K tokens, cheaper to re-read "
+                                  "than a handoff")
+        elif sw.get("handoff"):
+            if at - sw["handoff"] < HANDOFF_WAIT:
+                continue  # its takeover follows the handoff it was asked for
+            how, why = "resume", f"no handoff {HANDOFF_WAIT // 60} min after asking for one"
         if dry_run:
-            print(f"would switch {pane} to account {sw['account']}")
-            return
+            print(f"would switch {pane} to account {sw['account']} by {how}: {why}")
+            continue
+        if how == "handoff":
+            message = request_handoff(pane, session, fresh.get("cwd") or agent.get("cwd"), sw)
+            if not message:
+                continue  # a handoff is already underway; its takeover applies the switch
+            if prompt(pane, message):
+                mark_switch(pane, handoff=at)
+                emit("account", f"Account switch: handoff asked of {pane}",
+                     f"to account {sw['account']}: {why}", pane, account=sw["account"],
+                     when="idle", how="handoff")
+                continue
+            how, why = "resume", "the handoff request could not be sent"
+        if time.monotonic() - started > SWITCH_BUDGET:
+            continue  # the next pass
+        job, _ = switch_job(pane, sw["account"], agent)
+        if not job:
+            continue
+        emit("account", f"Account switch: resuming {pane}", f"on account {sw['account']}: {why}",
+             pane, account=sw["account"], when="idle", how="resume")
         error = apply_switch(dict(job, when="idle"))
         if error:
-            acc = load(path)
-            (acc.get("switch") or {}).pop(pane, None)
-            save(path, acc)
+            drop_switch(pane)
+            if sw.get("reason"):
+                path_failed(pane, sw["account"], error)
             emit("account", f"Account switch dropped: {pane}", error, pane,
                  account=sw["account"], when="idle")
+
+
+def request_handoff(pane, session, cwd, sw):
+    """The handoff hook's request for the agent (its lineage set up to take over on the
+    switch), or None while a handoff is already underway."""
+    job = {"pane": pane, "session": session, "cwd": cwd or "", "account": sw["account"],
+           "why": sw.get("why") or "queued by orch account --when-idle"}
+    result = subprocess.run([sys.executable, str(HOOK), "--request-handoff", json.dumps(job)],
+                            capture_output=True, text=True, timeout=60, check=False)
+    return result.stdout.strip() if result.returncode == 0 else None
+
+
+def mark_switch(pane, **fields):
+    path = ROOT / "accounts.json"
+    acc = load(path)
+    if pane in (acc.get("switch") or {}):
+        acc["switch"][pane].update(fields)
+        save(path, acc)
+
+
+def path_failed(pane, account, error):
+    path = ROOT / "accounts.json"
+    acc = load(path)
+    acc.setdefault("failed", {})[pane] = {"account": account, "time": now(), "error": error}
+    save(path, acc)
+
+
+def spill_state(pane, agent, st, acc):
+    """Where the spill rule stands with this agent, for the app: moved (at idle or at the
+    limit), waiting (and on what), can't move (and why), or None when it isn't involved."""
+    sw = (acc.get("switch") or {}).get(pane) or {}
+    if sw.get("reason") in ("spill", "limit"):
+        status = (agent or {}).get("agent_status")
+        reason = ("no agent in the pane" if not agent else "at a dialog" if status == "blocked"
+                  else "working" if status == "working"
+                  else "own job running" if st.get("background_tasks")
+                  else "writing its handoff" if sw.get("handoff") else "the next watchdog pass")
+        return {"state": "cant_move" if not agent else "waiting", "reason": reason,
+                "time": sw.get("time"), "account": sw["account"]}
+    failed = (acc.get("failed") or {}).get(pane)
+    if failed:
+        return {"state": "cant_move", "reason": failed["error"], "time": failed["time"],
+                "account": failed["account"]}
+    moved = (acc.get("moved") or {}).get(pane)
+    if moved:
+        return {"state": "moved_limit" if moved.get("reason") == "limit" else "moved_idle",
+                "reason": moved.get("how"), "time": moved["time"], "account": moved["account"]}
+    return None
+
+
+def spill_summary(acc):
+    """The spill rule with its progress: since (when it fired), moved of total."""
+    rule = acc.get("spill")
+    if not rule:
+        return None
+    involved = ({p for p, sw in (acc.get("switch") or {}).items()
+                 if sw.get("reason") in ("spill", "limit")}
+                | set(acc.get("moved") or {}) | set(acc.get("failed") or {}))
+    return dict(rule, since=(rule.get("active") or {}).get("since"),
+                moved=len(acc.get("moved") or {}), total=len(involved))
+
+
+def account_for_new(acc):
+    """The account a new agent should start on: the spill target while the rule is active,
+    else the default."""
+    rule = acc.get("spill") or {}
+    return rule["to"] if rule.get("active") else acc.get("default") or "1"
+
+
+def drop_switch(pane):
+    path = ROOT / "accounts.json"
+    acc = load(path)
+    if (acc.get("switch") or {}).pop(pane, None):
+        save(path, acc)
+
+
+def spill_pass(ags, claudes, dry_run):
+    """Watchdog: the spill rule (`orch account --spill FROM:PCT:TO`). Once account FROM's week
+    or 5-hour window is at PCT% or more (fresh capture only; stale data counts as unknown),
+    every agent on FROM gets a pending when-idle switch to TO. An agent on FROM whose last turn
+    ended at the usage limit gets one marked "limit", which is resumed at once."""
+    path = ROOT / "accounts.json"
+    acc = load(path)
+    rule = acc.get("spill")
+    if not rule:
         return
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import orch_usage
+    at = now()
+    usage = orch_usage.windows_report(ROOT, at).get(rule["from"])
+    if usage and not usage["stale"]:
+        hot = next(({"window": name, "used": w["used_percentage"], "since": at}
+                    for name, w in sorted(usage["windows"].items(), reverse=True)
+                    if not w["reset"] and w["used_percentage"] is not None
+                    and w["used_percentage"] >= rule["at"]), None)
+        if hot and not rule.get("active"):
+            rule["active"] = hot
+            acc["moved"], acc["failed"] = {}, {}
+            emit("spill", f"Account {rule['from']} at {hot['used']}%: moving to {rule['to']}",
+                 f"its {hot['window']} window reached {rule['at']}%; its agents move to account "
+                 f"{rule['to']} at their next turn end or when idle", None, push=True, **hot)
+        elif not hot and rule.get("active"):
+            rule["active"] = None
+            emit("spill", f"Account {rule['from']} is under {rule['at']}% again",
+                 "new agents on it stay there", None)
+    switches = acc.setdefault("switch", {})
+    for pane, agent in sorted(ags.items()):
+        if ((claudes.get(pane) or (None, None))[1] != rule["from"]
+                or pane in (acc.get("failed") or {})):  # can't move: shown, not retried
+            continue
+        sw = switches.get(pane)
+        limit = (agent.get("agent_status") in ("idle", "done")
+                 and limit_hit((agent.get("agent_session") or {}).get("value")))
+        if limit and (sw or {}).get("reason") != "limit":
+            switches[pane] = {"account": rule["to"], "time": at, "when": "idle",
+                              "reason": "limit", "why": f"it hit the usage limit ({limit})"}
+        elif rule.get("active") and not sw:
+            switches[pane] = {"account": rule["to"], "time": at, "when": "idle",
+                              "reason": "spill",
+                              "why": (f"account {rule['from']} is at {rule['active']['used']}% "
+                                      f"of its {rule['active']['window']} window")}
+        else:
+            continue
+        emit("account", f"Account switch queued: {pane}",
+             f"moves to account {rule['to']} when idle: {switches[pane]['why']}", pane,
+             account=rule["to"], when="idle", reason=switches[pane]["reason"])
+    if dry_run:
+        print(f"spill {rule['from']}:{rule['at']}:{rule['to']} active={rule.get('active')}; "
+              f"pending: {sorted(switches)}")
+        return
+    save(path, acc)
+
+
+def set_spill(text):
+    """`orch account --spill FROM:PCT:TO` or `--spill off` (which also drops the pending
+    switches the rule queued)."""
+    path = ROOT / "accounts.json"
+    acc = load(path)
+    if text == "off":
+        acc.pop("spill", None)
+        for pane in [p for p, sw in (acc.get("switch") or {}).items()
+                     if sw.get("reason") in ("spill", "limit")]:
+            acc["switch"].pop(pane)
+        save(path, acc)
+        emit("spill", "Spill rule off", "pending spill switches dropped", None)
+        return "spill rule off"
+    m = re.fullmatch(r"(\d+):(\d+(?:\.\d+)?):(\d+)", text)
+    if not m or m.group(1) == m.group(3):
+        die(f"--spill takes FROM:PCT:TO (e.g. 1:98:2) or off, not {text!r}")
+    check_account(m.group(3))
+    pct = float(m.group(2))
+    acc["spill"] = {"from": m.group(1), "at": int(pct) if pct.is_integer() else pct,
+                    "to": m.group(3), "time": now(), "active": None}
+    save(path, acc)
+    rule = f"{m.group(1)}:{acc['spill']['at']}:{m.group(3)}"
+    emit("spill", f"Spill rule on: {rule}", f"account {m.group(1)} at {acc['spill']['at']}% moves "
+         f"its agents to account {m.group(3)}", None)
+    return (f"spill rule on: when account {m.group(1)}'s week or 5-hour window reaches "
+            f"{acc['spill']['at']}%, its agents move to account {m.group(3)} (by the watchdog)")
 
 
 def run_switch(job):
@@ -876,55 +1367,99 @@ def run_switch(job):
 
 
 def cmd_account(args):
-    path = ROOT / "accounts.json"
-    acc = load(path)
-    at = now()
+    acc = load(ROOT / "accounts.json")
     if args.default:
-        check_account(args.default)
-        acc["default"] = args.default
-        save(path, acc)
-        emit("account", f"Default account: {args.default}", "for new agents", None,
-             account=args.default)
+        set_default(args.default)
         print(f"default account for new agents: {args.default}")
         return 0
+    if args.spill:
+        print(set_spill(args.spill))
+        return 0
+    if args.for_new:
+        print(account_for_new(acc))
+        return 0
+    if args.name:
+        print(f"account {args.name[0]} is named {set_name(*args.name)}")
+        return 0
     if not args.pane:
-        n, accounts = 1, {}
-        while account_dir(n).exists():
-            accounts[str(n)] = {"dir": str(account_dir(n)),
-                                "logged_in": (account_dir(n) / ".credentials.json").exists()}
-            n += 1
+        accounts = account_list()
         out = {"accounts": accounts, "default": acc.get("default") or "1",
-               "switch": acc.get("switch") or {}}
+               "for_new": account_for_new(acc), "switch": acc.get("switch") or {},
+               "spill": spill_summary(acc)}
         if args.json:
             print(json.dumps(out, indent=1))
             return 0
         for k, a in accounts.items():
-            print(f"account {k}: {a['dir']}" + ("" if a["logged_in"] else " (not logged in)")
+            print(f"account {k} ({a['name']}): {a['dir']}"
+                  + ("" if a["logged_in"] else " (not logged in)")
                   + (" (default)" if k == out["default"] else ""))
+        if out["spill"]:
+            sp = out["spill"]
+            print(f"spill {sp['from']}:{sp['at']}:{sp['to']}" + (
+                f" (active since {clock(sp['active']['since'])}: {sp['active']['window']} at "
+                f"{sp['active']['used']}%)" if sp.get("active") else " (not reached)"))
         for pane, sw in out["switch"].items():
             print(f"  {pane} moves to account {sw['account']} "
-                  + ("when idle" if sw.get("when") == "idle" else "at its next handoff"))
+                  + ("when idle" if sw.get("when") == "idle" else "at its next handoff")
+                  + (f" ({sw['why']})" if sw.get("why") else ""))
         return 0
     if not args.account:
         die("usage: orch account PANE N [--now | --at-handoff]")
     check_account(args.account)
     if args.now:
         return switch_now(args.pane, args.account)
-    when = "idle" if args.when_idle else "handoff"
-    text = ("when it is next idle with no background tasks (the watchdog restarts it and resumes "
-            "the session)" if args.when_idle else "at its next handoff (no extra tokens)")
-    acc.setdefault("switch", {})[args.pane] = {"account": args.account, "time": at, "when": when}
-    save(path, acc)
-    emit("account", f"Account switch queued: {args.pane}",
-         f"moves to account {args.account} {text}", args.pane, account=args.account, when=when)
+    text = queue_switch(args.pane, args.account, "idle" if args.when_idle else "handoff")
     print(f"{args.pane} moves to account {args.account} {text}")
     return 0
+
+
+def set_default(account):
+    check_account(account)
+    path = ROOT / "accounts.json"
+    acc = load(path)
+    acc["default"] = account
+    save(path, acc)
+    emit("account", f"Default account: {account}", "for new agents", None, account=account)
+
+
+def queue_switch(pane, account, when):
+    """Move the pane's agent to account N when it is next idle ("idle", the watchdog does it) or
+    at its next handoff ("handoff"); returns how, in words."""
+    check_account(account)
+    path = ROOT / "accounts.json"
+    acc = load(path)
+    text = ("at its next turn end or when idle, through a handoff and a fresh agent there (a "
+            "small context or an agent at its usage limit is resumed instead)" if when == "idle"
+            else "at its next handoff (no extra tokens)")
+    acc.setdefault("switch", {})[pane] = {"account": account, "time": now(), "when": when}
+    save(path, acc)
+    emit("account", f"Account switch queued: {pane}", f"moves to account {account} {text}", pane,
+         account=account, when=when)
+    return text
 
 
 def cmd_usage(args):
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     import orch_usage
-    return orch_usage.main(args, ROOT, now(), agents)
+    return orch_usage.main(args, ROOT, now(), agents, account_list())
+
+
+def cmd_new(args):
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import orch_new
+    return orch_new.main(args)
+
+
+def cmd_serve(args):
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import orch_serve
+    return orch_serve.serve(args)
+
+
+def cmd_pair(args):
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import orch_serve
+    return orch_serve.pair(args)
 
 
 def cmd_notify(args):
@@ -962,6 +1497,8 @@ def main(argv=None):
                    help="an answer the owner can pick (repeatable)")
     a.add_argument("--danger", action=OptionAction, dest="options", choices=DANGER,
                    help="what the option before it does when picked (default none)")
+    a.add_argument("--kind", choices=["plan"],
+                   help="plan: a new orchestrator's plan (orch new --plan-first), for approval")
     a.set_defaults(func=cmd_ask)
 
     ans = sub.add_parser("answer", help="record the owner's answer and prompt the asker")
@@ -1008,13 +1545,44 @@ def main(argv=None):
                       help="restart the idle agent now and resume its session (re-reads its "
                            "context uncached on the new account)")
     when.add_argument("--when-idle", action="store_true",
-                      help="like --now, the next time it is idle with no background tasks "
-                           "(the watchdog does it)")
+                      help="at its next turn end or when idle: a handoff and a fresh agent on "
+                           "the new account, or a resume for a small context")
     when.add_argument("--at-handoff", action="store_true",
                       help="at its next context handoff (default; costs nothing extra)")
     acct.add_argument("--default", metavar="N", help="the account for new agents")
+    acct.add_argument("--spill", metavar="FROM:PCT:TO",
+                      help="move every agent on account FROM to account TO once FROM's week or "
+                           "5-hour window reaches PCT%% (e.g. 1:98:2), or 'off'")
+    acct.add_argument("--for-new", action="store_true",
+                      help="print the account a new agent should start on (claude-acc N): the "
+                           "spill target while the rule is active, else the default")
+    acct.add_argument("--name", nargs=2, metavar=("N", "NAME"),
+                      help="a short name for account N in status and the phone app (default "
+                           "\"Acct N\"; \"\" resets it)")
     acct.add_argument("--json", action="store_true")
     acct.set_defaults(func=cmd_account)
+
+    nw = sub.add_parser("new", help="start a new orchestrator in a new herdr tab here")
+    nw.add_argument("--cwd", required=True, help="the folder it works in (or branches from)")
+    nw.add_argument("--goal", required=True, help="what the run is for, in the owner's words")
+    nw.add_argument("--until", required=True, help="HH:MM, 'YYYY-MM-DD HH:MM' or +8h")
+    nw.add_argument("--model", help="claude --model (default: Claude Code's)")
+    nw.add_argument("--effort", help="claude --effort")
+    nw.add_argument("--account", default="auto",
+                    help="N as in claude-acc N, or auto (default): the account for new agents")
+    nw.add_argument("--plan-first", action="store_true",
+                    help="propose a roadmap and wait for the owner's Approve before working")
+    nw.add_argument("--rules", action="append", metavar="TEXT",
+                    help="an owner rule, written at the top of its decision log (repeatable)")
+    nw.add_argument("--name", help="the herdr agent's name (and the worktree's)")
+    nw.add_argument("--worktree", action="store_true",
+                    help="work in a new git worktree <cwd>-<name> on branch orch/<name>")
+    nw.add_argument("--worker-model", help="the model its workers start on (in its brief)")
+    nw.add_argument("--max-workers", type=int, help="how many workers at a time (in its brief)")
+    nw.add_argument("--id", help="the request's id: the same id again starts nothing")
+    nw.add_argument("--dry-run", action="store_true", help="print the steps, change nothing")
+    nw.add_argument("--json", action="store_true")
+    nw.set_defaults(func=cmd_new)
 
     u = sub.add_parser("usage", help="account windows and tokens per agent")
     u.add_argument("action", nargs="?", choices=["capture"],
@@ -1023,13 +1591,29 @@ def main(argv=None):
     u.add_argument("--json", action="store_true")
     u.set_defaults(func=cmd_usage)
 
+    sv = sub.add_parser("serve", help="the HTTP gateway for the owner's app, on the tailnet only")
+    sv.add_argument("--allow-self", action="store_true",
+                    help="also accept requests from this machine's own node (tests only)")
+    sv.set_defaults(func=cmd_serve)
+
+    pr = sub.add_parser("pair", help="create the gateway's pairing token and print it")
+    pr.add_argument("--allow", action="append", metavar="NODE",
+                    help="tailnet node allowed to call the gateway: its name or StableID "
+                         "(repeatable; replaces the list)")
+    pr.add_argument("--new", action="store_true", help="replace the token")
+    pr.set_defaults(func=cmd_pair)
+
     n = sub.add_parser("notify", help="send a test alert through the notify command")
     n.add_argument("title")
     n.add_argument("body")
     n.set_defaults(func=cmd_notify)
 
     args = p.parse_args(argv)
-    return args.func(args)
+    try:
+        return args.func(args)
+    except Refused as e:
+        print(f"orch: {e.text}", file=sys.stderr)
+        raise
 
 
 if __name__ == "__main__":

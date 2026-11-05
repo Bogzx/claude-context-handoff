@@ -212,6 +212,34 @@ def test_state_from_the_flat_layout_gets_a_fresh_notice(hook, run):
     assert str(lineage / "handoff.md") in out["hookSpecificOutput"]["additionalContext"]
 
 
+@pytest.mark.parametrize("accounts, env", [
+    ({}, {"HANDOFF_LINEAGE": "L", "CLAUDE_CONFIG_DIR": "/home/u/.claude-2"}),  # no rule: kept
+    ({"spill": {"from": "1", "at": 98, "to": "2", "active": {"used": 98}}},
+     {"HANDOFF_LINEAGE": "L", "CLAUDE_CONFIG_DIR": "ACC2"}),  # spilling: the target
+    ({"spill": {"from": "1", "at": 98, "to": "2", "active": None}},
+     {"HANDOFF_LINEAGE": "L"}),  # after the reset: the default account, 1
+    ({"spill": {"from": "1", "at": 98, "to": "2", "active": None}, "default": "2"},
+     {"HANDOFF_LINEAGE": "L", "CLAUDE_CONFIG_DIR": "ACC2"}),
+    ({"switch": {PANE: {"account": "1", "when": "handoff"}},
+      "spill": {"from": "1", "at": 98, "to": "2", "active": {"used": 98}}},
+     {"HANDOFF_LINEAGE": "L"}),  # a queued switch wins
+])
+def test_the_takeover_account_follows_the_switch_then_the_spill_rule(hook, monkeypatch,
+                                                                     accounts, env):
+    monkeypatch.setenv("HERDR_PANE_ID", PANE)
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", "/home/u/.claude-2")
+    monkeypatch.setattr(hook, "claude_pid", os.getpid)
+    monkeypatch.setattr(hook, "account_dir", lambda n: "ACC" + str(n))
+    started = []
+    monkeypatch.setattr(hook.subprocess, "Popen", lambda args, **kw: started.append(args))
+    hook.ROOT.mkdir(parents=True, exist_ok=True)
+    (hook.ROOT / "accounts.json").write_text(json.dumps(accounts))
+
+    assert hook.start_respawn({"session_id": "s1"}, Path("L"), "claude-opus-5-5")
+
+    assert json.loads(started[0][-1])["env"] == env
+
+
 def test_herdr_stop_passes_the_sessions_lineage_to_the_respawn(hook, run, monkeypatch):
     monkeypatch.setattr(hook, "IN_HERDR", True)
     monkeypatch.setenv("HERDR_PANE_ID", PANE)
@@ -597,6 +625,72 @@ def test_no_report_is_asked_while_a_handoff_is_underway(hook, in_run):
     assert in_run(entry("user", "fix #12"), tool("Bash"), RESULT) is None
 
 
+def big(text="done"):  # an assistant entry of a 300K-token context
+    e = entry("assistant", [{"type": "text", "text": text}])
+    e["message"]["usage"] = {"input_tokens": 1000, "cache_read_input_tokens": 299_000}
+    return e
+
+
+def test_a_pending_idle_switch_asks_for_the_handoff_at_the_turn_end(hook, in_run, monkeypatch):
+    accounts = hook.ROOT / "accounts.json"
+    accounts.write_text(json.dumps({"switch": {PANE: {
+        "account": "2", "time": 1.0, "when": "idle", "reason": "spill",
+        "why": "account 1 is at 98% of its seven_day window"}}}))
+    started = []
+    monkeypatch.setattr(hook.subprocess, "Popen", lambda args, **kw: started.append(args))
+
+    out = in_run(entry("user", "fix #12"), tool("Bash"), RESULT, big())
+
+    assert out["decision"] == "block" and "moving this agent to Claude account 2" in out["reason"]
+    assert "account 1 is at 98%" in out["reason"]
+    state = json.loads((hook.ROOT / "state" / "s1.json").read_text())
+    lineage = Path(state["dir"])
+    assert lineage.name.startswith("w1-p1-") and str(lineage / "handoff.md") in out["reason"]
+    assert json.loads(accounts.read_text())["switch"][PANE]["handoff"] == pytest.approx(
+        time.time(), abs=60)
+    # Once asked, the next turn end is the report's, and the handoff starts the takeover with
+    # the switch (start_respawn applies the pending account).
+    assert "sent no report" in in_run(entry("user", "go on", uuid="p2"), tool("Bash"), RESULT,
+                                      big())["reason"]
+    write_handoff(lineage)
+    append(lineage / "decisions.md", "- D1 moved to account 2\n")
+    out = in_run(entry("user", "go on", uuid="p3"), tool("Write"), RESULT, big())
+    assert "takes over this pane" in out["systemMessage"]
+    [args] = started
+    assert json.loads(args[-1])["account"] == "2"
+
+
+@pytest.mark.parametrize("switch, tokens", [
+    ({"account": "2", "time": 1.0, "when": "idle"}, 20_000),  # small: orch resumes it
+    ({"account": "2", "time": 1.0, "when": "idle", "reason": "limit"}, 300_000),
+    ({"account": "2", "time": 1.0, "when": "handoff"}, 300_000),  # at its own handoff
+    ({"account": "1", "time": 1.0, "when": "idle"}, 300_000),  # already there
+])
+def test_other_switches_dont_ask_for_a_handoff(hook, in_run, switch, tokens, monkeypatch):
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR")  # account 1
+    (hook.ROOT / "accounts.json").write_text(json.dumps({"switch": {PANE: switch}}))
+    last = big()
+    last["message"]["usage"] = {"input_tokens": tokens}
+    out = in_run(entry("user", "fix #12"), tool("Bash"), RESULT, last)
+    assert "Claude account" not in out["reason"]  # the report rule's block instead
+
+
+def test_request_handoff_prepares_the_lineage_and_prints_the_request(hook, capsys):
+    job = {"pane": "w1:p4", "session": "s9", "cwd": "/work/proj", "account": "2",
+           "why": "queued by orch account --when-idle"}
+    assert hook.request_handoff(job) == 0
+    text = capsys.readouterr().out
+    state = json.loads((hook.ROOT / "state" / "s9.json").read_text())
+    lineage = Path(state["dir"])
+    assert lineage.parent == hook.ROOT / "work-proj" and lineage.name.startswith("w1-p4-")
+    assert (lineage / "decisions.md").exists() and "soft" in state
+    assert f"It is written now to {lineage / 'handoff.md'}" in text
+    assert "takes over this herdr pane" in text  # the herdr wording, even outside herdr
+    state["respawned"] = 5.0  # a takeover is starting: nothing to ask
+    (hook.ROOT / "state" / "s9.json").write_text(json.dumps(state))
+    assert hook.request_handoff(job) == 1
+
+
 def test_the_orchestrator_is_asked_for_its_fields(in_run):
     in_run.run.write_text(json.dumps({"orchestrator": PANE, "until": time.time() + 3600,
                                       "ended": None, "workers": {}}))
@@ -620,6 +714,26 @@ def test_the_status_file_keeps_the_report_and_records_the_account(hook, run, mon
     assert status["report"] == {"summary": "fixed #12"} and status["account"] == "2"
     assert status["pid"] == os.getpid() and status["relaunch"][-2:] == ["--effort", "high"]
     assert status["relaunch"][-4:-2] == ["--model", "claude-opus-5-5"]
+
+
+def test_context_tokens_are_recorded_at_session_start_and_during_the_turn(hook, run, monkeypatch):
+    monkeypatch.setattr(hook, "IN_HERDR", True)
+    monkeypatch.setenv("HERDR_PANE_ID", PANE)
+    monkeypatch.setattr(hook, "claude_pid", lambda: None)
+    live = hook.ROOT / "agents" / "context" / "w1-p1.json"
+
+    run("SessionStart", tokens=120_000, source="resume")  # a resumed session: its last call
+    assert json.loads(hook.status_path(PANE).read_text())["context_tokens"] == 120_000
+    assert json.loads(live.read_text())["context_tokens"] == 120_000
+    run("PostToolUse", tokens=124_000)  # less than CONTEXT_STEP: not rewritten
+    assert json.loads(live.read_text())["context_tokens"] == 120_000
+    run("PostToolUse", tokens=126_000)
+    assert json.loads(live.read_text())["context_tokens"] == 126_000
+    run("PostToolUse", session="s2", tokens=127_000)  # another session: always
+    assert {k: v for k, v in json.loads(live.read_text()).items() if k != "time"} == {
+        "session": "s2", "context_tokens": 127_000}
+    # mid-turn the status file (and the report the MCP server may be writing) is left alone
+    assert json.loads(hook.status_path(PANE).read_text())["context_tokens"] == 120_000
 
 
 @pytest.mark.parametrize("config_dir, account", [
@@ -717,6 +831,35 @@ def test_account_switch_now_refuses_with_background_tasks(hook, switch, herdr_st
 
     assert hook.respawn(job) is False
     assert ["agent", "prompt", PANE, "/exit"] not in calls()
+
+
+def test_a_takeover_records_a_spill_move(hook, takeover, herdr_stub):
+    takeover.job.update(account="2", reason="spill")
+    (hook.ROOT / "accounts.json").write_text(json.dumps({"switch": {PANE: {
+        "account": "2", "when": "idle", "reason": "spill"}}}))
+
+    takeover()
+
+    acc = json.loads((hook.ROOT / "accounts.json").read_text())
+    assert acc["switch"] == {} and acc["moved"][PANE]["how"] == "handoff"
+    assert acc["moved"][PANE]["reason"] == "spill"
+
+
+def test_a_takeover_waits_for_a_dialog_on_the_new_account(hook, takeover, herdr_stub,
+                                                           monkeypatch):
+    calls, configure = herdr_stub
+    configure(new="blocked")  # account 2 asks to trust the folder; nobody answers
+    clock = iter(range(0, 10 ** 6, 5))
+    monkeypatch.setattr(hook.time, "time", lambda: float(next(clock)))
+
+    assert hook.respawn(takeover.job) is False
+
+    events = [json.loads(x) for x in (hook.ROOT / "events.jsonl").read_text().splitlines()]
+    assert [e["kind"] for e in events] == ["respawn-dialog", "respawn-failed"]
+    assert "folder trust" in events[0]["body"]
+    polls = len([c for c in calls() if c[:2] == ["agent", "list"]])
+    assert polls > hook.DIALOG_WAIT / 5 / 2  # it kept waiting well past the 90 s start
+    assert prompts(calls) == []  # no takeover prompt into a dialog
 
 
 def test_account_switch_now_reports_a_dialog_in_the_new_agent(hook, switch, herdr_stub, capsys):

@@ -214,7 +214,7 @@ def test_report_per_agent_run_day_and_window_share(u):
     run_file(u, "w1:p0", {"w1:p1": {"label": "builder"}}, T0 - 2 * HOUR, T0 + 6 * HOUR)
     status_file(u, "w1:p0", "boss")
     status_file(u, "w1:p1", "work", account="2")
-    lineage = u.root / "home-bogdan-x" / "w1-p2-20261105-080000-oldsessi"  # a gone pane
+    lineage = u.root / "home-me-x" / "w1-p2-20261105-080000-oldsessi"  # a gone pane
     lineage.mkdir(parents=True)
     write(u.projects / "p" / "boss.jsonl", assistant("b0", T0 - 5 * HOUR, out=1, read=0, w1=0)
           + assistant("b1", T0 - HOUR, out=1000, read=0, w1=0))  # b0: before the run
@@ -242,8 +242,40 @@ def test_report_per_agent_run_day_and_window_share(u):
     five = rep["accounts"]["1"]["windows"]["five_hour"]
     assert set(five["agents"]) == {"w1:p0"}  # account 1, in the window
     assert rep["per_account"]["unknown"]["messages"] == 2  # no account seen: loose, w1:p2
-    assert five["agents"]["w1:p0"] == {"share": 1.0, "estimated_points": 30.0}
+    assert five["agents"]["w1:p0"]["share"] == 1.0
+    assert five["agents"]["w1:p0"]["estimated_points"] == 30.0
     assert "estimate" in rep["note"]
+
+
+@pytest.fixture
+def utc(monkeypatch):
+    """Local time is UTC: T0 is 09:13, so "today" starts 9 h 13 min before it."""
+    monkeypatch.setenv("TZ", "UTC")
+    time.tzset()
+    yield
+    monkeypatch.undo()
+    time.tzset()
+
+
+def test_report_lists_every_known_account_and_points_of_the_last_hour_and_today(u, utc):
+    status_file(u, "w1:p0", "boss")
+    write(u.projects / "p" / "boss.jsonl",
+          assistant("h", T0 - HOUR / 2, inp=0, out=1000, read=0, w1=0)  # $0.02, the last hour
+          + assistant("t", T0 - 3 * HOUR, inp=0, out=3000, read=0, w1=0)  # $0.06, today
+          + assistant("y", T0 - 20 * HOUR, inp=0, out=6000, read=0, w1=0))  # $0.12, yesterday
+    u.capture(statusline(session="boss", week=60.0), {}, u.root, T0)  # 60 points for $0.20
+
+    rep = u.report(u.root, u.projects, {}, T0, 24, {"1": {"name": "main"}, "2": {"name": "spare"}})
+
+    week = rep["accounts"]["1"]["windows"]["seven_day"]
+    assert rep["accounts"]["1"]["id"] == "1" and rep["accounts"]["1"]["name"] == "main"
+    assert week["machine_cost_usd"] == 0.2
+    assert week["agents"]["w1:p0"] == {"share": 1.0, "estimated_points": 60.0,
+                                       "points_last_hour": 6.0, "points_today": 24.0}
+    assert rep["accounts"]["2"] == {"id": "2", "name": "spare", "updated": None, "stale": True,
+                                    "windows": {}}  # no statusline ran on it yet
+    assert list(rep["accounts"]) == ["1", "2"]
+    assert "account 2 (spare): no reading yet" in u.human(rep)
 
 
 def test_a_session_keeps_its_pane_after_the_status_file_moves_on(u):
