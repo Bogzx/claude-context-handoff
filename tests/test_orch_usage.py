@@ -214,7 +214,7 @@ def test_report_per_agent_run_day_and_window_share(u):
     run_file(u, "w1:p0", {"w1:p1": {"label": "builder"}}, T0 - 2 * HOUR, T0 + 6 * HOUR)
     status_file(u, "w1:p0", "boss")
     status_file(u, "w1:p1", "work", account="2")
-    lineage = u.root / "home-bogdan-x" / "w1-p2-20261105-080000-oldsessi"  # a gone pane
+    lineage = u.root / "home-me-x" / "w1-p2-20261105-080000-oldsessi"  # a gone pane
     lineage.mkdir(parents=True)
     write(u.projects / "p" / "boss.jsonl", assistant("b0", T0 - 5 * HOUR, out=1, read=0, w1=0)
           + assistant("b1", T0 - HOUR, out=1000, read=0, w1=0))  # b0: before the run

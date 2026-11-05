@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # Install or update the context-handoff hooks, orch, its MCP server and its watchdog timer.
 #   ./install.sh                  this machine
-#   ./install.sh HOST [HOST ...]  other machines over ssh, e.g. ./install.sh bogdan@dev2 ubuntu@ob1
+#   ./install.sh HOST [HOST ...]  other machines over ssh, e.g. ./install.sh user@host2 user@host3
 set -euo pipefail
 cd "$(dirname "$0")"
 hooks=(hooks/context-handoff.py hooks/context-handoff-install.py hooks/orch.py hooks/orch_mcp.py
-       hooks/orch_usage.py hooks/orch_serve.py)
+       hooks/orch_usage.py hooks/orch_serve.py hooks/orch_push.py)
 units=(systemd/orch-watchdog.service systemd/orch-watchdog.timer systemd/orch-serve.service)
 files=("${hooks[@]}" "${units[@]}" install.sh)
 if [ $# -eq 0 ]; then

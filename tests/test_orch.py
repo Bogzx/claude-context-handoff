@@ -6,6 +6,7 @@ import os
 import sys
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -65,6 +66,8 @@ def world(tmp_path, monkeypatch):
     monkeypatch.setattr(orch, "agents", lambda: dict(w.agents))
     monkeypatch.setattr(orch, "prompt", lambda pane, text: w.prompts.append((pane, text)) or True)
     monkeypatch.setattr(orch, "herdr", lambda *a, **k: w.herdr_calls.append(a))
+    monkeypatch.setattr(orch, "CONFIG", tmp_path / "config" / ".env")
+    monkeypatch.setattr(orch, "_TAILNET_NAME", ["box1"])  # as if `tailscale status` said so
     monkeypatch.delenv("ORCH_NOTIFY_CMD", raising=False)
     w.agent(BOSS, "idle", seq=1)
     return w
@@ -474,7 +477,7 @@ Started 2026-11-05 10:00. Append-only.
 
 ## Generation 2: takeover by w1 in herdr pane w1:p0, 2026-11-05 12:00, from gen-01.md
 - D4 12:05, orchestrator: sample every 30 s instead of D3, because 15 s cost too much CPU.
-- **D5** 2026-11-05 12:10, the user (Bogdan): "drop the widget". Replaces **D2** and D1.
+- **D5** 2026-11-05 12:10, the user (Alex): "drop the widget". Replaces **D2** and D1.
 - **D6** 2026-11-05 ~12:20, user proposed: "ship it today". Agent agreed.
 - **D7** 2026-11-05 12:30 EET (10:30 UTC), agent: shipped.
 - **D8** 2026-11-05 12:40 EET (date), agent: tagged v1.
@@ -484,7 +487,7 @@ Started 2026-11-05 10:00. Append-only.
 
 
 def write_log(world, name, text, mtime):
-    lineage = world.root / "home-bogdan-Repo-x" / name
+    lineage = world.root / "home-me-Repo-x" / name
     lineage.mkdir(parents=True)
     (lineage / "decisions.md").write_text(text)
     os.utime(lineage / "decisions.md", (mtime, mtime))
@@ -517,7 +520,7 @@ def test_decisions_parses_the_newest_log_of_the_pane(world, capsys):
     assert d["D3"]["why"] == "The gateway samples state for the activity strip."
     assert d["D4"]["by"] == "orchestrator" and d["D4"]["time"] == "12:05"
     assert d["D4"]["why"] == "15 s cost too much CPU." and d["D4"]["generation"] == 2
-    assert d["D5"]["who"] == "user" and d["D5"]["by"] == "the user (Bogdan)"
+    assert d["D5"]["who"] == "user" and d["D5"]["by"] == "the user (Alex)"
     assert {k: d[k]["superseded_by"] for k in d if d[k]["superseded_by"]} == {
         "D1": "D5", "D2": "D5", "D3": "D4"}
     assert (d["D6"]["who"], d["D6"]["time"], d["D6"]["quote"]) == ("user", "2026-11-05 ~12:20",
@@ -589,7 +592,7 @@ def test_account_switch_at_handoff_is_queued(world, accounts, capsys):
     with pytest.raises(SystemExit):  # not logged in
         world.run("account", W1, "3")
     with pytest.raises(SystemExit):
-        world.run("account", W1, "pibo2")
+        world.run("account", W1, "work2")
 
 
 def test_account_switch_now_resumes_an_idle_agent(world, accounts, capsys):
@@ -811,7 +814,7 @@ def test_spill_off_drops_its_pending_switches_and_bad_rules_are_refused(world, a
     world.run("account", "--spill", "off")
     acc = json.loads((world.root / "accounts.json").read_text())
     assert "spill" not in acc and set(acc["switch"]) == {W2}
-    for bad in ("1:98", "1:98:1", "2:98:3", "pibo1:98:pibo2"):
+    for bad in ("1:98", "1:98:1", "2:98:3", "main:98:spare"):
         with pytest.raises(SystemExit):
             world.run("account", "--spill", bad)
 
@@ -901,3 +904,22 @@ def test_an_agent_at_its_limit_is_switched_at_the_next_pass(world, accounts, tmp
 def test_is_claude(world):
     assert world.orch.is_claude(os.getpid()) is False  # pytest
     assert world.orch.is_claude(None) is False and world.orch.is_claude(2 ** 30) is False
+
+
+def test_the_tailnet_name_is_tailscales_self_hostname_asked_once(world, monkeypatch):
+    calls = []
+
+    def run(cmd, **kw):
+        calls.append(cmd)
+        return SimpleNamespace(stdout=json.dumps({"Self": {"HostName": "box3",
+                                                           "DNSName": "box3.tail.ts.net."}}))
+    monkeypatch.setattr(world.orch, "_TAILNET_NAME", [])
+    monkeypatch.setattr(world.orch.subprocess, "run", run)
+    assert world.orch.machine_name() == "box3" and world.orch.machine_name() == "box3"
+    assert calls == [["tailscale", "status", "--json"]]
+    world.orch.CONFIG.parent.mkdir(parents=True)
+    world.orch.CONFIG.write_text("ORCH_TOKEN=x\nORCH_MACHINE=build-box\n")
+    assert world.orch.machine_name() == "build-box"
+    monkeypatch.setattr(world.orch, "_TAILNET_NAME", [])
+    monkeypatch.setattr(world.orch.subprocess, "run", lambda cmd, **kw: SimpleNamespace(stdout=""))
+    assert world.orch.tailnet_name() is None

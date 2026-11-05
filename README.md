@@ -13,7 +13,7 @@ reads and adds to (see [Decision log](#decision-log)).
 `orch` (in `hooks/orch.py`) keeps a herdr orchestration moving across those takeovers: a run registered per
 orchestrator pane, one shared wait, parked workers and a watchdog timer (see [Orchestration runs](#orchestration-runs-orch)).
 
-Installed on dev1, dev2 and ob1 since 2026-10-24.
+In daily use on three machines since 2026-10-24.
 
 ## Stages
 
@@ -61,8 +61,8 @@ At the first Stop after the handoff has been written, the hook starts a detached
 The relaunch keeps the original command-line flags but drops the session identity (`--resume`, `--continue`,
 `--session-id`, `--fork-session`) and the old initial prompt. The model is taken from the transcript, so a `/model`
 switch carries over, and the effort comes from the hook input or `$CLAUDE_EFFORT`. The account carries over through
-`CLAUDE_CONFIG_DIR`, which `claude-acc N` sets for accounts above 1 (`pibo2`). It goes in as a prefix on the
-command only, so a later `pibo` in the same pane is not affected.
+`CLAUDE_CONFIG_DIR`, which `claude-acc N` sets for accounts above 1. It goes in as a prefix on the
+command only, so a later command in the same pane is not affected.
 
 Every takeover is logged in `~/.claude/handoffs/respawn.log` and `events.jsonl`. A failure is logged there too,
 raises a herdr notification and goes to the owner's notify command (see [Alerts](#alerts)). A postponed takeover is
@@ -93,8 +93,8 @@ Now each piece of work gets a lineage folder, and its decisions go in `decisions
 - What a new agent reads: the whole log while it is up to 30 KB. Past that, `decisions-index.md` (the first 160
   characters of every entry, written at each takeover) and the log from the generation that just finished, plus the
   one before it if both fit in 60 KB. Older entries are looked up by D-number. Reading every log in full had made each
-  new AlphaProve orchestrator start at 140–190K of its 400K tokens (177 KB log), and the bg3-ai log reached 587 KB.
-  So the first line of an entry has to say on its own what was decided and by whom.
+  new orchestrator of one large project start at 140–190K of its 400K tokens (177 KB log), and another project's
+  log reached 587 KB. So the first line of an entry has to say on its own what was decided and by whom.
 
 - One entry per decision, numbered D1, D2, … across generations: date and time, who decided (the user, quoted
   verbatim, or the agent), what was chosen or ruled out, and why, with the evidence for a ruled-out approach.
@@ -260,13 +260,14 @@ account and machine, plus each agent's share of the window, from the transcripts
 matched to panes through the status files, herdr and the lineage folders, and to accounts through the status files
 and the statusline. The cost is an estimate from list prices (`PRICES` in `hooks/orch_usage.py`), not a bill, and the
 shares only count this machine. Transcripts are read incrementally (`usage-cache.json` keeps the offsets and 10-minute
-buckets for 8 days, and older files are skipped). On dev1, with 4.4 GB of transcripts, the first pass took 7 s and
+buckets for 8 days, and older files are skipped). On one machine, with 4.4 GB of transcripts, the first pass took 7 s and
 the next one under a second.
 
 ### Gateway (orch serve)
 
 `hooks/orch_serve.py` is the HTTP gateway the phone app (orch-app) calls on each machine. The contract is orch-app's
-`docs/API.md` (v1). It uses only the standard library and runs on Python 3.8.
+`docs/API.md` (v1), and `docs/PUSH.md` for pushes and the relay. Its HTTP side uses only the standard library and runs
+on Python 3.8; the push and relay code (`hooks/orch_push.py`) also needs the `cryptography` package (see Pushes).
 
 - It listens on port 7433, on the machine's Tailscale IPv4 (`tailscale ip -4`) only, never on 0.0.0.0, and won't
   start without one.
@@ -274,29 +275,62 @@ the next one under a second.
   StableID, short name or full name. It must also carry the pairing token as `Authorization: Bearer <token>`. An
   unknown node gets 403 and a missing or wrong token gets 401, both with an empty body.
 - `orch pair --allow <phone's tailnet name>` writes the token and the allow-list to `~/.config/orch/.env` (mode 600,
-  directory 700) and prints the token and a pairing string for a QR code (`orch://pair?machine=...&addr=...&port=7433&token=...`).
-  Run it again to change the list; `--new` replaces the token. The same file can name the accounts:
-  `ORCH_ACCOUNT_NAMES=1=pibo1,2=pibo2`. The gateway reads the file on every request, so changes take effect without a
+  directory 700) and prints the token and a pairing string for a QR code
+  (`orch://pair?machine=...&addr=...&port=7433&token=...&key=...&project=...`). `key` is the AES-256 key of pushes and
+  relay messages; `project` is the Firebase project, printed once the service account key is installed. Run it again to
+  change the list; `--new` replaces the token and the key. The same file can name the accounts:
+  `ORCH_ACCOUNT_NAMES=1=work,2=personal`. The gateway reads the file on every request, so changes take effect without a
   restart.
+- The machine's name in the API, pushes and the relay is `ORCH_MACHINE` from that file, else its Tailscale device
+  name (`tailscale status --json`, `Self.HostName`), else its hostname.
 - `orch serve --allow-self` also admits the machine's own node. It is off by default and meant for a local test.
+- `GET /v1/health` (version, clock, push and relay state; the `Server` header is `orch/<version>`), `POST /v1/pair`
+  (the phone's FCM token and relay uid; a node of the machine's own Tailscale user with the right token joins the
+  allow-list by StableID, then gets a `test` push) and `DELETE /v1/pair` (leaves the allow-list, token forgotten).
+  The gateway keeps the phones in `~/.config/orch/phones.json` (600).
 - Reads: `GET /v1/fleet` (runs with their orchestrator and workers, reports, open questions, blocked dialogs with the
   screen text, stall reasons with proposed fixes, accounts with today's samples, pending switches, recent actions),
   `/v1/usage?hours=168`, `/v1/orchestrators/<pane>/decisions`, `/v1/orchestrators/<pane>/history?since=&limit=`,
   `/v1/panes/<pane>/screen?lines=15` and `/v1/actions/<id>`.
 - Writes: `POST /v1/actions`, one JSON action with the app's `id` (a UUID), `time` and `kind`: `prompt`, `answer`,
   `interrupt` (Esc), `park`, `unpark`, `run` (`extend` from the current end, or `stop`), `nudge`, `account` (`now`,
-  `idle`, `handoff`), `default_account` or `ack` (decisions seen). An id runs once: a retry with the same body gets the
+  `idle`, `handoff`), `default_account`, `spill`, `ack` (decisions seen) or `push_token` (a rotated FCM token). An id runs once: a retry with the same body gets the
   first result, and the same id with a different body is refused. Actions older than 10 minutes are refused. The
   answer is 202 `delivered`, 4xx `rejected` or 502 `failed`, with a sentence the app can show. An action becomes
   `picked` once its target agent starts a turn (for an agent that was already working, at its next state change). A
   switch `now` runs in the background, and its action ends `picked` or `failed`.
-- The gateway appends every action, refused ones included, to `events.jsonl` as kind `action` with `source: "app"`.
+- The gateway appends every action, refused ones included, to `events.jsonl` as kind `action` with `source: "app"`
+  (or `"relay"`).
 - `install.sh` installs `orch-serve.service` (systemd user unit) enabled but not started. It only runs once
   `~/.config/orch/.env` exists: `orch pair`, then `systemctl --user start orch-serve`.
 
-Not in the gateway yet: answering a permission dialog (`dialog` is refused), the diff view, the activity lanes, the
-per-agent model and context size, and the FCM push sender and the relay poller. Those two go in `BACKGROUND` in
-`orch_serve.py`, next to the job that rescans the transcripts every 5 minutes so `/v1/usage` stays fast.
+Not in the gateway yet: answering a permission dialog (`dialog` is refused), the diff view, the activity lanes and the
+per-agent model.
+
+### Pushes and the relay (orch_push.py)
+
+The gateway's background loop also pushes to the paired phones and polls the relay mailbox, so notifications and quick
+answers work off the tailnet. The app side is orch-app `docs/PUSH.md`.
+
+- Down: FCM HTTP v1 data messages sent by the machine itself with the `orch-push` service account
+  (`~/.config/orch/firebase-sa.json`, 600). The payload is zlib-compressed JSON sealed with AES-256-GCM under the
+  pairing key (`ORCH_KEY`), so Google relays only `{v, machine, nonce, ct}`. What is pushed: questions and dialogs open
+  30 s (high priority); stalls 5 minutes after the watchdog's nudge, ended runs, usage running out before its reset,
+  spill events, failures (`system`), action statuses; a state snapshot per orchestrator on change (at most one a
+  minute), accounts on a whole-percent change (at most every 5 minutes) and a heartbeat every 10 minutes (collapsible).
+  The gateway trims a message over FCM's 4 KB in fixed steps and lists them in its `trimmed`. A passing FCM
+  failure is retried on the next pass; a dead token stops pushes to that phone until the app sends a new one.
+- Up: the phone writes sealed actions to Firestore at `mailboxes/<its anonymous uid>/<machine>/<id>`. The gateway
+  polls its paired phones' mailboxes (every 30 s, every 5 s for 10 minutes after a push that may get an answer), runs
+  each action through the same code as `POST /v1/actions` (`source: "relay"`) and deletes it.
+- The crypto uses the `cryptography` package from the system (Debian/Ubuntu: python3-cryptography; 2.8, Ubuntu
+  20.04's, is enough). Nothing else imports it: without it the gateway still serves HTTP and `/v1/health` says
+  why pushes are off.
+- `cloud/firebase_setup.py` sets up the Firebase project (`--project`, else the one in
+  `~/.config/orch/google-services.json`) once, idempotently (`--dry-run` shows what it would change):
+  APIs, the Firestore database (eur3 unless `--location`), Anonymous sign-in, the `orchPush` role (FCM send;
+  Firestore get, list and delete) held by the `orch-push` service account, its key, and `cloud/firestore.rules`.
+  `--copy-to host2 user@host3` copies the key. It uses the Firebase CLI's own login and keeps no secret.
 
 ## Outside herdr
 
@@ -307,14 +341,14 @@ one-line pointer to an unread handoff.
 
 ## Install
 
-Requirements: Linux (`/proc`), Python 3.8 or newer (ob1 runs 3.8, so keep the script 3.8-compatible), and herdr for
+Requirements: Linux (`/proc`), Python 3.8 or newer (Ubuntu 20.04 has 3.8, so keep the scripts 3.8-compatible), and herdr for
 the takeover.
 
 ```bash
 git clone https://github.com/Bogzx/claude-context-handoff.git
 cd claude-context-handoff
 ./install.sh                          # this machine
-./install.sh bogdan@dev2 ubuntu@ob1   # other machines over ssh
+./install.sh user@host2 user@host3   # other machines over ssh
 ```
 
 `install.sh` copies `hooks/` into `~/.claude/hooks/`, links `~/.local/bin/orch` to `orch.py`, installs and starts the
@@ -352,7 +386,7 @@ quick test, set it inline: `HANDOFF_SOFT_TOKENS=1000 claude …`.
 All under `~/.claude/handoffs/`:
 
 - `<project-path>/<pane>-<started>-<session>/`: one lineage folder, for example
-  `home-bogdan-Repo-AlphaProve/w17-p8B-20261026-134442-45643f64/`. The pane part is `local` outside herdr; several
+  `home-me-Repo-myapp/w17-p8B-20261026-134442-45643f64/`. The pane part is `local` outside herdr; several
   workers often share one worktree, so lineages are kept apart by pane. The session part is the first 8 characters of
   the session that started it, which also finds its transcript.
   - `handoff.md`: the pending handoff.
@@ -376,14 +410,13 @@ All under `~/.claude/handoffs/`:
 ## Checking it works
 
 ```bash
-uv run --no-project --with pytest pytest -q                 # offline tests
-uv run --python 3.8 --no-project --with pytest pytest -q    # the Python that ob1 runs
+uv run --no-project --with pytest --with cryptography pytest -q        # offline tests
+uv run --python 3.8 --no-project --with pytest --with cryptography==2.8 pytest -q  # the oldest Python and cryptography
 tail ~/.claude/handoffs/respawn.log ~/.claude/handoffs/events.jsonl
 systemctl --user list-timers orch-watchdog.timer
 orch watchdog --dry-run
 sha256sum ~/.claude/hooks/context-handoff.py hooks/context-handoff.py
-ssh bogdan@dev2 'sha256sum ~/.claude/hooks/context-handoff.py'
-ssh ubuntu@ob1 'sha256sum ~/.claude/hooks/context-handoff.py'
+ssh user@host2 'sha256sum ~/.claude/hooks/context-handoff.py'
 jq .env ~/.claude/settings.json
 ```
 
@@ -418,6 +451,6 @@ the log and then `gen-01.md`, and found the `## Generation 2` line the hook had 
 Research on long contexts (Chroma's "Context Rot", Du et al. at EMNLP 2025, Anthropic's context-engineering post) shows
 quality dropping as context grows, and the common rule of thumb is to reset at 40–60% of the window. On that basis
 the first recommendation was a handoff at about 120K and a hard stop at about 200K. The owner chose 400K and 600K
-instead, because the current models hold up well at high context and the projects (AlphaProve in particular) are
+instead, because the current models hold up well at high context and the projects (one in particular) are
 large. Limits based on project size were considered and dropped: what fills the context is the task, not the size of
 the repo. Per-project overrides cover the exceptions.

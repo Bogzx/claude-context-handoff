@@ -3,6 +3,7 @@ The shapes are checked against orch-app docs/API.md (v1, draft 2026-11-05)."""
 import importlib.util
 import json
 import os
+import socket
 import stat
 import sys
 import threading
@@ -32,8 +33,8 @@ class World:
         self.screen = "Bash command\n  rm saves/tmp/x.lsv\nDo you want to proceed?\n"
         self.whois = {"127.0.0.1": {"Node": {"StableID": "nPHONE", "ComputedName": "phone",
                                              "Name": "phone.tail.ts.net."}},
-                      "100.64.0.1": {"Node": {"StableID": "nDEV1", "ComputedName": "dev1",
-                                              "Name": "dev1.tail.ts.net."}}}
+                      "100.64.0.1": {"Node": {"StableID": "nBOX1", "ComputedName": "box1",
+                                              "Name": "box1.tail.ts.net."}}}
 
     def agent(self, pane, status, seq=1, change=1, name=None):
         self.agents[pane] = {"pane_id": pane, "agent_status": status, "completion_seq": seq,
@@ -99,9 +100,13 @@ def world(tmp_path, monkeypatch):
     monkeypatch.setattr(orch, "herdr", w.herdr)
     monkeypatch.setattr(serve, "tailscale", w.tailscale)
     monkeypatch.setattr(serve, "CONFIG", tmp_path / "config" / ".env")
+    monkeypatch.setattr(orch, "CONFIG", tmp_path / "config" / ".env")
+    monkeypatch.setattr(orch, "_TAILNET_NAME", ["box1"])  # `tailscale status`'s Self.HostName
+    monkeypatch.setattr(serve.orch_push, "PHONES", tmp_path / "config" / "phones.json")
+    monkeypatch.setattr(serve.orch_push, "SA_FILE", tmp_path / "config" / "firebase-sa.json")
     serve.write_env({"ORCH_TOKEN": TOKEN, "ORCH_ALLOW": "phone",
-                     "ORCH_ACCOUNT_NAMES": "1=pibo1,2=pibo2"})
-    w.agent(BOSS, "idle", name="AlphaProve")
+                     "ORCH_ACCOUNT_NAMES": "1=main,2=spare"})
+    w.agent(BOSS, "idle", name="Website")
     return w
 
 
@@ -244,7 +249,7 @@ def test_auth_needs_an_allowed_node_and_the_token_and_says_nothing_else(world, h
 
 
 def test_allow_self_admits_this_machines_own_node_only_when_asked(world, http):
-    world.whois["127.0.0.1"] = world.whois["100.64.0.1"]  # the caller is dev1 itself
+    world.whois["127.0.0.1"] = world.whois["100.64.0.1"]  # the caller is box1 itself
     assert http()("/v1/fleet") == (403, b"")
     assert http(allow_self=True)("/v1/fleet")[0] == 200
 
@@ -296,8 +301,16 @@ def test_pair_keeps_a_private_token_and_prints_the_pairing_string(world, capsys)
     assert stat.S_IMODE(os.stat(world.serve.CONFIG.parent).st_mode) == 0o700
     world.orch.main(["pair"])
     assert world.serve.read_env() == env  # the same token and list
+    key = env["ORCH_KEY"]
+    assert len(world.serve.orch_push.b64d(key)) == 32 and f"&key={key}" in out
+    assert "project=" not in out and "pushes: off until the service account key" in out
     world.orch.main(["pair", "--new"])
     assert world.serve.read_env()["ORCH_TOKEN"] != token
+    assert world.serve.read_env()["ORCH_KEY"] != key  # a new pairing gets a new push key
+    world.serve.orch_push.SA_FILE.write_text(json.dumps({"project_id": "orch-test"}))
+    world.orch.main(["pair"])
+    out = capsys.readouterr().out
+    assert "&project=orch-test" in out and "pushes: Firebase project orch-test" in out
 
 
 # --- reads ----------------------------------------------------------------------------------------
@@ -344,7 +357,7 @@ def test_fleet_has_the_api_shape_and_the_stalled_run(world):
     for acc in fleet["accounts"].values():
         conforms(acc, ACCOUNT)
     run, loose = fleet["orchestrators"]
-    assert run["pane"] == BOSS and run["name"] == "AlphaProve" and loose["pane"] == LOOSE
+    assert run["pane"] == BOSS and run["name"] == "Website" and loose["pane"] == LOOSE
     assert run["activity"] == "stalled" and run["activity_since"] == world.t - 6 * 60
     assert run["run"]["goal"] == "ship the fixes" and loose["run"] is None
     assert loose["activity"] == "working" and loose["workers"] == []
@@ -369,9 +382,9 @@ def test_fleet_has_the_api_shape_and_the_stalled_run(world):
     assert run["stall"]["nudged_at"] == world.t
     assert run["report"]["source"] == "report" and run["report"]["progress"]["done"] == 4
     one, two = fleet["accounts"]["1"], fleet["accounts"]["2"]
-    assert one["name"] == "pibo1" and one["config_dir"] == "~/.claude" and not one["stale"]
+    assert one["name"] == "main" and one["config_dir"] == "~/.claude" and not one["stale"]
     assert [p[1] for p in one["windows"]["seven_day"]["samples"]] == [77, 78, 79, 80]
-    assert two["name"] == "pibo2" and two["windows"] == {} and two["stale"]
+    assert two["name"] == "spare" and two["windows"] == {} and two["stale"]
     assert fleet["default_account"] == "1"
 
 
@@ -398,7 +411,7 @@ def test_fleet_says_when_herdr_is_down(world, monkeypatch):
 
 
 def lineage(w):
-    d = w.root / "home-bogdan-proj" / f"{BOSS.replace(':', '-')}-20261105-093000-abcd1234"
+    d = w.root / "home-me-proj" / f"{BOSS.replace(':', '-')}-20261105-093000-abcd1234"
     d.mkdir(parents=True)
     (d / "decisions.md").write_text(
         "# Decision log\n\n## Generation 1\n"
@@ -459,6 +472,7 @@ def test_screen(world):
 
 def test_the_background_loop_keeps_the_usage_scan_warm(world):
     assert (300, world.serve.warm_usage) in world.serve.BACKGROUND
+    assert (5, world.serve.push_and_relay) in world.serve.BACKGROUND
     world.serve.warm_usage(None)
     assert (world.root / "usage-cache.json").exists()
 
@@ -639,3 +653,383 @@ def test_an_account_switch_now_runs_in_the_background(world, monkeypatch):
     assert world.post(gw, id="n2", kind="account", pane=W1, account="2", when="now")[0] == 202
     started.pop()()
     assert world.get(gw, "/v1/actions/n2")[1]["status"] == "picked"
+
+
+# --- pairing, health, pushes and the relay (orch_push.py; needs `cryptography`) ------------------
+
+KEY = bytes(range(32))
+MACHINE = "box1"  # the tailnet name the world fixture gives this machine
+HEALTH = {"machine": str, "version": str, "time": NUM, "addr?": str, "orchestrators": [str],
+          "accounts": dict, "push": {"registered": bool, "seq": int, "last_sent?": NUM,
+                                     "last_heartbeat?": NUM, "error?": str},
+          "relay?": {"last_poll?": NUM, "error?": str}}
+PAIRED = {"machine": str, "version": str, "orchestrators": [str], "accounts": dict,
+          "test_push": {"seq": int, "sent": NUM, "error?": str}}
+_RSA = []
+
+
+class Cloud:
+    """orch_push.http's fake: the OAuth token, FCM (it opens what it is sent) and Firestore."""
+
+    def __init__(self, push):
+        self.push = push
+        self.pushes = []  # {"token", "android", "message"} of every accepted send
+        self.fcm = []  # answers to the next sends, (status, body); then 200
+        self.docs = {}  # Firestore document name -> fields
+        self.sends = 0
+
+    def __call__(self, method, url, body=None, headers=None, form=False, timeout=20):
+        if url == self.push.TOKEN_URI:
+            return 200, {"access_token": "at", "expires_in": 3600}
+        if url.endswith("/messages:send"):
+            self.sends += 1
+            m = body["message"]
+            answer = self.fcm.pop(0) if self.fcm else (200, {"name": f"m{self.sends}"})
+            if answer[0] == 200:
+                self.pushes.append({"token": m["token"], "android": m["android"],
+                                    "message": self.push.unseal(KEY, "push", MACHINE, m["data"])})
+            return answer
+        name = url.split("/v1/", 1)[1].split("?")[0]
+        if method == "DELETE":
+            return (200, {}) if self.docs.pop(name, None) is not None else (404, {})
+        docs = [{"name": n, "fields": f, "createTime": f"2026-11-05T10:00:0{i}Z"}
+                for i, (n, f) in enumerate(self.docs.items()) if n.rsplit("/", 1)[0] == name]
+        return 200, ({"documents": docs} if docs else {})
+
+    def write(self, uid, action, key=KEY, doc=None):
+        """What the app does off the tailnet: a sealed action in its mailbox for this machine."""
+        env = self.push.seal(key, "relay", MACHINE, action)
+        doc = doc or f"d{len(self.docs) + 1}"
+        name = f"projects/orch-test/databases/(default)/documents/mailboxes/{uid}/{MACHINE}/{doc}"
+        self.docs[name] = {k: {"stringValue": env[k]} for k in ("v", "nonce", "ct")}
+        return name
+
+    def kinds(self):
+        return [p["message"]["kind"] for p in self.pushes]
+
+
+@pytest.fixture
+def cloud(world, monkeypatch):
+    pytest.importorskip("cryptography")
+    from cryptography.hazmat.backends import default_backend
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    if not _RSA:
+        _RSA.append(rsa.generate_private_key(65537, 2048, default_backend()).private_bytes(
+            serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption()).decode())
+    push = world.serve.orch_push
+    push.SA_FILE.write_text(json.dumps({
+        "project_id": "orch-test", "private_key_id": "k1", "private_key": _RSA[0],
+        "client_email": "orch-push@orch-test.iam.gserviceaccount.com"}))
+    world.serve.write_env(dict(world.serve.read_env(), ORCH_KEY=push.b64e(KEY)))
+    c = Cloud(push)
+    monkeypatch.setattr(push, "http", c)
+    return c
+
+
+def pair(world, gw, token="fcm-1", uid="uid1", addr="127.0.0.1"):
+    return gw.route("POST", "/v1/pair", {}, {"fcm_token": token, "device": "OnePlus 12",
+                                             "app_version": "0.3.0", "relay_uid": uid}, addr)
+
+
+def test_health_and_the_server_header(world, cloud):
+    gw = world.serve.Gateway()
+    server = world.serve.make_server(gw, "127.0.0.1", 0)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    url = f"http://127.0.0.1:{server.server_port}/v1/health"
+    try:
+        with pytest.raises(urllib.error.HTTPError) as refused:
+            urllib.request.urlopen(url, timeout=10)
+        assert refused.value.code == 401 and refused.value.headers["Server"] == "orch/1.0.0"
+        req = urllib.request.Request(url, headers={"Authorization": f"Bearer {TOKEN}"})
+        with urllib.request.urlopen(req, timeout=10) as r:
+            assert r.headers["Server"] == "orch/1.0.0"
+            health = json.loads(r.read())
+    finally:
+        server.shutdown()
+        server.server_close()
+    conforms(health, HEALTH)
+    assert health["version"] == "1.0.0" and health["addr"] == "100.64.0.1"
+    assert health["accounts"] == {"1": "main", "2": "spare"} and "relay" not in health
+    assert health["push"]["registered"] is False and health["push"]["seq"] == 0
+
+
+def test_pairing_stores_the_token_and_sends_a_test_push(world, cloud):
+    gw = world.serve.Gateway()
+    status, paired = pair(world, gw)
+    assert status == 200
+    conforms(paired, PAIRED)
+    assert paired["test_push"] == {"seq": 1, "sent": world.t}
+    [push] = cloud.pushes
+    assert push["token"] == "fcm-1" and push["android"] == {"priority": "NORMAL", "ttl": "300s"}
+    assert push["message"] == {"seq": 1, "sent": world.t, "kind": "test", "orchestrator": None,
+                               "body": None}
+    phones = world.serve.orch_push.PHONES
+    assert stat.S_IMODE(os.stat(phones).st_mode) == 0o600
+    assert json.loads(phones.read_text())["nPHONE"] == {
+        "paired": world.t, "updated": world.t, "node": "phone", "fcm_token": "fcm-1",
+        "token_error": None, "device": "OnePlus 12", "app_version": "0.3.0", "relay_uid": "uid1"}
+    health = gw.route("GET", "/v1/health", {}, None, "127.0.0.1")[1]
+    conforms(health, HEALTH)
+    assert health["push"] == {"registered": True, "seq": 1, "last_sent": world.t,
+                              "last_heartbeat": None}
+    assert health["relay"] == {"last_poll": None, "error": None}
+    world.t += 60
+    assert pair(world, gw, token="fcm-2")[1]["test_push"]["seq"] == 2  # a new token replaces it
+    assert json.loads(phones.read_text())["nPHONE"]["fcm_token"] == "fcm-2"
+    assert cloud.pushes[-1]["token"] == "fcm-2"
+
+
+def test_pairing_admits_a_node_of_the_machines_own_user_only(world, cloud, http):
+    world.whois["100.64.0.1"]["UserProfile"] = {"LoginName": "owner@example.com"}
+    world.whois["127.0.0.1"] = {"Node": {"StableID": "nTAB", "ComputedName": "tablet",
+                                         "Name": "tablet.tail.ts.net."},
+                                "UserProfile": {"LoginName": "owner@example.com"}}
+    call = http()
+    assert call("/v1/fleet") == (403, b"")
+    body = {"fcm_token": "fcm-t"}
+    assert call("/v1/pair", method="POST", body=body, token="wrong") == (401, b"")
+    status, out = call("/v1/pair", method="POST", body=body)
+    assert status == 200 and json.loads(out)["test_push"]["sent"] == world.t
+    assert world.serve.read_env()["ORCH_ALLOW"] == "phone,nTAB"
+    assert call("/v1/fleet")[0] == 200
+    assert call("/v1/pair", method="DELETE") == (204, b"")
+    assert world.serve.read_env()["ORCH_ALLOW"] == "phone"
+    assert "nTAB" not in json.loads(world.serve.orch_push.PHONES.read_text())
+    assert call("/v1/fleet") == (403, b"")
+    world.whois["127.0.0.1"]["UserProfile"]["LoginName"] = "someone@else.com"
+    assert call("/v1/pair", method="POST", body=body) == (403, b"")
+    world.whois["127.0.0.1"]["UserProfile"]["LoginName"] = "owner@example.com"
+    world.whois["100.64.0.1"]["UserProfile"]["LoginName"] = "tagged-devices"
+    assert call("/v1/pair", method="POST", body=body) == (403, b"")
+    assert [e["title"] for e in world.events() if e["kind"] == "pair"] == [
+        "Phone paired: tablet", "Phone unpaired: tablet"]
+
+
+def test_push_token_replaces_the_phones_token(world, cloud):
+    gw = world.serve.Gateway()
+    pair(world, gw)
+    phones = world.serve.orch_push.PHONES
+    action = {"id": "t1", "time": world.t, "kind": "push_token", "fcm_token": "fcm-new"}
+    assert gw.route("POST", "/v1/actions", {}, action, "127.0.0.1")[1]["status"] == "delivered"
+    assert json.loads(phones.read_text())["nPHONE"]["fcm_token"] == "fcm-new"
+    status, out = world.post(gw, id="t2", kind="push_token", fcm_token="x")  # no known phone
+    assert status == 409 and "pair it again" in out["error"]
+
+
+def test_the_push_loop_sends_what_the_phone_needs_once(world, cloud):
+    busy_fleet(world)
+    gw = world.serve.Gateway()
+    pair(world, gw)
+    cloud.pushes.clear()
+    gw.pusher.cycle()
+    # in the order queued; collapsible kinds carry the current seq without raising it, and
+    # account 1 burns 4 %/h, so it runs out before its reset: a `usage` alert
+    assert [(p["message"]["kind"], p["message"]["orchestrator"], p["message"]["seq"])
+            for p in cloud.pushes] == [("state", BOSS, 1), ("state", LOOSE, 1),
+                                       ("usage", None, 2), ("accounts", None, 2),
+                                       ("heartbeat", None, 2)]
+    states = {p["message"]["orchestrator"]: p for p in cloud.pushes if p["message"]["kind"] == "state"}
+    assert states[BOSS]["android"] == {"priority": "NORMAL", "ttl": "86400s",
+                                       "collapse_key": f"{MACHINE}:state:{BOSS}"}
+    _, fleet = gw.fleet()
+    assert states[BOSS]["message"]["body"] == fleet["orchestrators"][0]
+    [accounts] = [p for p in cloud.pushes if p["message"]["kind"] == "accounts"]
+    samples = accounts["message"]["body"]["1"]["windows"]["seven_day"]["samples"]
+    assert [s[1] for s in samples] == [77, 78, 79, 80]  # within the last 2 h
+    cloud.pushes.clear()
+    world.t += 31  # the tester's dialog has been open for 30 s now
+    gw.pusher.cycle()
+    [dialog] = cloud.pushes
+    assert dialog["message"]["kind"] == "dialog" and dialog["message"]["seq"] == 3
+    assert dialog["android"] == {"priority": "HIGH", "ttl": "86400s"}
+    assert dialog["message"]["orchestrator"] == BOSS and dialog["message"]["body"]["pane"] == W2
+    cloud.pushes.clear()
+    qid = world.orch.ask(W1, "Merge #12?", [{"label": "Merge"}, {"label": "Not yet"}])
+    gw.pusher.cycle()
+    [question] = cloud.pushes
+    assert question["message"]["kind"] == "question" and question["message"]["seq"] == 4
+    assert question["android"]["priority"] == "HIGH"
+    assert question["message"]["orchestrator"] == BOSS
+    conforms(question["message"]["body"], QUESTION)
+    assert question["message"]["body"]["id"] == qid
+    cloud.pushes.clear()
+    world.t += 300  # the watchdog's nudge was 5 min ago and the run is still stalled
+    gw.pusher.cycle()
+    assert sorted(cloud.kinds()) == ["stall", "state"]
+    [stall] = [p for p in cloud.pushes if p["message"]["kind"] == "stall"]
+    assert stall["message"]["seq"] == 5 and stall["message"]["orchestrator"] == BOSS
+    conforms(stall["message"]["body"], STALL)
+    cloud.pushes.clear()
+    world.t += 600
+    gw.pusher.cycle()
+    [beat] = [p for p in cloud.pushes if p["message"]["kind"] == "heartbeat"]
+    assert beat["android"]["collapse_key"] == f"{MACHINE}:heartbeat:"
+    assert beat["message"]["seq"] == 5 and set(beat["message"]["body"]["states"]) == {BOSS, LOOSE}
+    assert "dialog" not in cloud.kinds() and "stall" not in cloud.kinds()  # each went once
+    health = gw.route("GET", "/v1/health", {}, None, "127.0.0.1")[1]["push"]
+    assert health["seq"] == 5 and health["last_heartbeat"] == world.t
+
+
+def test_events_become_pushes_and_old_ones_are_skipped(world, cloud):
+    start_run(world)
+    gw = world.serve.Gateway()
+    pair(world, gw)
+    gw.pusher.cycle()
+    cloud.pushes.clear()
+    world.orch.emit("respawn-failed", "Handoff takeover failed", "w1:p1: at a dialog", W1)
+    world.orch.emit("spill", "Account 1 at 98%: moving to 2", "its week reached 98%", None)
+    world.orch.emit("report", "Worker report", "...", W1)  # not a push
+    gw.pusher.cycle()
+    assert [(p["message"]["kind"], p["message"]["orchestrator"], p["message"]["seq"])
+            for p in cloud.pushes] == [("system", BOSS, 2), ("spill", None, 3)]
+    assert cloud.pushes[0]["message"]["body"] == {
+        "time": world.t, "kind": "respawn-failed", "title": "Handoff takeover failed",
+        "body": "w1:p1: at a dialog", "pane": W1}
+    assert cloud.pushes[1]["message"]["body"]["title"] == "Account 1 at 98%: moving to 2"
+    cloud.pushes.clear()
+    old = world.t
+    world.t += 3700
+    world.orch.emit("run-stop", "Run stop", "...", BOSS)
+    with open(world.root / "events.jsonl", "a") as f:  # caught up late: over an hour old
+        f.write(json.dumps({"time": old, "kind": "orch-missing", "pane": BOSS, "title": "x",
+                            "body": "y"}) + "\n")
+    gw.pusher.cycle()
+    assert sorted(k for k in cloud.kinds() if k != "state") == ["ended", "heartbeat"]
+    [ended] = [p for p in cloud.pushes if p["message"]["kind"] == "ended"]
+    assert ended["message"]["orchestrator"] == BOSS and ended["message"]["body"]["pane"] == BOSS
+
+
+def test_the_relay_runs_each_action_once_and_pushes_its_status(world, cloud):
+    busy_fleet(world)
+    gw = world.serve.Gateway()
+    pair(world, gw)
+    gw.pusher.cycle()
+    cloud.pushes.clear()
+    [q] = world.orch.load_run(BOSS)["questions"]
+    answer = {"id": "r1", "time": world.t - 20, "kind": "answer", "question": q["id"],
+              "text": "Not yet"}
+    cloud.write("uid1", answer)
+    cloud.write("uid2", dict(answer, id="r9"))  # another phone's mailbox: not ours to read
+    assert gw.pusher.poll() is True
+    assert world.prompts[-1][0] == W1 and "Not yet" in world.prompts[-1][1]
+    assert [n.split("/")[-3] for n in cloud.docs] == ["uid2"]  # ours was deleted
+    [event] = [e for e in world.events() if e["kind"] == "action"]
+    assert event["source"] == "relay" and event["status"] == "delivered"
+    gw.pusher.cycle()
+    [acts] = [p for p in cloud.pushes if p["message"]["kind"] == "actions"]
+    assert acts["message"]["body"] == [{"id": "r1", "status": "delivered",
+                                        "delivered_at": world.t, "picked_at": None,
+                                        "error": None}]
+    assert acts["message"]["seq"] == 3 and acts["android"]["priority"] == "NORMAL"
+    prompts = len(world.prompts)
+    cloud.write("uid1", answer)  # the same message again (a replay, or a failed delete)
+    cloud.write("uid1", dict(answer, id="r2", text="Merge"))  # the question is closed now
+    cloud.write("uid1", dict(answer, id="r3", time=world.t - 11 * 60))  # too old
+    cloud.write("uid1", dict(answer, id="r4"), key=bytes(32))  # not sealed with our key
+    cloud.pushes.clear()
+    assert gw.pusher.poll() is True
+    assert len(world.prompts) == prompts and not [n for n in cloud.docs if "/uid1/" in n]
+    log = json.loads((world.root / "gateway-actions.json").read_text())
+    assert log["r2"]["status"] == "rejected" and "already answered" in log["r2"]["error"]
+    assert log["r3"]["status"] == "rejected" and "expire" in log["r3"]["error"]
+    assert "r4" not in log
+    [dropped] = [e for e in world.events() if e["kind"] == "relay-rejected"]
+    assert "does not open with this machine's key" in dropped["body"]
+    gw.pusher.cycle()
+    [acts] = [p for p in cloud.pushes if p["message"]["kind"] == "actions"]
+    assert sorted(a["id"] for a in acts["message"]["body"]) == ["r2", "r3"]
+    relay = gw.route("GET", "/v1/health", {}, None, "127.0.0.1")[1]["relay"]
+    assert relay == {"last_poll": world.t, "error": None}
+
+
+def test_a_dead_token_stops_pushes_until_the_app_sends_a_new_one(world, cloud):
+    gw = world.serve.Gateway()
+    pair(world, gw)
+    cloud.fcm = [(400, {"error": {"status": "INVALID_ARGUMENT", "message": "The registration "
+                                  "token is not a valid FCM registration token"}})]
+    world.orch.ask(BOSS, "Ship?", [])
+    gw.pusher.cycle()
+    sends = cloud.sends
+    assert json.loads(world.serve.orch_push.PHONES.read_text())["nPHONE"]["token_error"] == (
+        "INVALID_ARGUMENT")
+    assert [e["kind"] for e in world.events()].count("push-token") == 1
+    world.t += 700
+    gw.pusher.cycle()
+    assert cloud.sends == sends  # nothing is sent to a dead token
+    push = gw.route("GET", "/v1/health", {}, None, "127.0.0.1")[1]["push"]
+    assert push["registered"] is False and "INVALID_ARGUMENT" in push["error"]
+    gw.route("POST", "/v1/actions", {}, {"id": "t", "time": world.t, "kind": "push_token",
+                                         "fcm_token": "fcm-2"}, "127.0.0.1")
+    gw.pusher.cycle()
+    assert cloud.pushes[-1]["token"] == "fcm-2"
+
+
+def test_a_passing_failure_keeps_the_push_for_the_next_pass(world, cloud):
+    gw = world.serve.Gateway()
+    pair(world, gw)
+    gw.pusher.cycle()
+    cloud.pushes.clear()
+    cloud.fcm = [(503, {"error": {"status": "UNAVAILABLE", "message": "try later"}})]
+    world.orch.ask(BOSS, "Ship?", [])
+    gw.pusher.cycle()
+    assert cloud.pushes == []
+    assert "UNAVAILABLE" in gw.route("GET", "/v1/health", {}, None, "127.0.0.1")[1]["push"]["error"]
+    world.t += 20
+    gw.pusher.cycle()
+    [question] = cloud.pushes
+    assert question["message"]["seq"] == 2 and question["message"]["sent"] == world.t
+
+
+def test_without_a_service_account_nothing_is_pushed_and_health_says_why(world, cloud):
+    world.serve.orch_push.SA_FILE.unlink()
+    gw = world.serve.Gateway()
+    status, out = pair(world, gw)
+    assert status == 200 and out["test_push"]["seq"] is None
+    assert "no service account key" in out["test_push"]["error"]
+    gw.pusher.cycle()
+    assert cloud.sends == 0
+    assert "no service account key" in gw.route("GET", "/v1/health", {}, None,
+                                                "127.0.0.1")[1]["push"]["error"]
+
+
+def test_a_usage_alert_is_sent_once_per_window_even_days_later(world, cloud):
+    gw = world.serve.Gateway()
+    pair(world, gw)
+    resets = world.t + 6.9 * 86400
+
+    def burning():  # account 1 at 4 %/h: full long before its reset in days
+        (world.root / "usage.json").write_text(json.dumps({"accounts": {"1": {
+            "time": world.t - 30, "windows": {"seven_day": {"used_percentage": 80,
+                                                        "resets_at": resets}}}}}))
+        with open(world.root / "usage-history.jsonl", "a") as f:
+            f.writelines(json.dumps({"time": world.t - 3600 + i * 900, "account": "1", "windows": {
+                "seven_day": {"used_percentage": 77 + i, "resets_at": resets}}}) + "\n"
+                for i in range(4))
+    burning()
+    gw.pusher.cycle()
+    assert cloud.kinds().count("usage") == 1
+    for _ in range(2):  # the second pass is the first after old entries were pruned
+        world.t += 2.5 * 86400
+        burning()
+        gw.pusher.cycle()
+    assert cloud.kinds().count("usage") == 1
+
+
+def test_the_machine_is_named_by_orch_machine_else_tailscale_else_the_hostname(world, monkeypatch,
+                                                                              capsys):
+    start_run(world)
+    gw = world.serve.Gateway()
+    world.orch.emit("respawn", "Handoff takeover", "...", BOSS)  # the hooks log the hostname
+    assert gw.fleet()[1]["machine"] == "box1" and gw.health(None)["machine"] == "box1"
+    assert gw.fleet()[1]["orchestrators"][0]["machine"] == "box1" and gw.pusher.machine == "box1"
+    assert {e["host"] for e in gw.history(BOSS, 0, 50)["events"]} == {"box1"}
+    world.serve.write_env(dict(world.serve.read_env(), ORCH_MACHINE="box3"))
+    assert gw.fleet()[1]["machine"] == "box3" and gw.health(None)["machine"] == "box3"
+    assert gw.pusher.machine == "box3" and gw.usage(24)["machine"] == "box3"
+    world.orch.main(["pair"])
+    assert "orch://pair?machine=box3&" in capsys.readouterr().out
+    world.serve.write_env({k: v for k, v in world.serve.read_env().items() if k != "ORCH_MACHINE"})
+    monkeypatch.setattr(world.orch, "_TAILNET_NAME", [None])  # tailscale didn't answer
+    assert gw.fleet()[1]["machine"] == socket.gethostname()

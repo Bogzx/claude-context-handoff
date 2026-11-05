@@ -7,7 +7,7 @@ server offers no tools. Tools:
   report     the agent's state at the end of a working turn, stored in
              ~/.claude/handoffs/agents/<pane>.json ("report") and events.jsonl (kind report)
   ask_owner  `orch ask` with options: logged, pushed to the owner, answered by `orch answer`
-Newline-delimited JSON-RPC 2.0, stdlib only, Python 3.8 compatible (ob1).
+Newline-delimited JSON-RPC 2.0, stdlib only, Python 3.8 compatible (Ubuntu 20.04).
 """
 import json
 import os

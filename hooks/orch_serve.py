@@ -7,12 +7,17 @@ anything else gets 403 or 401 with an empty body. `orch pair` keeps the token, t
 the account names in ~/.config/orch/.env (mode 600) and prints the token with a pairing string
 for a QR code. `orch serve --allow-self` also admits this machine's own node: for a test only.
 
-Reads: GET /v1/fleet, /v1/usage, /v1/orchestrators/<pane>/decisions,
+Reads: GET /v1/health, /v1/fleet, /v1/usage, /v1/orchestrators/<pane>/decisions,
 /v1/orchestrators/<pane>/history, /v1/panes/<pane>/screen, /v1/actions/<id>.
 Writes: POST /v1/actions, one action per request (prompt, answer, interrupt, park, unpark, run,
-nudge, account, default_account, spill, ack). An action id runs once: a retry gets the first result.
-Every action is logged to events.jsonl (kind "action", source "app"). Standard library only,
-Python 3.8 compatible (ob1).
+nudge, account, default_account, spill, ack, push_token). An action id runs once: a retry gets
+the first result. Every action is logged to events.jsonl (kind "action", source "app" or
+"relay"). POST /v1/pair registers the phone's FCM token (a node of the machine's own Tailscale
+user with the right token joins the allow-list); DELETE /v1/pair forgets it.
+
+The background loop also sends the encrypted FCM pushes and polls the relay mailbox
+(orch_push.py, the only part that needs the `cryptography` package). The HTTP side is standard
+library only. Python 3.8 compatible (Ubuntu 20.04).
 """
 import copy
 import hashlib
@@ -33,10 +38,12 @@ from urllib.parse import parse_qs, unquote, urlencode, urlsplit
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import orch
+import orch_push
 import orch_usage
 
+VERSION = "1.0.0"  # the gateway's, in the Server header and /v1/health
 PORT = 7433
-CONFIG = Path.home() / ".config" / "orch" / ".env"
+CONFIG = orch.CONFIG
 KEEP = 86400  # action results kept for retries
 FRESH = 10 * 60  # older actions are refused; the fleet lists the actions of this period
 RECENT_RUN = 86400  # a run that ended this long ago still shows in the fleet
@@ -50,27 +57,21 @@ def warm_usage(gateway):
     orch_usage.scan(orch.ROOT, Path.home() / ".claude" / "projects", orch.now(), orch.agents())
 
 
+def push_and_relay(gateway):
+    """FCM pushes (alerts, state snapshots, the heartbeat) and the relay poller, which keep
+    their own pace (orch_push.Pusher.tick)."""
+    gateway.pusher.tick()
+
+
 # Jobs for the gateway's background loop: (seconds between runs, function(gateway)), each first
-# run 5 s after the start. The next task adds the FCM push sender (encrypted state snapshots,
-# alerts and the 15-minute heartbeat) and the relay poller (actions from the mailbox, run through
-# Gateway.act(..., source="relay")).
-BACKGROUND = [(300, warm_usage)]
+# run 5 s after the start.
+BACKGROUND = [(300, warm_usage), (5, push_and_relay)]
 
 
 # --- config (~/.config/orch/.env) ------------------------------------------------------------
 
 def read_env(path=None):
-    out = {}
-    try:
-        text = Path(path or CONFIG).read_text()
-    except OSError:
-        return out
-    for line in text.splitlines():
-        line = line.strip()
-        if line and not line.startswith("#") and "=" in line:
-            key, _, value = line.partition("=")
-            out[key.strip()] = value.strip().strip("'\"")
-    return out
+    return orch.read_env(path or CONFIG)
 
 
 def write_env(values, path=None):
@@ -88,7 +89,7 @@ def items(text):
 
 
 def account_names(env):
-    """ORCH_ACCOUNT_NAMES="1=pibo1,2=pibo2" -> {"1": "pibo1", "2": "pibo2"}"""
+    """ORCH_ACCOUNT_NAMES="1=work,2=personal" -> {"1": "work", "2": "personal"}"""
     return dict(x.split("=", 1) for x in items(env.get("ORCH_ACCOUNT_NAMES")) if "=" in x)
 
 
@@ -108,14 +109,17 @@ def tailscale_ip():
 
 
 def whois(addr):
-    """The names a tailnet address goes by (node StableID, short name, full name), or an empty
-    set when tailscale doesn't know it."""
+    """The tailnet node at an address: {"id": StableID, "name": short name, "names": the names
+    it goes by (StableID, short name, full name), "login": its Tailscale user}, or None."""
     try:
-        node = json.loads(tailscale("whois", "--json", addr).stdout)["Node"]
+        info = json.loads(tailscale("whois", "--json", addr).stdout)
+        node = info["Node"]
     except (OSError, subprocess.SubprocessError, ValueError, KeyError, TypeError):
-        return set()
+        return None
     names = {node.get("StableID"), node.get("ComputedName"), (node.get("Name") or "").rstrip(".")}
-    return {n for n in names if isinstance(n, str) and n}
+    return {"id": node.get("StableID"), "name": node.get("ComputedName"),
+            "names": {n for n in names if isinstance(n, str) and n},
+            "login": (info.get("UserProfile") or {}).get("LoginName")}
 
 
 # --- the pieces of the fleet --------------------------------------------------------------------
@@ -271,23 +275,31 @@ class Gateway:
     def __init__(self, allow_self=False, config=None):
         self.config = config
         self.lock = threading.Lock()  # the action log, and one action at a time
-        self.seen = {}  # whois cache: address -> (time, names)
-        self.self_names = whois(tailscale_ip() or "") if allow_self else set()
+        self.seen = {}  # whois cache: address -> (time, node)
+        me = whois(tailscale_ip() or "") if allow_self else None
+        self.self_names = (me or {}).get("names", set())
+        self.pusher = orch_push.Pusher(self)
 
     # auth
 
-    def names(self, addr):
+    def node(self, addr):
         at = time.monotonic()
         hit = self.seen.get(addr)
         if not hit or at - hit[0] > WHOIS_TTL:
             hit = self.seen[addr] = (at, whois(addr))
-        return hit[1]
+        return hit[1] or {}
 
-    def authorize(self, addr, header):
-        """None when the caller may go on, else the HTTP status to refuse it with."""
+    def names(self, addr):
+        return self.node(addr).get("names", set())
+
+    def allowed(self, env):
+        return set(items(env.get("ORCH_ALLOW"))) | self.self_names
+
+    def authorize(self, addr, header, pairing=False):
+        """None when the caller may go on, else the HTTP status to refuse it with. A pairing
+        request (POST /v1/pair) needs only the token here: pair() checks the node."""
         env = read_env(self.config)
-        allowed = set(items(env.get("ORCH_ALLOW"))) | self.self_names
-        if not self.names(addr) & allowed:
+        if not pairing and not self.names(addr) & self.allowed(env):
             return 403
         token = env.get("ORCH_TOKEN") or ""
         given = header[7:].strip() if header.startswith("Bearer ") else ""
@@ -297,18 +309,25 @@ class Gateway:
 
     # routes
 
-    def route(self, method, path, query, body):
-        """(status, JSON body) for an authorized request."""
+    def route(self, method, path, query, body, caller=None):
+        """(status, JSON body or None) for an authorized request from the address `caller`."""
         parts = [unquote(p) for p in path.split("/") if p]
         arg = {k: v[-1] for k, v in query.items()}
         if parts[:1] != ["v1"]:
             return 404, {"error": "not found"}
         parts = parts[1:]
+        phone = self.node(caller).get("id") if caller else None
         if method == "POST" and parts == ["actions"]:
-            return self.act(body)
+            return self.act(body, phone=phone)
+        if method == "POST" and parts == ["pair"]:
+            return self.pair(caller, body)
+        if method == "DELETE" and parts == ["pair"]:
+            return self.unpair(caller)
         if method != "GET":
             return 405, {"error": "method not allowed"}
         try:
+            if parts == ["health"]:
+                return 200, self.health(phone)
             if parts == ["fleet"]:
                 return self.fleet()
             if parts == ["usage"]:
@@ -330,6 +349,88 @@ class Gateway:
             return 400, {"error": "bad query parameter"}
         return 404, {"error": "not found"}
 
+    # pairing and health
+
+    def push_key(self):
+        """The AES-256 key of pushes and relay messages (ORCH_KEY, from `orch pair`), or None."""
+        try:
+            key = orch_push.b64d(read_env(self.config).get("ORCH_KEY") or "")
+        except ValueError:
+            return None
+        return key if len(key) == 32 else None
+
+    def machine(self):
+        """This machine's name in the API, pushes and the relay (orch.machine_name)."""
+        return orch.machine_name(read_env(self.config))
+
+    def account_names(self):
+        names = account_names(read_env(self.config))
+        return {a: names.get(a) or f"account {a}" for a in sorted(orch.account_list())}
+
+    @staticmethod
+    def orchestrators():
+        return [r["orchestrator"] for r in orch.all_runs()
+                if r.get("orchestrator") and orch.active(r)]
+
+    def health(self, phone):
+        out = {"machine": self.machine(), "version": VERSION, "time": orch.now(),
+               "addr": tailscale_ip(), "orchestrators": self.orchestrators(),
+               "accounts": self.account_names(), "push": self.pusher.health(phone)}
+        if any(p.get("relay_uid") for p in orch_push.load_phones().values()):
+            out["relay"] = dict(self.pusher.relay)
+        return out
+
+    def pair(self, addr, body):
+        """POST /v1/pair: store the phone's FCM token (and relay uid), then push `test`. A node
+        not yet allowed joins the allow-list when it belongs to this machine's Tailscale user."""
+        node = dict(whois(addr or "") or {})
+        if not node.get("id"):
+            return 403, None
+        env = read_env(self.config)
+        if not node["names"] & self.allowed(env):
+            mine = (whois(tailscale_ip() or "") or {}).get("login")
+            if not mine or mine == "tagged-devices" or node.get("login") != mine:
+                return 403, None
+            env["ORCH_ALLOW"] = ",".join([*items(env.get("ORCH_ALLOW")), node["id"]])
+            write_env(env, self.config)
+        body = body if isinstance(body, dict) else {}
+        token = body.get("fcm_token")
+        if not isinstance(token, str) or not token.strip():
+            return 400, {"error": "fcm_token is missing"}
+        text = {k: body.get(k) if isinstance(body.get(k), str) else None
+                for k in ("device", "app_version", "relay_uid")}
+        at = orch.now()
+        phones = orch_push.load_phones()
+        phones.setdefault(node["id"], {"paired": at}).update(
+            node=node.get("name"), fcm_token=token.strip(), token_error=None, updated=at, **text)
+        orch_push.save_phones(phones)
+        orch.emit("pair", f"Phone paired: {node.get('name') or node['id']}",
+                  f"{text['device'] or 'unknown device'}, app {text['app_version'] or '?'}"
+                  + ("; relay on" if text["relay_uid"] else ""), None)
+        return 200, {"machine": self.machine(), "version": VERSION,
+                     "orchestrators": self.orchestrators(), "accounts": self.account_names(),
+                     "test_push": self.pusher.test(node["id"])}
+
+    def unpair(self, addr):
+        """DELETE /v1/pair: the calling node leaves the allow-list and its token is forgotten."""
+        node = self.node(addr)
+        env = read_env(self.config)
+        env["ORCH_ALLOW"] = ",".join(n for n in items(env.get("ORCH_ALLOW"))
+                                     if n not in node.get("names", set()))
+        write_env(env, self.config)
+        phones = orch_push.load_phones()
+        if phones.pop(node.get("id"), None) is not None:
+            orch_push.save_phones(phones)
+        orch.emit("pair", f"Phone unpaired: {node.get('name') or node.get('id')}", "", None)
+        return 204, None
+
+    def question(self, qid):
+        """(orchestrator pane, Question) for an open question, else None."""
+        run, q = orch.find_question(qid)
+        if not q or q.get("answered"):
+            return None
+        return (run or {}).get("orchestrator") or q.get("pane"), question_json(q)
+
     # reads
 
     def fleet(self):
@@ -346,7 +447,7 @@ class Gateway:
         leads = [(r["orchestrator"], r) for r in runs] + [(p, None) for p in sorted(ags)
                                                           if p not in busy]
         return 200, {
-            "version": 1, "machine": socket.gethostname(), "time": at,
+            "version": 1, "machine": self.machine(), "time": at,
             "orchestrators": [self.orchestrator(p, r, ags, at, watchdog.get(p) or {}, nudges)
                               for p, r in leads],
             "accounts": self.accounts(at), "default_account": self.default_account(),
@@ -375,7 +476,7 @@ class Gateway:
                 stall = stall_json(reasons, workers, v["report"], nudges.get(pane))
         name = (agent or {}).get("name") or orch.first_line((run or {}).get("goal") or "", 60)
         return {
-            "pane": pane, "name": name or pane, "machine": socket.gethostname(),
+            "pane": pane, "name": name or pane, "machine": self.machine(),
             "cwd": (agent or {}).get("cwd") or (run or {}).get("cwd"),
             "activity": activity, "activity_since": since, "agent": lead,
             "run": {k: run.get(k) for k in ("goal", "created", "until", "ended")} if run else None,
@@ -457,13 +558,13 @@ class Gateway:
             for k in (*periods, "points_7d"):
                 o[k] = None if a[k] is None or o[k] is None else round(o[k] + a[k], 2)
         for o in other.values():
-            o["note"] = f"{o.pop('sessions')} sessions outside a run on {socket.gethostname()}"
+            o["note"] = f"{o.pop('sessions')} sessions outside a run on {self.machine()}"
         for run in rep["runs"].values():
             lead = next((a for a in agents if a["pane"] == run["orchestrator"]), None)
             account = (lead or {}).get("account")
             run["week_points"] = (round(run["cost"] * ratio[account], 2) if account in ratio
                                   else None)
-        rep.update(machine=socket.gethostname(), accounts=accounts, agents=agents,
+        rep.update(machine=self.machine(), accounts=accounts, agents=agents,
                    other=list(other.values()), default_account=self.default_account())
         return rep
 
@@ -481,8 +582,9 @@ class Gateway:
 
     def history(self, pane, since, limit):
         panes = {pane, *(orch.load_run(pane).get("workers") or {})}
-        events = [e for e in read_events() if e.get("pane") in panes
-                  and (e.get("time") or 0) >= since]
+        machine, local = self.machine(), socket.gethostname()  # the hooks log the hostname
+        events = [dict(e, host=machine) if e.get("host") == local else e for e in read_events()
+                  if e.get("pane") in panes and (e.get("time") or 0) >= since]
         return {"events": events[::-1][:max(1, min(limit, 2000))],
                 "generations": generations(pane)}
 
@@ -528,9 +630,10 @@ class Gateway:
             return 404, {"error": f"no action {aid}"}
         return 200, self.status_json(log[aid])
 
-    def act(self, body, source="app"):
-        """Run one action from the app (or, later, the relay) at most once per id: (HTTP
-        status, ActionStatus). A repeated id gets the first result without running again."""
+    def act(self, body, source="app", phone=None):
+        """Run one action from the app (or the relay) at most once per id: (HTTP status,
+        ActionStatus). A repeated id gets the first result without running again. `phone`: the
+        sender's tailnet StableID (the key of its push registration)."""
         if not isinstance(body, dict) or not isinstance(body.get("id"), str) or not body["id"]:
             return 400, {"id": None, "status": "rejected", "error": "an action needs an id"}
         aid = body["id"]
@@ -545,8 +648,8 @@ class Gateway:
                 return old["code"], self.status_json(old)
             at = orch.now()
             rec = {"id": aid, "kind": body.get("kind"), "time": body.get("time"), "received": at,
-                   "source": source, "fingerprint": fingerprint, "delivered_at": None,
-                   "picked_at": None, "error": None}
+                   "source": source, "phone": phone, "fingerprint": fingerprint,
+                   "delivered_at": None, "picked_at": None, "error": None}
             try:
                 sent = body.get("time")
                 if not isinstance(sent, (int, float)):
@@ -705,6 +808,16 @@ def act_ack(gw, body, rec):
     return {"pane": lead}
 
 
+def act_push_token(gw, body, rec):
+    """A new FCM token for the phone that sent this (Firebase rotated it)."""
+    token = need(body, "fcm_token")
+    phones = orch_push.load_phones()
+    if rec.get("phone") not in phones:
+        raise Reject("this phone is not registered for pushes here: pair it again")
+    phones[rec["phone"]].update(fcm_token=token.strip(), token_error=None, updated=orch.now())
+    orch_push.save_phones(phones)
+
+
 def act_dialog(gw, body, rec):
     raise Reject("answering a dialog from the app is not supported by this gateway yet", 400)
 
@@ -712,15 +825,18 @@ def act_dialog(gw, body, rec):
 ACTIONS = {"prompt": act_prompt, "answer": act_answer, "interrupt": act_interrupt,
            "park": act_park, "unpark": act_park, "run": act_run, "nudge": act_nudge,
            "account": act_account, "default_account": act_default_account, "ack": act_ack,
-           "spill": act_spill,
+           "spill": act_spill, "push_token": act_push_token,
            "dialog": act_dialog}
 
 
 # --- HTTP ----------------------------------------------------------------------------------------
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "orch"
+    server_version = f"orch/{VERSION}"
     sys_version = ""
+
+    def version_string(self):  # the Server header, without http.server's " <sys_version>"
+        return self.server_version
 
     def do_GET(self):  # http.server calls do_<METHOD>
         self.dispatch("GET")
@@ -745,11 +861,12 @@ class Handler(BaseHTTPRequestHandler):
 
     def dispatch(self, method):
         gw = self.server.gateway
-        refused = gw.authorize(self.client_address[0], self.headers.get("Authorization") or "")
+        url = urlsplit(self.path)
+        refused = gw.authorize(self.client_address[0], self.headers.get("Authorization") or "",
+                               pairing=method == "POST" and url.path.rstrip("/") == "/v1/pair")
         if refused:
             self.reply(refused, None)
             return
-        url = urlsplit(self.path)
         body = None
         if method == "POST":
             try:
@@ -765,7 +882,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.reply(400, {"id": None, "status": "rejected", "error": "the body is not JSON"})
                 return
         try:
-            status, out = gw.route(method, url.path, parse_qs(url.query), body)
+            status, out = gw.route(method, url.path, parse_qs(url.query), body,
+                                   self.client_address[0])
         except Exception:  # noqa: BLE001 one bad request must not stop the gateway
             traceback.print_exc()
             status, out = 500, {"error": "internal error"}
@@ -829,15 +947,19 @@ def pair(args):
     env = read_env()
     if args.new or not env.get("ORCH_TOKEN"):
         env["ORCH_TOKEN"] = secrets.token_urlsafe(32)
+        env["ORCH_KEY"] = secrets.token_urlsafe(32)
+    env.setdefault("ORCH_KEY", secrets.token_urlsafe(32))  # paired before pushes existed
     if args.allow is not None:
         env["ORCH_ALLOW"] = ",".join(x for a in args.allow for x in items(a))
     write_env(env)
-    machine, addr = socket.gethostname(), tailscale_ip() or ""
+    machine, addr, project = orch.machine_name(env), tailscale_ip() or "", orch_push.project()
     print(f"token: {env['ORCH_TOKEN']}")
     print("pairing string (for a QR code): orch://pair?"
-          + urlencode({"machine": machine, "addr": addr, "port": PORT,
-                       "token": env["ORCH_TOKEN"]}))
+          + urlencode({"machine": machine, "addr": addr, "port": PORT, "token": env["ORCH_TOKEN"],
+                       "key": env["ORCH_KEY"], **({"project": project} if project else {})}))
+    print(f"pushes: Firebase project {project}" if project else
+          f"pushes: off until the service account key is at {orch_push.SA_FILE}")
     print(f"allowed tailnet nodes: {env.get('ORCH_ALLOW') or 'none yet (orch pair --allow NODE)'}")
-    print(f"config: {CONFIG} (ORCH_ACCOUNT_NAMES=1=pibo1,2=pibo2 names the accounts)")
+    print(f"config: {CONFIG} (ORCH_ACCOUNT_NAMES=1=work,2=personal names the accounts)")
     print("start the gateway: systemctl --user start orch-serve")
     return 0

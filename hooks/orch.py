@@ -28,7 +28,7 @@ Agents report at turn end through the orch MCP server (orch_mcp.py), into
 Events go to ~/.claude/handoffs/events.jsonl. Owner alerts also go to the notify command:
 $ORCH_NOTIFY_CMD, else an executable ~/.claude/handoffs/notify, called as
 `<command> <title> <body>` with ORCH_EVENT_KIND set and the whole event as JSON in
-ORCH_EVENT. Python 3.8 compatible (ob1).
+ORCH_EVENT. Python 3.8 compatible (Ubuntu 20.04).
 """
 import argparse
 import json
@@ -132,6 +132,48 @@ def agents():
 def prompt(pane, text):
     result = herdr("agent", "prompt", pane, text)
     return result.returncode == 0
+
+
+# --- this machine ------------------------------------------------------------------------
+
+CONFIG = Path.home() / ".config" / "orch" / ".env"  # the gateway's: token, key, allow-list, names
+
+
+def read_env(path=None):
+    """KEY=value lines of ~/.config/orch/.env (or path); {} when it is missing."""
+    out = {}
+    try:
+        text = Path(path or CONFIG).read_text()
+    except OSError:
+        return out
+    for line in text.splitlines():
+        line = line.strip()
+        if line and not line.startswith("#") and "=" in line:
+            key, _, value = line.partition("=")
+            out[key.strip()] = value.strip().strip("'\"")
+    return out
+
+
+_TAILNET_NAME = []
+
+
+def tailnet_name():
+    """This machine's Tailscale device name (Self.HostName), looked up once per process."""
+    if not _TAILNET_NAME:
+        try:
+            out = subprocess.run(["tailscale", "status", "--json"], capture_output=True,
+                                 text=True, timeout=5, check=False).stdout
+            _TAILNET_NAME.append(json.loads(out)["Self"].get("HostName") or None)
+        except (OSError, subprocess.SubprocessError, ValueError, KeyError, TypeError):
+            _TAILNET_NAME.append(None)
+    return _TAILNET_NAME[0]
+
+
+def machine_name(env=None):
+    """The name the owner's app knows this machine by: ORCH_MACHINE in ~/.config/orch/.env, else
+    its Tailscale device name, else the hostname."""
+    env = read_env() if env is None else env
+    return env.get("ORCH_MACHINE") or tailnet_name() or socket.gethostname()
 
 
 # --- events -----------------------------------------------------------------------------
@@ -381,7 +423,7 @@ def ask(pane, text, options=()):
     if options:
         body += "\nOptions: " + " / ".join(
             o["label"] + (f" [{o['danger']}]" if o["danger"] != "none" else "") for o in options)
-    emit("ask", f"Question from {pane} on {socket.gethostname()}", body, pane, push=True, id=qid,
+    emit("ask", f"Question from {pane} on {machine_name()}", body, pane, push=True, id=qid,
          question=text, options=options)
     return qid
 
@@ -664,7 +706,7 @@ def cmd_watchdog(args):
     state_path = ROOT / "watchdog.json"
     state = load(state_path)
     at = now()
-    host = socket.gethostname()
+    host = machine_name()
     for run in all_runs():
         orch = run.get("orchestrator")
         if not orch or run.get("ended"):
