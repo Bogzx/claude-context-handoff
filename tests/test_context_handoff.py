@@ -38,6 +38,8 @@ if args[:2] == ["agent", "get"]:
     print(json.dumps({"result": {"agent": agent() or {}}}))
 elif args[:2] == ["agent", "list"]:
     print(json.dumps({"result": {"agents": [a for a in [agent()] if a]}}))
+elif st.get("dialog") and args[:2] in (["agent", "prompt"], ["agent", "send-keys"]):
+    st["phase"] = "gone"  # its Enter picked "No, exit" at the trust question: Claude quit
 elif args[:2] == ["agent", "prompt"]:
     if args[3] == "/exit":
         st["phase"] = "gone"
@@ -48,9 +50,15 @@ elif args[:2] == ["agent", "send-keys"]:
         st["new"] = "working"
 elif args[:2] == ["agent", "wait"] and "--until" in args:
     rc = 0 if (agent() or {}).get("agent_status") == "working" else 1
+elif args[:2] == ["agent", "read"]:
+    if st.get("dialog"):  # cfg "screen", until someone answers it after "answer_after" reads
+        st["reads"] = st.get("reads", 0) + 1
+        st["dialog"] = st["reads"] <= cfg.get("answer_after", 10 ** 9)
+    print(cfg["screen"] if st.get("dialog") else "")
 elif args[:2] == ["pane", "run"]:
     st["phase"] = "new"
     st["new"] = cfg.get("new", st["new"])
+    st["dialog"] = bool(cfg.get("screen"))
 path.write_text(json.dumps(st))
 sys.exit(rc)
 """
@@ -860,6 +868,53 @@ def test_a_takeover_waits_for_a_dialog_on_the_new_account(hook, takeover, herdr_
     polls = len([c for c in calls() if c[:2] == ["agent", "list"]])
     assert polls > hook.DIALOG_WAIT / 5 / 2  # it kept waiting well past the 90 s start
     assert prompts(calls) == []  # no takeover prompt into a dialog
+
+
+# Claude Code 2.1.318's folder-trust question in a narrow pane, as a spill takeover met it on
+# 2026-11-05 while herdr called the new agent idle (the footer wraps).
+TRUST_NARROW = """\
+ Accessing workspace:
+ /home/me/Repo/my-app
+ Quick safety check: Is this
+ a project you created or
+ one you trust? (Like your
+ own code, a well-known open
+ source project, or work
+ from your team). If not,
+ take a moment to review
+ what's in this folder
+ first.
+ Security guide
+ ❯ No, exit
+   Yes, I trust this folder
+ Enter to confirm · Esc to
+ cancel
+"""
+
+
+def test_a_takeover_never_types_into_a_trust_question_that_herdr_calls_idle(
+        hook, takeover, herdr_stub, monkeypatch):
+    calls, configure = herdr_stub
+    configure(new="idle", screen=TRUST_NARROW)  # nobody answers it
+    clock = iter(range(0, 10 ** 6, 5))
+    monkeypatch.setattr(hook.time, "time", lambda: float(next(clock)))
+
+    assert hook.respawn(takeover.job) is False
+
+    assert prompts(calls) == [] and not [c for c in calls() if c[:2] == ["agent", "send-keys"]]
+    events = [json.loads(x) for x in (hook.ROOT / "events.jsonl").read_text().splitlines()]
+    assert [e["kind"] for e in events] == ["respawn-dialog", "respawn-failed"]
+
+
+def test_a_takeover_prompts_once_the_trust_question_is_answered(hook, takeover, herdr_stub):
+    calls, configure = herdr_stub
+    configure(new="idle", screen=TRUST_NARROW, answer_after=6)  # answered in the pane
+
+    assert hook.respawn(takeover.job) is True
+
+    assert len(prompts(calls)) == 1
+    events = [json.loads(x) for x in (hook.ROOT / "events.jsonl").read_text().splitlines()]
+    assert [e["kind"] for e in events] == ["respawn-dialog", "respawn"]
 
 
 def test_account_switch_now_reports_a_dialog_in_the_new_agent(hook, switch, herdr_stub, capsys):
