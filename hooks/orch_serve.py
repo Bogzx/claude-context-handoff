@@ -435,12 +435,6 @@ def trusted(account):
             if isinstance(v, dict) and v.get("hasTrustDialogAccepted")}
 
 
-def lead_name(pane, run, agent, cwd=""):
-    """An orchestrator's name: its herdr agent name, else its run's folder, else the pane."""
-    cwd = (run or {}).get("cwd") or (agent or {}).get("cwd") or cwd or ""
-    return (agent or {}).get("name") or os.path.basename(cwd.rstrip("/")) or pane
-
-
 class Reject(Exception):
     def __init__(self, text, code=409, status="rejected"):
         super().__init__(text)
@@ -696,7 +690,7 @@ class Gateway:
                 stall = stall_json(reasons, workers, v["report"], nudges.get(pane))
         dialogs = [dialog_json(a, ags.get(a["pane"])) for a in [lead, *workers]
                    if a["state"] == "blocked" or a["pane_view"] == "trust"]
-        name = lead_name(pane, run, agent, (start or {}).get("cwd"))
+        name = orch.lead_name(pane, run, agent, (start or {}).get("cwd"))
         if start:  # a new orchestrator: its start's steps until the brief or the plan's OK
             activity, since, stall = "starting", start.get("time"), None
             doing = {s["step"]: s["time"] for s in start["steps"] if s["status"] == "doing"}
@@ -758,7 +752,8 @@ class Gateway:
             gd, run = git_dir(path), runs.get(path)
             lead = (run or {}).get("orchestrator")
             out.append({"path": shown, "branch": branch_of(gd), "last_activity": last_work(path, gd),
-                        "orchestrator": {"pane": lead, "name": lead_name(lead, run, ags.get(lead))}
+                        "orchestrator": {"pane": lead,
+                                         "name": orch.lead_name(lead, run, ags.get(lead))}
                         if run else None,
                         "trusted": path in trust})  # a trusted parent doesn't count
         out.sort(key=lambda f: -(f["last_activity"] or 0))

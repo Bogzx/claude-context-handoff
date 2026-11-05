@@ -58,7 +58,7 @@ WATCH_EVERY = 0.5  # seconds between looks at events.jsonl: one stat, no fleet r
 RELAY_SLOW, RELAY_FAST, FAST_FOR = 30, 5, 600  # seconds; fast for 10 min after an actionable push
 ENDED = {"run-ended", "run-stop"}
 SYSTEM = {"respawn-failed", "account-failed", "respawn-dialog", "orch-missing", "orch-blocked",
-          "orch-not-acting", "test"}
+          "orch-not-acting", "orch-stopped", "test"}
 
 
 class Unavailable(Exception):
@@ -266,9 +266,11 @@ def save_phones(phones):
 # --- fitting a message into 4 KB -----------------------------------------------------------------
 
 def urgent(message):
-    """High priority: a question, a dialog, or a start that failed."""
-    return message["kind"] in HIGH or (message["kind"] == "start"
-                                       and (message.get("body") or {}).get("status") == "failed")
+    """High priority: a question, a dialog, a stopped orchestrator, or a start that failed."""
+    body = message.get("body") or {}
+    return (message["kind"] in HIGH
+            or (message["kind"] == "start" and body.get("status") == "failed")
+            or (message["kind"] == "system" and body.get("kind") == "orch-stopped"))
 
 
 def _agents(o):

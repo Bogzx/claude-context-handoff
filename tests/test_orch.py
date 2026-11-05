@@ -4,7 +4,7 @@ import importlib.util
 import json
 import os
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -328,6 +328,308 @@ def test_spill_says_why_a_pane_in_the_agents_view_waits(world):
     acc = {"switch": {W1: {"account": "2", "reason": "spill", "time": 1.0, "handoff": 2.0}}}
 
     assert world.orch.spill_state(W1, agent, {}, acc)["reason"] == "the pane shows the agents view"
+
+
+STOP_TEXT = "You've hit your weekly limit · resets 6am (Europe/Bucharest)"
+TRUST_SCREEN = " ❯ No, exit\n   Yes, I trust this folder\n\n Enter to confirm · Esc to cancel\n"
+PASS = 6 * 60  # watchdog passes in these tests are further apart than STOP_OVER
+
+
+def stamp(t):
+    return datetime.fromtimestamp(t, timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+
+
+def limit_at(t, text=STOP_TEXT):
+    return {"type": "assistant", "isApiErrorMessage": True, "error": "rate_limit",
+            "timestamp": stamp(t), "message": {"content": [{"type": "text", "text": text}]}}
+
+
+def stopped_lead(world, *records, account="1", event="Stop", at=None):
+    """A lead with an idle worker, so a nudge would go if nothing held it back."""
+    start_run(world)
+    world.turn_end(BOSS, bg=["orch wait"])
+    status = world.root / "agents" / "w1-p0.json"
+    st = json.loads(status.read_text())
+    status.write_text(json.dumps(dict(st, account=account, event=event, time=at or T0 - 3600)))
+    transcript(world, f"s-{BOSS}", *(records or [limit_at(T0 - 60)]))
+    world.agent(W1, "idle")
+    world.turn_end(W1, ago=11 * 60)
+    world.agent(W2, "working")
+
+
+def usage(world, account="1", **windows):
+    world.root.mkdir(parents=True, exist_ok=True)
+    (world.root / "usage.json").write_text(json.dumps({"accounts": {account: {
+        "read_at": world.t, "windows": {n: {"used_percentage": 99, "resets_at": r}
+                                        for n, r in windows.items()}}}}))
+
+
+def set_status(world, **fields):
+    path = world.root / "agents" / "w1-p0.json"
+    path.write_text(json.dumps(dict(json.loads(path.read_text()), **fields)))
+
+
+def passes(world, n=1):
+    for _ in range(n):
+        world.run("watchdog")
+        world.sleep(PASS)
+
+
+def nudges(world):
+    return [e for e in world.events() if e["kind"] == "nudge"]
+
+
+def test_a_lead_at_its_limit_gets_one_alert_and_no_nudge(world, tmp_path, monkeypatch):
+    pushed = push_log(tmp_path, monkeypatch)
+    stopped_lead(world)
+    world.agents[BOSS]["name"] = "board"
+
+    passes(world, 4)
+
+    [alert] = pushed()
+    assert alert[:2] == ["orch-stopped", "Orchestrator stopped: board on box1"]
+    assert alert[2] == (f"board ({BOSS}): {STOP_TEXT}. "
+                        "Move it to another account, or message it once the limit resets.")
+    assert [e["state"] for e in world.events() if e["kind"] == "orch-stopped"] == ["limit"]
+    assert world.prompts == [] and nudges(world) == []
+
+
+@pytest.mark.parametrize("status", ["idle", "done", "working"])
+def test_a_lead_in_the_agents_view_gets_one_alert_whatever_herdr_says(world, tmp_path, monkeypatch,
+                                                                      status):
+    pushed = push_log(tmp_path, monkeypatch)
+    start_run(world)
+    world.agent(BOSS, status)
+    world.agents[BOSS]["terminal_title"] = AGENTS_VIEW
+
+    passes(world, 3)
+
+    [alert] = pushed()
+    assert alert[0] == "orch-stopped" and "agents view" in alert[2]
+    assert "Open a session or leave the view in the pane on box1." in alert[2]
+    assert world.prompts == []
+
+
+def test_a_lead_at_the_trust_question_gets_one_alert_and_no_blocked_one(world, tmp_path,
+                                                                        monkeypatch):
+    pushed = push_log(tmp_path, monkeypatch)
+    start_run(world)
+    world.agent(BOSS, "blocked")  # herdr calls the trust question blocked
+    monkeypatch.setattr(world.orch, "screen_lines", lambda *a: TRUST_SCREEN.split("\n"))
+
+    passes(world, 4)  # past BLOCKED_GRACE
+
+    [alert] = pushed()
+    assert alert[0] == "orch-stopped" and "folder-trust question" in alert[2]
+    assert "Answer it in the pane on box1." in alert[2]
+    assert [e for e in world.events() if e["kind"] == "orch-blocked"] == []
+
+
+def test_the_view_decides_what_the_owner_can_do_for_a_limit_in_the_agents_view(world, tmp_path,
+                                                                                monkeypatch):
+    pushed = push_log(tmp_path, monkeypatch)
+    stopped_lead(world)
+    world.agents[BOSS]["terminal_title"] = AGENTS_VIEW
+
+    passes(world)
+
+    [alert] = pushed()
+    assert STOP_TEXT in alert[2] and "leave the view in the pane" in alert[2]
+    assert "Move it" not in alert[2]
+
+
+def test_the_alert_says_when_a_move_is_already_queued(world, tmp_path, monkeypatch):
+    pushed = push_log(tmp_path, monkeypatch)
+    stopped_lead(world)
+    world.orch.save(world.root / "accounts.json", {"switch": {BOSS: {
+        "account": "2", "when": "later", "reason": "limit"}}})
+
+    passes(world)
+
+    [alert] = pushed()
+    assert alert[2].endswith("A move to account 2 is queued.") and "Move it" not in alert[2]
+
+
+def test_a_lead_that_stops_again_later_gets_a_new_alert(world, tmp_path, monkeypatch):
+    pushed = push_log(tmp_path, monkeypatch)
+    stopped_lead(world)
+    passes(world)
+
+    world.agent(BOSS, "working")
+    transcript(world, f"s-{BOSS}", limit_at(T0 - 60), PROMPT, REPLY)  # the session went on
+    passes(world, 2)
+    assert len(pushed()) == 1
+
+    world.agent(BOSS, "idle")
+    transcript(world, f"s-{BOSS}", limit_at(T0 - 60), PROMPT, REPLY, limit_at(world.t))
+    passes(world, 3)
+
+    assert [p[0] for p in pushed()] == ["orch-stopped", "orch-stopped"]
+
+
+def test_a_prompt_into_a_session_at_its_limit_is_the_same_stop(world, tmp_path, monkeypatch):
+    pushed = push_log(tmp_path, monkeypatch)
+    stopped_lead(world)
+    passes(world)
+
+    transcript(world, f"s-{BOSS}", limit_at(T0 - 60), PROMPT, limit_at(world.t))  # a new `since`
+    passes(world, 2)
+
+    assert len(pushed()) == 1
+
+
+def test_a_pass_that_misreads_a_stopped_lead_is_not_a_new_stop(world, tmp_path, monkeypatch):
+    pushed = push_log(tmp_path, monkeypatch)
+    start_run(world)
+    world.agent(BOSS, "blocked")
+    trust = TRUST_SCREEN.split("\n")
+    screens = iter([trust, None, trust, None, trust])  # two reads timed out, far apart
+    monkeypatch.setattr(world.orch, "screen_lines", lambda *a: next(screens))
+
+    passes(world, 5)
+
+    assert len(pushed()) == 1
+
+
+def test_an_agent_herdr_drops_for_one_pass_is_not_a_new_stop(world, tmp_path, monkeypatch):
+    pushed = push_log(tmp_path, monkeypatch)
+    stopped_lead(world)
+    lead = world.agents[BOSS]
+    passes(world)
+    del world.agents[BOSS]
+    passes(world)
+    world.agents[BOSS] = lead
+    passes(world)
+
+    assert len(pushed()) == 1
+
+
+def test_another_cause_is_a_new_stop_though_the_lead_never_went_on(world, tmp_path, monkeypatch):
+    pushed = push_log(tmp_path, monkeypatch)
+    start_run(world)
+    world.agents[BOSS]["terminal_title"] = AGENTS_VIEW
+    world.turn_end(BOSS)
+    set_status(world, account="1")
+    passes(world)
+
+    transcript(world, f"s-{BOSS}", limit_at(world.t))
+    passes(world, 2)
+
+    assert len(pushed()) == 2 and STOP_TEXT in pushed()[1][2]
+
+
+def test_the_agents_view_giving_way_to_the_trust_question_is_a_new_stop(world, tmp_path,
+                                                                         monkeypatch):
+    pushed = push_log(tmp_path, monkeypatch)
+    start_run(world)
+    world.agents[BOSS]["terminal_title"] = AGENTS_VIEW
+    passes(world)
+
+    world.agent(BOSS, "blocked")  # no text and the same account: only the state differs
+    monkeypatch.setattr(world.orch, "screen_lines", lambda *a: TRUST_SCREEN.split("\n"))
+    passes(world, 2)
+
+    assert ["agents view" in pushed()[0][2], "folder-trust" in pushed()[1][2]] == [True, True]
+    assert len(pushed()) == 2
+
+
+def test_the_limit_of_another_account_is_a_new_stop(world, tmp_path, monkeypatch):
+    pushed = push_log(tmp_path, monkeypatch)
+    stopped_lead(world)
+    passes(world)
+
+    set_status(world, account="2", event="SessionStart", time=world.t)  # moved between two passes
+    world.sleep(10)
+    transcript(world, f"s-{BOSS}", limit_at(T0 - 60), limit_at(world.t))
+    passes(world, 2)
+
+    assert len(pushed()) == 2
+
+
+def test_a_dry_run_alerts_nobody_and_uses_nothing_up(world, tmp_path, monkeypatch, capsys):
+    pushed = push_log(tmp_path, monkeypatch)
+    stopped_lead(world)
+
+    world.run("watchdog", "--dry-run")
+
+    assert "would alert: Orchestrator stopped" in capsys.readouterr().out and pushed() == []
+    world.run("watchdog")
+    assert len(pushed()) == 1
+
+
+def test_a_lead_gets_its_nudge_once_the_limits_window_has_reset(world, tmp_path, monkeypatch):
+    """Nothing else wakes it: the record stays at the end of the transcript until a turn runs."""
+    pushed = push_log(tmp_path, monkeypatch)
+    stopped_lead(world)
+    usage(world, seven_day=T0 + 3 * 3600)
+
+    passes(world, 2)
+    assert world.prompts == [] and len(pushed()) == 1
+
+    world.t = T0 + 3 * 3600 + 1
+    passes(world)
+
+    assert [p for p, _ in world.prompts] == [BOSS] and len(pushed()) == 1
+
+
+def test_a_reading_of_the_next_window_says_the_limit_is_over(world):
+    stopped_lead(world)
+    usage(world, seven_day=T0 + 7 * 86400 - 3600)  # the window it hit: began an hour ago
+    world.run("watchdog")
+    assert world.prompts == []
+
+    world.sleep(2 * 3600)  # another agent on the account read the new window
+    usage(world, seven_day=T0 + 7 * 86400)
+    world.run("watchdog")
+    assert [p for p, _ in world.prompts] == [BOSS]
+
+
+@pytest.mark.parametrize("text, window, other", [
+    ("You've hit your 5-hour limit · resets 3pm", "five_hour", "seven_day"),
+    ("You've hit your session limit · resets 3pm", "five_hour", "seven_day"),
+    ("You've hit your weekly limit · resets Nov 4, 9pm", "seven_day", "five_hour"),
+])
+def test_claudes_words_pick_the_window(world, text, window, other):
+    stopped_lead(world, limit_at(T0 - 60, text))
+    usage(world, **{window: T0 + 60, other: T0 + 3600})  # the other one still runs
+    assert world.orch.view(BOSS, world.agents[BOSS], None, world.t)["limit"]
+    world.t = T0 + 61
+    assert world.orch.view(BOSS, world.agents[BOSS], None, world.t)["limit"] is None
+
+
+@pytest.mark.parametrize("readings", [
+    {},  # no reading of this account
+    {"five_hour": T0 - 7200},  # of the other window
+    {"seven_day": T0 - 120},  # a window that ended before the limit
+], ids=["none", "other window", "older window"])
+def test_a_limit_with_no_known_reset_holds(world, readings):
+    stopped_lead(world)
+    usage(world, **readings)
+    world.run("watchdog")
+    assert world.prompts == []
+
+
+def test_a_limit_with_no_window_behind_it_holds(world):
+    stopped_lead(world, limit_at(T0 - 60, "You've hit your Opus limit · resets 3pm"))
+    usage(world, seven_day=T0 - 30, five_hour=T0 - 30)
+    world.run("watchdog")
+    assert world.prompts == []
+
+
+def test_a_lead_resumed_since_its_limit_is_not_stopped_and_gets_its_nudge(world, tmp_path,
+                                                                          monkeypatch):
+    """A resume sends no prompt, so the nudge is what sets a moved lead going."""
+    pushed = push_log(tmp_path, monkeypatch)
+    stopped_lead(world, account="2", event="SessionStart", at=T0 - 10)
+
+    world.run("watchdog")
+
+    assert pushed() == [] and [p for p, _ in world.prompts] == [BOSS]
+
+
+def test_a_later_turn_end_is_no_resume(world):
+    stopped_lead(world, event="Stop", at=T0 - 10)
+    assert world.orch.view(BOSS, world.agents[BOSS], None, world.t)["limit"]
 
 
 def test_watchdog_leaves_a_working_orchestrator_and_parked_workers_alone(world):

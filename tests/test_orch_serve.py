@@ -1663,6 +1663,42 @@ def test_the_fleet_says_an_orchestrator_stopped_at_its_limit(world):
     assert lead_of(world, gw, BOSS)["agent"]["limit"] is None  # a new turn began
 
 
+def lead_at_its_limit(world):
+    """A lead whose limit is a minute old; returns the path of its status file."""
+    start_run(world)
+    world.agent(BOSS, "idle")
+    world.turn_end(BOSS, ago=120)
+    when = datetime.fromtimestamp(world.t - 60, timezone.utc)
+    transcript(world, f"s-{BOSS}", limit_record(when.strftime("%Y-%m-%dT%H:%M:%S.000Z")))
+    return world.root / "agents" / "w1-p0.json"
+
+
+def test_the_fleet_stops_saying_limit_once_the_window_has_reset(world):
+    status = lead_at_its_limit(world)
+    status.write_text(json.dumps(dict(json.loads(status.read_text()), account="1")))
+    (world.root / "usage.json").write_text(json.dumps({"accounts": {"1": {
+        "read_at": world.t, "windows": {"seven_day": {"resets_at": world.t + 3600}}}}}))
+    gw = world.serve.Gateway()
+    assert lead_of(world, gw, BOSS)["activity"] == "limit"
+
+    world.t += 3601
+
+    lead = lead_of(world, gw, BOSS)
+    assert lead["agent"]["limit"] is None and lead["activity"] != "limit"
+
+
+def test_the_fleet_stops_saying_limit_once_the_session_is_resumed(world):
+    status = lead_at_its_limit(world)
+    gw = world.serve.Gateway()
+    assert lead_of(world, gw, BOSS)["activity"] == "limit"
+
+    status.write_text(json.dumps(dict(json.loads(status.read_text()), account="2",
+                                      event="SessionStart", time=world.t)))
+
+    lead = lead_of(world, gw, BOSS)
+    assert lead["agent"]["limit"] is None and lead["activity"] != "limit"
+
+
 def test_the_limit_of_a_session_herdr_has_lost_track_of_is_seen(world):
     """The agents view keeps herdr on a session that ended; the status names the running one."""
     gw = world.serve.Gateway()
@@ -2642,6 +2678,26 @@ def test_the_push_loop_sends_what_the_phone_needs_once(world, cloud):
     assert "dialog" not in cloud.kinds() and "stall" not in cloud.kinds()  # each went once
     health = gw.route("GET", "/v1/health", {}, None, "127.0.0.1")[1]["push"]
     assert health["seq"] == 4 and health["last_heartbeat"] == world.t
+
+
+def test_a_stop_reaches_the_phone_as_a_system_push_at_high_priority(world, cloud):
+    start_run(world)
+    gw = world.serve.Gateway()
+    pair(world, gw)
+    gw.pusher.cycle()
+    cloud.pushes.clear()
+    world.orch.emit("orch-stopped", "Orchestrator stopped: boss on box1",
+                    "boss (w1:p0): stopped. Do this.", BOSS, state="limit")
+    world.orch.emit("orch-missing", "Orchestrator missing", "no agent", BOSS)
+    gw.pusher.cycle()
+
+    stop, other = [p for p in cloud.pushes if p["message"]["kind"] == "system"]
+    assert stop["message"]["orchestrator"] == BOSS
+    assert stop["message"]["body"] == {
+        "time": world.t, "kind": "orch-stopped", "title": "Orchestrator stopped: boss on box1",
+        "body": "boss (w1:p0): stopped. Do this.", "pane": BOSS}
+    assert stop["android"]["priority"] == "HIGH"  # a phone in Doze holds a normal one back
+    assert other["android"]["priority"] == "NORMAL"
 
 
 def test_events_become_pushes_and_old_ones_are_skipped(world, cloud):
