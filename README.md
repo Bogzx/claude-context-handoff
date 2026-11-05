@@ -452,7 +452,10 @@ Not in the gateway yet: the diff view, the activity lanes and the per-agent mode
   gateway takes it from the transcript, where Claude Code writes the tool call before it asks: the one unfinished call
   that holds every line on screen. If there is no such call, or more than one, `command` is only what the screen shows
   and `command_cut` is true: `allow` is refused (409) and the prompt is answered in the pane. `deny` and `delegate`
-  still work. A file prompt's `command` is the file's name, which the question gives in full.
+  still work.
+- A file change can't be allowed from the phone. A prompt from Write, Edit, MultiEdit or NotebookEdit has `tool` `Write`
+  or `Edit`, the file's name as `command` and `command_cut` true, so `allow` is refused (409) with its own reason,
+  whichever way the action arrives. `deny` and `delegate` still work, and the orchestrator can still decide it.
 - `prompt`, `nudge`, `interrupt` and `answer` are refused (409) for a start's pane until Claude runs there and its
   folder-trust question is answered. Before that, a shell would read the text, or its keys could answer the dialog.
   They are refused (409) the same way for any pane in Claude Code's agents view, where the text would start a new

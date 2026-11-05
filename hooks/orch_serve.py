@@ -226,6 +226,12 @@ RULE = re.compile(r"^\s*[╌─━-]{8,}\s*$")
 HEADER = re.compile(r"[A-Z]\w* command")
 GUTTER = re.compile(r"^\s*│ ?")  # the bar left of a command in a permission prompt
 CALL_TAIL = 1 << 20  # bytes of a transcript read for a dialog's tool call
+# Claude's file questions, as "Do you want to <verb> <file>?". NotebookEdit has the last three.
+WRITES = ("create", "overwrite", "write to")
+EDITS = ("make this edit to", "insert this cell into", "delete this cell from")
+FILE_QUESTION = re.compile(rf"Do you want to ({'|'.join(WRITES + EDITS)}) (.+)\?")
+FILE_TOOLS = {"Write": "Write", "Edit": "Edit", "MultiEdit": "Edit", "NotebookEdit": "Edit"}
+FILE_REFUSED = "file changes can't be allowed from the phone: answer it in the pane"
 
 
 def permission(lines):
@@ -258,9 +264,9 @@ def permission(lines):
         return None
     question = ASKED.match(lines[q])[1]
     tool = command = None
-    m = re.fullmatch(r"Do you want to (create|make this edit to) (.+)\?", question)
+    m = FILE_QUESTION.fullmatch(question)
     if m:
-        tool, command = ("Write" if m[1] == "create" else "Edit"), m[2]
+        tool, command = ("Write" if m[1] in WRITES else "Edit"), m[2]
     else:
         block, top = [], q  # the command: the lines right above the question
         for i in range(q - 1, -1, -1):
@@ -299,9 +305,10 @@ def whole_command(found, session):
     Code writes the tool call to the transcript before it asks, so the command comes from
     there, when exactly one unfinished call holds every line on screen. Otherwise the text is
     only what the screen shows, and command_cut stops Allow, in the app and in act_permission.
-    A file prompt names its file in the question, whole."""
-    if not found or found["tool"] in ("Write", "Edit"):
-        return found and dict(found, command_cut=False)
+    A file prompt is always cut: it names its file, and its contents stay off the phone, so
+    nobody there can read what Allow would write. The owner's rule."""
+    if not found or found["tool"] in FILE_TOOLS:
+        return found and dict(found, command_cut=True)
     shown = ["".join(x.split()) for x in (found["command"] or "").split("\n")]
     shown = [x for x in shown if x]  # without spaces: the terminal wraps a line anywhere
     calls = []
@@ -313,6 +320,9 @@ def whole_command(found, session):
     if len(calls) != 1:
         return dict(found, command_cut=True)
     call, given = calls[0]
+    if call.get("name") in FILE_TOOLS:  # a question this parser doesn't know yet
+        return dict(found, tool=FILE_TOOLS[call["name"]], command_cut=True,
+                    command=given.get("file_path") or given.get("notebook_path"))
     command = given.get("command")
     return dict(found, tool=call.get("name"), command_cut=False,
                 command=command if isinstance(command, str)
@@ -1289,7 +1299,8 @@ def act_permission(gw, body, rec, pane, choice):
         lead = run["orchestrator"]
         typable(lead)
         out = target(lead)
-        cut = " (only the end of it is on screen)" if found["command_cut"] else ""
+        cut = (" (only the end of it is on screen)"
+               if found["command_cut"] and found["tool"] not in FILE_TOOLS else "")
         text = (f"The owner leaves this permission prompt to you: {label} ({pane}) asks "
                 f"\"{found['question']}\" for {what}{cut}. The screen:\n" + "\n".join(lines)
                 + f"\nDecide and answer it in that pane: `herdr agent send-keys {pane} enter` "
@@ -1298,6 +1309,8 @@ def act_permission(gw, body, rec, pane, choice):
         if not orch.prompt(lead, text):
             raise Reject(f"could not prompt {lead}", 502, "failed")
     else:
+        if choice == "allow" and found["tool"] in FILE_TOOLS:
+            raise Reject(FILE_REFUSED)
         if choice == "allow" and found["command_cut"]:
             raise Reject(f"only part of the command in {pane} can be read: answer it in the pane")
         keys = permission_keys(found, choice)

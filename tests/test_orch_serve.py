@@ -146,6 +146,64 @@ WRITE_2 = """\
 
  Esc to cancel
 """
+OPTIONS = """\
+ ❯ 1. Yes
+   2. Yes, and switch to accept edits (auto-approve file edits and common file commands) for this session (shift+tab)
+   3. No
+
+ Esc to cancel · Tab to amend
+"""
+RULE = "╌" * 60
+# Claude Code 2.1.318 in a terminal of 155 x 44, against a fake API (no account).
+OVERWRITE = f"""\
+ Overwrite file
+ notes.md
+{RULE}
+  1 -old line
+  2 -second line
+  1 +SECRET=abc
+  2 +line two
+{RULE}
+ Do you want to overwrite notes.md?
+{OPTIONS}"""
+EDIT = f"""\
+ Edit file
+ notes.md
+{RULE}
+ 1 -old line
+ 1 +SECRET=abc
+ 2  second line
+{RULE}
+ Do you want to make this edit to notes.md?
+{OPTIONS}"""
+NOTEBOOK_EDIT = f"""\
+ Edit notebook
+ /work/proj/nb.ipynb
+ Replace cell contents for cell c1
+{RULE}
+  1 -print('old cell')
+  1 +print('SECRET=abc')
+{RULE}
+ Do you want to make this edit to nb.ipynb?
+{OPTIONS}"""
+NOTEBOOK_INSERT = f"""\
+ Edit notebook
+ /work/proj/nb.ipynb
+ Insert new cell for cell c1 (code)
+{RULE}
+  1 print('SECRET=abc')
+{RULE}
+ Do you want to insert this cell into nb.ipynb?
+{OPTIONS}"""
+NOTEBOOK_DELETE = f"""\
+ Edit notebook
+ /work/proj/nb.ipynb
+ Delete cell for cell c1
+{RULE}
+  1 print('SECRET=abc')
+{RULE}
+ Do you want to delete this cell from nb.ipynb?
+{OPTIONS}"""
 T0 = datetime(2026, 11, 5, 10, 0).timestamp()  # noqa: DTZ001 orch works in local time
 TOKEN = "t0ken-for-tests"
 
@@ -300,6 +358,15 @@ def tool_call(command, tool_id="toolu_1", description="Write the lab notes"):
     return {"type": "assistant", "message": {"content": [
         {"type": "tool_use", "id": tool_id, "name": "Bash",
          "input": {"command": command, "description": description}}]}}
+
+
+def file_call(name="NotebookEdit", **given):
+    """The call behind NOTEBOOK_INSERT: "c1" + "print..." holds the preview's "1 print...", so
+    the search for a command's call finds it."""
+    given = given or {"notebook_path": "/work/proj/nb.ipynb", "cell_id": "c1",
+                      "new_source": "print('SECRET=abc')\n", "edit_mode": "insert"}
+    return {"type": "assistant", "message": {"content": [
+        {"type": "tool_use", "id": "toolu_1", "name": name, "input": given}]}}
 
 
 def tool_result(tool_id="toolu_1"):
@@ -1831,16 +1898,73 @@ def test_a_command_the_transcript_does_not_confirm_is_marked_cut(world, records)
     assert "line 01" not in dialog["command"]
 
 
-def test_a_file_dialog_names_its_file_whole(world):
-    gw = world.serve.Gateway()
+def file_dialog(world, gw, screen, *records):
     start_run(world)
     world.agent(W1, "blocked", change=7)
-    world.screen = WRITE
-
+    world.screen = screen
+    transcript(world, f"s-{W1}", *records)
     [dialog] = lead_of(world, gw, BOSS)["dialogs"]
+    return dialog
 
-    assert (dialog["tool"], dialog["command"], dialog["command_cut"]) == ("Write", "hello.txt",
+
+WRITE_TO = WRITE.replace("create hello.txt", "write to hello.txt")  # from the binary, not seen
+
+
+@pytest.mark.parametrize("screen, tool, name", [
+    (WRITE, "Write", "hello.txt"),
+    (WRITE_TO, "Write", "hello.txt"),
+    (OVERWRITE, "Write", "notes.md"),
+    (EDIT, "Edit", "notes.md"),
+    (NOTEBOOK_EDIT, "Edit", "nb.ipynb"),
+    (NOTEBOOK_INSERT, "Edit", "nb.ipynb"),
+    (NOTEBOOK_DELETE, "Edit", "nb.ipynb"),
+], ids=["create", "write to", "overwrite", "edit", "cell edit", "cell insert", "cell delete"])
+def test_a_file_prompt_is_write_or_edit_its_files_name_and_cut(world, screen, tool, name):
+    dialog = file_dialog(world, world.serve.Gateway(), screen, file_call())
+
+    assert (dialog["tool"], dialog["command"], dialog["command_cut"]) == (tool, name, True)
+
+
+@pytest.mark.parametrize("call", [
+    file_call(),
+    file_call("MultiEdit", file_path="/work/proj/nb.ipynb", edits="c1print('SECRET=abc')"),
+    file_call("Write", file_path="/work/proj/nb.ipynb", content="c1print('SECRET=abc')"),
+], ids=["NotebookEdit", "MultiEdit", "Write"])
+def test_a_file_question_nobody_knows_yet_keeps_its_contents_off_the_phone(world, call):
+    """The search finds the call, and the input it would send holds the file's contents."""
+    screen = NOTEBOOK_INSERT.replace("insert this cell into", "rewrite")
+    dialog = file_dialog(world, world.serve.Gateway(), screen, call)
+
+    assert dialog["command"] == "/work/proj/nb.ipynb" and dialog["command_cut"] is True
+    assert dialog["tool"] == ("Write" if "Write" in str(call) else "Edit")
+
+
+def test_a_command_that_only_mentions_a_file_tool_is_still_a_command(world):
+    dialog = file_dialog(world, world.serve.Gateway(), BASH,
+                         tool_call("rm notes.txt", description="Remove notes.txt"))
+
+    assert (dialog["tool"], dialog["command"], dialog["command_cut"]) == ("Bash", "rm notes.txt",
                                                                          False)
+
+
+@pytest.mark.parametrize("screen", [WRITE, OVERWRITE, NOTEBOOK_INSERT],
+                         ids=["create", "overwrite", "cell insert"])
+def test_allow_is_refused_on_a_file_and_deny_and_delegate_still_work(world, screen):
+    gw = world.serve.Gateway()
+    file_dialog(world, gw, screen, file_call())
+
+    refused = from_phone(world, gw, kind="dialog", pane=W1, change=7, choice="allow")
+
+    assert refused[0] == 409
+    status = world.get(gw, f"/v1/actions/{refused[1]['id']}")[1]
+    assert status["error"] == "file changes can't be allowed from the phone: answer it in the pane"
+    assert not [c for c in world.herdr_calls if c[:2] == ("agent", "send-keys")]
+
+    assert from_phone(world, gw, kind="dialog", pane=W1, change=7, choice="delegate")[0] == 202
+    told = world.prompts[-1][1]
+    assert "only the end of it" not in told and "send-keys" in told
+    assert from_phone(world, gw, kind="dialog", pane=W1, change=7, choice="deny")[0] == 202
+    assert [c for c in world.herdr_calls if c[:2] == ("agent", "send-keys")][-1][3:] == ("esc",)
 
 
 def test_allow_is_refused_on_a_cut_command_and_deny_and_delegate_still_work(world):
@@ -1851,7 +1975,8 @@ def test_allow_is_refused_on_a_cut_command_and_deny_and_delegate_still_work(worl
 
     refused = from_phone(world, gw, kind="dialog", pane=W1, change=7, choice="allow")
 
-    assert refused[0] == 409 and "answer it in the pane" in refused[1]["error"]
+    assert refused[0] == 409 and "only part of the command" in refused[1]["error"]
+    assert "answer it in the pane" in refused[1]["error"]
     assert not [c for c in world.herdr_calls if c[:2] == ("agent", "send-keys")]
     assert from_phone(world, gw, kind="dialog", pane=W1, change=7, choice="delegate")[0] == 202
     assert "only the end of it is on screen" in world.prompts[-1][1]
@@ -2758,6 +2883,23 @@ def test_start_steps_become_start_pushes_high_only_when_one_failed(world, cloud,
     assert failed["message"]["body"]["status"] == "failed"
     assert failed["message"]["body"]["error"] == "herdr couldn't open a tab: no such workspace"
     assert "system" not in cloud.kinds()  # the failure goes once, as a start push
+
+
+def test_allow_on_a_file_is_refused_by_relay_too(world, cloud):
+    start_run(world)
+    gw = world.serve.Gateway()
+    pair(world, gw)
+    gw.pusher.cycle()
+    world.agent(W1, "blocked", change=7)
+    world.screen = OVERWRITE
+    cloud.write("uid1", {"id": "r-allow", "time": world.t, "kind": "dialog", "pane": W1,
+                         "change": 7, "choice": "allow"})
+
+    assert gw.pusher.poll() is True
+
+    status = world.get(gw, "/v1/actions/r-allow")[1]
+    assert status["status"] == "rejected" and "file changes" in status["error"]
+    assert not [c for c in world.herdr_calls if c[:2] == ("agent", "send-keys")]
 
 
 def test_the_relay_runs_each_action_once_and_pushes_its_status(world, cloud):
