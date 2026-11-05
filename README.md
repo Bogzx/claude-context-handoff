@@ -455,7 +455,9 @@ Not in the gateway yet: the diff view, the activity lanes and the per-agent mode
   still work.
 - A file change can't be allowed from the phone. A prompt from Write, Edit, MultiEdit or NotebookEdit has `tool` `Write`
   or `Edit`, the file's name as `command` and `command_cut` true, so `allow` is refused (409) with its own reason,
-  whichever way the action arrives. `deny` and `delegate` still work, and the orchestrator can still decide it.
+  whichever way the action arrives. `deny` and `delegate` still work, and the orchestrator can still decide it. Its
+  `text` is empty, in the fleet and in pushes, so the file's preview stays off the phone; that includes a dialog whose
+  question wrapped in a narrow pane, while a file tool's call is open. `/v1/panes/<pane>/screen` still shows the pane.
 - `prompt`, `nudge`, `interrupt` and `answer` are refused (409) for a start's pane until Claude runs there and its
   folder-trust question is answered. Before that, a shell would read the text, or its keys could answer the dialog.
   They are refused (409) the same way for any pane in Claude Code's agents view, where the text would start a new
@@ -509,8 +511,8 @@ answers work off the tailnet. The app side is orch-app `docs/PUSH.md`.
 
 - Down: FCM HTTP v1 data messages sent by the machine itself with the `orch-push` service account
   (`~/.config/orch/firebase-sa.json`, 600). The payload is zlib-compressed JSON sealed with AES-256-GCM under the
-  pairing key (`ORCH_KEY`), so Google relays only `{v, machine, nonce, ct}`. What is pushed: questions and dialogs open
-  30 s (high priority); stalls 5 minutes after the watchdog's nudge, ended runs, usage running out before its reset,
+  pairing key (`ORCH_KEY`), so Google relays only `{v, machine, nonce, ct}`. What is pushed: questions at once and dialogs
+  open 30 s (both high priority); stalls 5 minutes after the watchdog's nudge, ended runs, usage running out before its reset,
   spill events, failures (`system`, high priority only for `orch-stopped`), action statuses, the steps of a start
   (`start`, high priority only when one failed); a state snapshot per orchestrator on change (at most one a minute),
   accounts on a whole-percent change (at

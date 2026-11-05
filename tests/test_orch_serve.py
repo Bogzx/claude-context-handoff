@@ -204,6 +204,26 @@ NOTEBOOK_DELETE = f"""\
 {RULE}
  Do you want to delete this cell from nb.ipynb?
 {OPTIONS}"""
+WRAPPED = f"""\
+ Overwrite file
+ …-long-directory/notes-with-a-long-name.md
+{RULE}
+  1 -old line
+  2 -second line
+  1 +SECRET=abc
+  2 +line two
+{RULE}
+ Do you want to overwrite
+ notes-with-a-long-name.md?
+ ❯ 1. Yes
+   2. Yes, and switch to accept edits
+      (auto-approve file edits and common
+      file commands) for this session
+      (shift+tab)
+   3. No
+
+ Esc to cancel · Tab to amend
+"""  # the same, 44 columns wide
 T0 = datetime(2026, 11, 5, 10, 0).timestamp()  # noqa: DTZ001 orch works in local time
 TOKEN = "t0ken-for-tests"
 
@@ -1923,6 +1943,7 @@ def test_a_file_prompt_is_write_or_edit_its_files_name_and_cut(world, screen, to
     dialog = file_dialog(world, world.serve.Gateway(), screen, file_call())
 
     assert (dialog["tool"], dialog["command"], dialog["command_cut"]) == (tool, name, True)
+    assert dialog["text"] == ""
 
 
 @pytest.mark.parametrize("call", [
@@ -1937,6 +1958,55 @@ def test_a_file_question_nobody_knows_yet_keeps_its_contents_off_the_phone(world
 
     assert dialog["command"] == "/work/proj/nb.ipynb" and dialog["command_cut"] is True
     assert dialog["tool"] == ("Write" if "Write" in str(call) else "Edit")
+    assert dialog["text"] == ""
+
+
+def overwrite_call():
+    return file_call("Write", file_path="/work/proj/notes.md", content="SECRET=abc\nline two\n")
+
+
+def test_a_preview_that_matches_no_call_is_not_taken_for_a_command(world):
+    """Its line numbers keep the search from finding the call, but the call is open."""
+    screen = OVERWRITE.replace("overwrite notes.md", "rewrite notes.md")
+    dialog = file_dialog(world, world.serve.Gateway(), screen, overwrite_call())
+
+    assert (dialog["tool"], dialog["command"]) == ("Write", "/work/proj/notes.md")
+    assert dialog["command_cut"] is True and dialog["text"] == ""
+
+
+def test_a_question_wrapped_in_a_narrow_pane_keeps_its_preview_off_the_phone(world):
+    gw = world.serve.Gateway()
+    dialog = file_dialog(world, gw, WRAPPED, overwrite_call())
+
+    assert dialog["text"] == "" and "kind" not in dialog
+    refused = from_phone(world, gw, kind="dialog", pane=W1, change=7, choice="allow")
+    assert refused[0] == 400  # not a prompt it can read: nothing is pressed
+    assert not [c for c in world.herdr_calls if c[:2] == ("agent", "send-keys")]
+
+
+@pytest.mark.parametrize("records", [(overwrite_call(), tool_result()), (tool_call("ls"),)],
+                         ids=["the file call ended", "another tool's call"])
+def test_a_dialog_with_no_file_call_open_keeps_its_screen(world, records):
+    dialog = file_dialog(world, world.serve.Gateway(), WRAPPED, *records)
+
+    assert "notes-with-a-long-name" in dialog["text"]
+
+
+def test_a_command_keeps_its_screen_with_a_file_call_open_beside_it(world):
+    dialog = file_dialog(world, world.serve.Gateway(), BASH, overwrite_call(),
+                         tool_call("rm notes.txt", "toolu_2", "Remove notes.txt"))
+
+    assert (dialog["tool"], dialog["command"]) == ("Bash", "rm notes.txt")
+    assert "rm notes.txt" in dialog["text"]
+
+
+def test_the_trust_question_keeps_its_screen_with_a_stale_file_call(world):
+    """A start reads the question from `text`, and a resumed session can have such a call."""
+    screen = ("Do you trust this folder?\n ❯ No, exit\n   Yes, I trust this folder\n\n"
+              " Enter to confirm · Esc to cancel\n")
+    dialog = file_dialog(world, world.serve.Gateway(), screen, overwrite_call())
+
+    assert "trust this folder" in dialog["text"]
 
 
 def test_a_command_that_only_mentions_a_file_tool_is_still_a_command(world):
@@ -2883,6 +2953,34 @@ def test_start_steps_become_start_pushes_high_only_when_one_failed(world, cloud,
     assert failed["message"]["body"]["status"] == "failed"
     assert failed["message"]["body"]["error"] == "herdr couldn't open a tab: no such workspace"
     assert "system" not in cloud.kinds()  # the failure goes once, as a start push
+
+
+def test_a_preview_reaches_the_phone_by_no_road(world, cloud):
+    start_run(world)
+    gw = world.serve.Gateway()
+    pair(world, gw)
+    gw.pusher.cycle()
+    cloud.pushes.clear()
+    world.agent(W1, "blocked", change=7)
+    world.screen = OVERWRITE
+    assert "SECRET" in world.screen
+    transcript(world, f"s-{W1}", file_call("Write", file_path="/work/proj/notes.md",
+                                           content="SECRET=abc\nline two\n"))
+    gw.pusher.cycle()
+    world.t += 61  # past DIALOG_AFTER and STATE_EVERY
+    gw.pusher.cycle()
+    assert {"dialog", "state"} <= set(cloud.kinds())
+
+    cloud.write("uid1", {"id": "r-deny", "time": world.t, "kind": "dialog", "pane": W1,
+                         "change": 7, "choice": "deny"})
+    assert gw.pusher.poll() is True  # by relay: the status and the event come back
+    assert from_phone(world, gw, kind="dialog", pane=W1, change=7, choice="allow")[0] == 409
+    gw.pusher.cycle()
+
+    assert "actions" in cloud.kinds()
+    seen = {"pushes": cloud.pushes, "docs": cloud.docs, "fleet": world.get(gw, "/v1/fleet")[1],
+            "history": world.get(gw, f"/v1/orchestrators/{BOSS}/history?since=0")[1]}
+    assert [k for k, v in seen.items() if "SECRET" in json.dumps(v)] == []
 
 
 def test_allow_on_a_file_is_refused_by_relay_too(world, cloud):

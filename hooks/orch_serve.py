@@ -299,6 +299,13 @@ def pending_calls(session):
     return [c for c in calls if c.get("id") not in done]
 
 
+def file_prompt(found, call):
+    """`found` as a prompt of the file tool `call`: its file's name and none of its contents."""
+    given = call.get("input") or {}
+    return dict(found, tool=FILE_TOOLS[call["name"]], command_cut=True,
+                command=given.get("file_path") or given.get("notebook_path"))
+
+
 def whole_command(found, session):
     """`found` (a permission prompt) with the whole command and `command_cut`. The screen can't
     say what Allow would run: a command taller than the terminal shows only its end. Claude
@@ -306,23 +313,26 @@ def whole_command(found, session):
     there, when exactly one unfinished call holds every line on screen. Otherwise the text is
     only what the screen shows, and command_cut stops Allow, in the app and in act_permission.
     A file prompt is always cut: it names its file, and its contents stay off the phone, so
-    nobody there can read what Allow would write. The owner's rule."""
+    nobody there can read what Allow would write. The owner's rule. A question this parser
+    doesn't know yet is taken for one while a file tool's call is open: what it took for a
+    command would be the preview."""
     if not found or found["tool"] in FILE_TOOLS:
         return found and dict(found, command_cut=True)
+    pending = pending_calls(session)
     shown = ["".join(x.split()) for x in (found["command"] or "").split("\n")]
     shown = [x for x in shown if x]  # without spaces: the terminal wraps a line anywhere
     calls = []
-    for call in pending_calls(session) if shown else ():
+    for call in pending if shown else ():
         given = call.get("input") or {}
         held = "".join("".join(v for v in given.values() if isinstance(v, str)).split())
         if all(x in held for x in shown):
             calls.append((call, given))
     if len(calls) != 1:
-        return dict(found, command_cut=True)
+        files = [c for c in pending if c.get("name") in FILE_TOOLS]
+        return file_prompt(found, files[-1]) if files else dict(found, command_cut=True)
     call, given = calls[0]
-    if call.get("name") in FILE_TOOLS:  # a question this parser doesn't know yet
-        return dict(found, tool=FILE_TOOLS[call["name"]], command_cut=True,
-                    command=given.get("file_path") or given.get("notebook_path"))
+    if call.get("name") in FILE_TOOLS:
+        return file_prompt(found, call)
     command = given.get("command")
     return dict(found, tool=call.get("name"), command_cut=False,
                 command=command if isinstance(command, str)
@@ -341,8 +351,13 @@ def dialog_json(a, agent):
     report = a["report"] or {}
     lines = orch.screen_lines(a["pane"], 40, "visible") or []
     found = whole_command(permission(lines), a["session"])
+    # A file prompt's preview stays off the phone. A question too long for a narrow pane wraps
+    # and isn't parsed, so its open call says what it is; the trust question has no preview.
+    private = (found["tool"] in FILE_TOOLS if found else a["pane_view"] != "trust" and any(
+        c.get("name") in FILE_TOOLS for c in pending_calls(a["session"])))
     return dict({"pane": a["pane"], "label": a["label"], "since": a["since"],
-                 "change": (agent or {}).get("state_change_seq"), "text": "\n".join(lines),
+                 "change": (agent or {}).get("state_change_seq"),
+                 "text": "" if private else "\n".join(lines),
                  "doing": report.get("summary") or orch.first_line(a["last"], 160),
                  "danger": True},  # no rule yet: every dialog answer is treated as dangerous
                 **({"kind": "permission", "tool": found["tool"], "command": found["command"],
