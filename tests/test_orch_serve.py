@@ -268,7 +268,8 @@ ORCHESTRATOR = {"pane": str, "name": str, "machine": str, "cwd?": str,
                                       "status": {"doing", "ok", "failed"}, "time": NUM,
                                       "error?": str}]}}
 SPILL = {"from": str, "at": NUM, "to": str, "time": NUM,
-         "active?": {"window": {"seven_day", "five_hour"}, "used": NUM, "since": NUM}}
+         "active?": {"window": {"seven_day", "five_hour"}, "used": NUM, "since": NUM,
+                     "resets_at?": NUM}}
 FLEET = {"version": int, "machine": str, "time": NUM, "orchestrators": [ORCHESTRATOR],
          "accounts": dict, "default_account": str, "actions": [ACTION_STATUS], "spill?": SPILL}
 DECISIONS = {"pane": str, "log": str, "decisions": [

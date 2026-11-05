@@ -260,6 +260,8 @@ and the gateway.
 `orch account --spill 1:98:2` uses account 1 until it is nearly full, then moves its agents to account 2. When
 account 1's week or 5-hour window reaches 98%, every agent on account 1 gets a pending `--when-idle` switch to
 account 2. Only fresh data counts: a stale `usage.json` or a window that has already reset is treated as unknown.
+The rule ends when a fresh reading is under the threshold, or when the window that fired it resets. That needs no
+reading, because by then every agent may have left the account.
 The trigger is pushed once (kind `spill`). An agent on account 1 whose last turn ended with Claude Code's limit
 message ("You've hit your weekly limit · resets ...", an API error `rate_limit` in the transcript) is resumed on
 account 2 at the next pass. The account of each agent is read from its claude process (`CLAUDE_CONFIG_DIR`).

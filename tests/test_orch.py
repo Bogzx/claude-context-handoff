@@ -1050,7 +1050,8 @@ def test_spill_moves_account_one_agents_once_it_reaches_the_threshold(world, acc
     world.run("watchdog")
 
     acc = json.loads((world.root / "accounts.json").read_text())
-    assert acc["spill"]["active"] == {"window": "seven_day", "used": 98, "since": world.t}
+    assert acc["spill"]["active"] == {"window": "seven_day", "used": 98, "since": world.t,
+                                      "resets_at": world.t + 86400}
     assert set(acc["switch"]) == {W1}  # on account 1; W2 is on 2, BOSS has no claude here
     assert acc["switch"][W1]["reason"] == "spill" and acc["switch"][W1]["when"] == "idle"
     assert "98% of its seven_day window" in acc["switch"][W1]["why"]
@@ -1065,6 +1066,67 @@ def test_spill_moves_account_one_agents_once_it_reaches_the_threshold(world, acc
     usage_at(world, 3, resets_in=7 * 86400)  # the week reset
     world.run("watchdog")
     assert json.loads((world.root / "accounts.json").read_text())["spill"]["active"] is None
+
+
+def active_spill(world):
+    return json.loads((world.root / "accounts.json").read_text())["spill"]["active"]
+
+
+def test_spill_ends_when_its_window_resets_with_no_new_reading(world, accounts, capsys):
+    world.run("account", "--spill", "1:98:2")
+    usage_at(world, 98)
+    world.run("watchdog")
+    assert active_spill(world)["resets_at"] == T0 + 86400
+
+    world.t = T0 + 86399  # every agent left the account: this is the last reading it gets
+    world.run("watchdog")
+    assert active_spill(world)
+    capsys.readouterr()
+    world.run("account", "--for-new")
+    assert capsys.readouterr().out.strip() == "2"
+
+    world.t = T0 + 86400
+    world.run("watchdog")
+
+    assert active_spill(world) is None
+    capsys.readouterr()
+    world.run("account", "--for-new")
+    assert capsys.readouterr().out.strip() == "1"
+    ended = [e for e in world.events() if e["kind"] == "spill"][-1]
+    assert ended["title"] == "Account 1's seven_day window has reset"
+
+
+@pytest.mark.parametrize("entry", [{"read_at": T0}, {"time": T0}], ids=["dated", "old format"])
+def test_a_spill_fired_before_it_kept_the_reset_time_ends_by_the_stored_one(world, accounts,
+                                                                            entry):
+    world.run("account", "--spill", "1:98:2")
+    path = world.root / "accounts.json"
+    acc = json.loads(path.read_text())
+    acc["spill"]["active"] = {"window": "seven_day", "used": 98, "since": T0}
+    path.write_text(json.dumps(acc))
+    (world.root / "usage.json").write_text(json.dumps({"accounts": {"1": dict(entry, windows={
+        "seven_day": {"used_percentage": 98, "resets_at": T0 + 3600}})}}))
+
+    world.t = T0 + 3599
+    world.run("watchdog")
+    assert active_spill(world)
+
+    world.t = T0 + 3600
+    world.run("watchdog")
+    assert active_spill(world) is None
+
+
+def test_a_spill_stays_active_without_a_known_reset_time(world, accounts):
+    world.run("account", "--spill", "1:98:2")
+    path = world.root / "accounts.json"
+    acc = json.loads(path.read_text())
+    acc["spill"]["active"] = {"window": "seven_day", "used": 98, "since": T0}
+    path.write_text(json.dumps(acc))
+
+    world.t = T0 + 30 * 86400
+    world.run("watchdog")
+
+    assert active_spill(world)
 
 
 def test_spill_off_drops_its_pending_switches_and_bad_rules_are_refused(world, accounts, capsys):

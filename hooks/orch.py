@@ -1366,11 +1366,22 @@ def drop_switch(pane):
         save(path, acc)
 
 
+def spill_end(rule):
+    """When the window that fired the rule resets, or None while it isn't active. No reading has
+    to confirm it: every agent has left the account by then, so none may come. A rule fired
+    before it kept this time finds it in usage.json, where a reset time holds however old."""
+    active = rule.get("active") or {}
+    entry = (load(ROOT / "usage.json").get("accounts") or {}).get(rule["from"]) or {}
+    return active.get("resets_at") or ((entry.get("windows") or {}).get(active.get("window"))
+                                       or {}).get("resets_at")
+
+
 def spill_pass(ags, claudes, dry_run):
     """Watchdog: the spill rule (`orch account --spill FROM:PCT:TO`). Once account FROM's week
     or 5-hour window is at PCT% or more (fresh capture only; stale data counts as unknown),
     every agent on FROM gets a pending when-idle switch to TO. An agent on FROM whose last turn
-    ended at the usage limit gets one marked "limit", which is resumed at once."""
+    ended at the usage limit gets one marked "limit", which is resumed at once. The rule ends
+    when a fresh reading is under PCT%, or when the window that fired it resets."""
     path = ROOT / "accounts.json"
     acc = load(path)
     rule = acc.get("spill")
@@ -1380,8 +1391,14 @@ def spill_pass(ags, claudes, dry_run):
     import orch_usage
     at = now()
     usage = orch_usage.windows_report(ROOT, at).get(rule["from"])
+    resets = spill_end(rule)
+    if resets and resets <= at:
+        emit("spill", f"Account {rule['from']}'s {rule['active']['window']} window has reset",
+             "new agents on it stay there", None)
+        rule["active"] = None
     if usage and not usage["stale"]:
-        hot = next(({"window": name, "used": w["used_percentage"], "since": at}
+        hot = next(({"window": name, "used": w["used_percentage"], "since": at,
+                     "resets_at": w["resets_at"]}
                     for name, w in sorted(usage["windows"].items(), reverse=True)
                     if not w["reset"] and w["used_percentage"] is not None
                     and w["used_percentage"] >= rule["at"]), None)
