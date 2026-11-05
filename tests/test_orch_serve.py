@@ -41,6 +41,48 @@ my-app on  main
    Yes, I trust this folder
 
  Enter to confirm · Esc to cancel"""  # Claude Code 2.x, as seen live on 2026-11-05
+# Claude Code 2.1.318's permission prompts, captured with `herdr agent read --source visible` on
+# 2026-11-05 in an 8-row pane: a short terminal shows only the option under the cursor.
+BASH = """\
+ Remove notes.txt
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ rm notes.txt
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ Do you want to proceed?
+ ❯ 1. Yes
+
+ Esc to cancel · Tab to amend
+"""
+BASH_3 = """\
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ rm notes.txt
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ Do you want to proceed?
+ ❯ 3. Yes, and switch to auto mode · auto mode handles
+      these prompts for you
+
+ Esc to cancel
+"""
+WRITE = """\
+ hello.txt
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+  1 hi
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ Do you want to create hello.txt?
+ ❯ 1. Yes
+
+ Esc to cancel · Tab to amend
+"""
+WRITE_2 = """\
+  1 hi
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ Do you want to create hello.txt?
+ ❯ 2. Yes, and switch to accept edits (auto-approve file
+      edits and common file commands) for this session
+      (shift+tab)
+
+ Esc to cancel
+"""
 T0 = datetime(2026, 11, 5, 10, 0).timestamp()  # noqa: DTZ001 orch works in local time
 TOKEN = "t0ken-for-tests"
 
@@ -199,7 +241,7 @@ WORKER_REPORT = {"time": NUM, "summary": str, "status?": {"done", "partial", "bl
 QUESTION = {"id": str, "pane": str, "time": NUM, "text": str,
             "options": [{"label": str, "danger": {"none", "deploy", "prod", "destructive"}}],
             "evidence": [dict], "rule?": str, "kind?": {"plan"}, "answer?": str,
-            "answered?": NUM}
+            "answered?": NUM, "default?": str, "default_at?": NUM, "by_default": bool}
 DIALOG = {"pane": str, "label": str, "since?": NUM, "change": int, "tool?": str,
           "command?": str, "cwd?": str, "doing?": str, "danger": bool, "text": str,
           "kind?": {"trust"}}
@@ -207,7 +249,8 @@ STALL = {"nudged_at?": NUM, "reasons": [{"key": str, "kind": str, "pane?": str, 
                                          "fix?": str, "message?": str, "picked": bool}]}
 WINDOW = {"used_percentage": NUM, "resets_at": NUM, "burn_per_hour?": NUM, "basis_minutes?": NUM,
           "projected_full_at?": NUM, "full_before_reset?": bool, "samples": [[NUM]]}
-ACCOUNT = {"id": str, "name": str, "config_dir": str, "logged_in": bool, "updated?": NUM,
+ACCOUNT = {"id": str, "name": str, "login?": str, "config_dir": str, "logged_in": bool,
+           "updated?": NUM,
            "stale": bool, "pct_per_100k_uncached?": NUM, "windows": {"seven_day?": WINDOW,
                                                                       "five_hour?": WINDOW}}
 ACTION_STATUS = {"id": str, "status": {"delivered", "picked", "rejected", "failed"},
@@ -225,7 +268,8 @@ ORCHESTRATOR = {"pane": str, "name": str, "machine": str, "cwd?": str,
                                       "status": {"doing", "ok", "failed"}, "time": NUM,
                                       "error?": str}]}}
 SPILL = {"from": str, "at": NUM, "to": str, "time": NUM,
-         "active?": {"window": {"seven_day", "five_hour"}, "used": NUM, "since": NUM}}
+         "active?": {"window": {"seven_day", "five_hour"}, "used": NUM, "since": NUM,
+                     "resets_at?": NUM}}
 FLEET = {"version": int, "machine": str, "time": NUM, "orchestrators": [ORCHESTRATOR],
          "accounts": dict, "default_account": str, "actions": [ACTION_STATUS], "spill?": SPILL}
 DECISIONS = {"pane": str, "log": str, "decisions": [
@@ -403,7 +447,7 @@ def busy_fleet(w):
     (w.root / "watchdog.json").write_text(json.dumps(
         {BOSS: {"first_seen": {f"{W2}:blocked:s-{W2}:1": w.t - 11 * 60}}}))
     (w.root / "usage.json").write_text(json.dumps({"accounts": {"1": {
-        "time": w.t - 30, "windows": {"seven_day": {"used_percentage": 80,
+        "read_at": w.t - 30, "windows": {"seven_day": {"used_percentage": 80,
                                                     "resets_at": w.t + 86400}}}}}))
     with open(w.root / "usage-history.jsonl", "w") as f:
         f.writelines(json.dumps({"time": w.t - 3600 + i * 900, "account": "1", "windows": {
@@ -645,7 +689,7 @@ def test_actions_are_refused_with_a_reason(world):
     assert busy[0] == 409 and busy[1]["error"] == f"{W1} is working, not idle"
     assert "not logged in" in world.post(gw, id="s2", kind="account", pane=W1, account="3",
                                          when="idle")[1]["error"]
-    assert world.post(gw, id="d1", kind="dialog", pane=W2, change=1, choice="allow")[0] == 400
+    assert world.post(gw, id="d1", kind="dialog", pane=LOOSE, change=1, choice="allow")[0] == 400
     assert world.post(gw, id="r1", kind="run", orchestrator=W2, op="extend")[0] == 409
     assert world.post(gw, id="pk", kind="park", orchestrator=BOSS, pane=LOOSE)[0] == 409
     qid = world.orch.ask(W1, "Deploy?")
@@ -654,6 +698,28 @@ def test_actions_are_refused_with_a_reason(world):
     assert again[0] == 409 and "already answered" in again[1]["error"]
     rejected = [e for e in world.events() if e["kind"] == "action" and e["status"] != "delivered"]
     assert len(rejected) == 11 and all(e["source"] == "app" for e in rejected)
+
+
+def test_the_fleet_shows_a_questions_default_and_that_it_was_taken(world):
+    world.orch.main(["--orch", BOSS, "run", "start", "--until", "+8h", "--goal", "x"])
+    qid = world.orch.ask(BOSS, "Both OK?", [{"label": "Yes"}, {"label": "No"}], default="Yes",
+                         by="+30m")
+    gw = world.serve.Gateway()
+
+    def question():
+        [lead] = world.get(gw, "/v1/fleet")[1]["orchestrators"]
+        return next(q for q in lead["questions"] if q["id"] == qid)
+
+    open_one = question()
+    assert open_one["default"] == "Yes" and open_one["default_at"] == world.t + 1800
+    assert open_one["by_default"] is False and open_one["answered"] is None
+
+    world.t += 1800
+    world.orch.default_answers(world.orch.agents(), False)
+
+    closed = question()
+    assert closed["by_default"] is True and closed["answer"] == "Yes"
+    assert closed["answered"] == world.t
 
 
 def test_an_answered_question_stays_in_the_fleet_for_10_minutes(world):
@@ -719,6 +785,21 @@ def test_each_action_kind_does_its_job(world):
     assert kinds == ["answer", "park", "unpark", "run", "run", "run", "run", "nudge",
                      "interrupt", "account", "account", "spill", "spill", "spill",
                      "default_account"]
+
+
+def test_accounts_carry_the_hash_of_their_login_for_the_app_to_merge_machines_by(world):
+    (world.home / ".claude.json").write_text(json.dumps({"oauthAccount": {
+        "accountUuid": "u1", "organizationUuid": "o1", "emailAddress": "me@example.com"}}))
+    gw = world.serve.Gateway()
+
+    fleet = world.get(gw, "/v1/fleet")[1]
+
+    assert fleet["accounts"]["1"]["login"] == world.orch.account_login(1)
+    assert len(fleet["accounts"]["1"]["login"]) == 16
+    assert fleet["accounts"]["2"]["login"] is None  # no login known: the app merges nothing
+    assert "example" not in json.dumps(fleet["accounts"])
+    assert world.get(gw, "/v1/usage?hours=24")[1]["accounts"]["1"]["login"] == (
+        fleet["accounts"]["1"]["login"])
 
 
 def test_an_account_switch_now_runs_in_the_background(world, monkeypatch):
@@ -846,8 +927,9 @@ def test_a_start_is_refused_outside_the_roots_in_excluded_or_busy_folders(world,
 def test_a_start_runs_once_per_id(world, monkeypatch):
     allow_starts(world, monkeypatch)
     gw = world.serve.Gateway()
-    first = world.post(gw, **start_action(id="st1"))
-    assert world.post(gw, **start_action(id="st1")) == first  # the app's retry
+    action = start_action(id="st1", time=world.t)
+    first = world.post(gw, **action)
+    assert world.post(gw, **action) == first  # the app's retry: the same body
     other = world.post(gw, **start_action(id="st1", goal="Something else"))
     assert other[0] == 409 and "already used" in other[1]["error"]
     (world.root / "gateway-actions.json").unlink()  # the action log forgot it: the start didn't
@@ -899,6 +981,105 @@ def test_a_start_at_the_trust_dialog_shows_a_trust_dialog(world, monkeypatch):
     assert "kind" not in dialog  # another dialog of the same agent
 
 
+def test_a_starting_orchestrator_takes_no_typed_input_until_claude_runs_and_trust_is_answered(
+        world, monkeypatch):
+    allow_starts(world, monkeypatch, run_it=False)
+    gw = world.serve.Gateway()
+    world.post(gw, **start_action(id="st1"))
+    rec = world.orch.load(world.orch.STARTS / "st1" / "new.json")
+    rec["pane"] = NEW
+    world.orch.start_step(rec, "pane", "ok")
+    world.agent(NEW, "idle")  # herdr sees the pane's shell before Claude runs
+
+    def typed(n):
+        return [world.post(gw, id=f"p{n}", kind="prompt", pane=NEW, text="y"),
+                world.post(gw, id=f"i{n}", kind="interrupt", pane=NEW),
+                world.post(gw, id=f"n{n}", kind="nudge", orchestrator=NEW, text="y")]
+
+    keys = len(world.herdr_calls)
+    for status, out in typed(1):
+        assert status == 409 and out["error"].endswith("whose Claude isn't running yet")
+    world.orch.start_step(rec, "claude", "doing")
+    world.orch.start_step(rec, "trust", "doing")
+    world.agent(NEW, "blocked")
+    for status, out in typed(2):
+        assert status == 409 and "folder-trust question: answer that first" in out["error"]
+    assert world.prompts == [] and world.herdr_calls[keys:] == []  # nothing reached the pane
+    world.orch.start_step(rec, "trust", "ok")
+    world.orch.start_step(rec, "claude", "ok")
+    world.agent(NEW, "idle")
+    assert [status for status, _ in typed(3)] == [202, 202, 202]
+    world.orch.save(world.orch.STARTS / "st1" / "new.json", dict(rec, restart=True))  # retry
+    assert world.post(gw, id="p4", kind="prompt", pane=NEW, text="y")[0] == 409
+
+
+
+def test_permission_prompts_parse_from_captured_screens(world):
+    serve = world.serve
+    bash = serve.permission(BASH.split("\n"))
+    assert bash == {"question": "Do you want to proceed?", "tool": None,
+                    "command": "rm notes.txt", "options": ["1. Yes"], "cursor": "1. Yes"}
+    assert serve.permission_keys(bash, "allow") == ["enter"]
+    assert serve.permission_keys(bash, "deny") == ["esc"]
+    third = serve.permission(BASH_3.split("\n"))
+    assert third["cursor"] == ("3. Yes, and switch to auto mode · auto mode handles these "
+                               "prompts for you")
+    assert serve.permission_keys(third, "allow") is None  # never Enter on another option
+    write = serve.permission(WRITE.split("\n"))
+    assert (write["tool"], write["command"], write["cursor"]) == ("Write", "hello.txt", "1. Yes")
+    assert serve.permission(WRITE_2.split("\n"))["cursor"].endswith("for this session "
+                                                                     "(shift+tab)")
+    # the same prompt in a tall terminal (the captured options, all on screen at once)
+    tall = ("Bash command\n\n  rm notes.txt\n  Remove notes.txt\n\n Do you want to proceed?\n"
+            " ❯ 1. Yes\n   2. Yes, and always allow access to tmp/ from this project\n"
+            "   3. Yes, and switch to auto mode\n   4. No\n\n Esc to cancel · Tab to amend")
+    found = serve.permission(tall.split("\n"))
+    assert (found["tool"], found["command"]) == ("Bash", "rm notes.txt\nRemove notes.txt")
+    assert len(found["options"]) == 4 and found["cursor"] == "1. Yes"
+    for other in (TRUST, world.screen, "❯ \n────\n  ? for shortcuts", ""):
+        assert serve.permission(other.split("\n")) is None
+
+
+def test_the_app_answers_a_permission_prompt_of_an_agent_in_a_run(world):
+    gw = world.serve.Gateway()
+    start_run(world)
+    world.agent(W1, "blocked", change=7)
+    world.screen = BASH
+    [dialog] = lead_of(world, gw, BOSS)["dialogs"]
+    assert (dialog["kind"], dialog["tool"], dialog["command"]) == ("permission", None,
+                                                                    "rm notes.txt")
+    assert gw.route("GET", "/v1/health", {}, None, "127.0.0.1")[1]["dialogs"] == [
+        "trust", "permission"]
+
+    stale = from_phone(world, gw, kind="dialog", pane=W1, change=6, choice="allow")
+    assert stale[0] == 409 and "the dialog changed" in stale[1]["error"]
+    assert from_phone(world, gw, kind="dialog", pane=W1, change=7, choice="allow")[0] == 202
+    assert world.herdr_calls[-1] == ("agent", "send-keys", W1, "enter")
+    assert from_phone(world, gw, kind="dialog", pane=W1, change=7, choice="deny")[0] == 202
+    assert world.herdr_calls[-1] == ("agent", "send-keys", W1, "esc")
+    assert from_phone(world, gw, kind="dialog", pane=W1, change=7, choice="delegate")[0] == 202
+    lead, text = world.prompts[-1]
+    assert lead == BOSS and "builder (w1:p1)" in text and "rm notes.txt" in text
+    assert f"herdr agent send-keys {W1} enter" in text and f"send-keys {W1} esc" in text
+    answered = [(e["choice"], e["by"]) for e in world.events() if e["kind"] == "permission"]
+    assert answered == [("allow", "nPHONE"), ("deny", "nPHONE"), ("delegate", "nPHONE")]
+
+    keys = len(world.herdr_calls)
+    world.screen = BASH_3  # someone moved the cursor in the pane
+    moved = from_phone(world, gw, kind="dialog", pane=W1, change=7, choice="allow")
+    assert moved[0] == 409 and "not \"1. Yes\"" in moved[1]["error"]
+    world.screen = "Bash command\n  rm x\nWhat should Claude do?\n❯ 1. Retry\n"
+    assert from_phone(world, gw, kind="dialog", pane=W1, change=7, choice="allow")[0] == 400
+    world.screen = BASH
+    world.agent(BOSS, "blocked", change=3)  # the orchestrator itself: nobody to delegate to
+    assert from_phone(world, gw, kind="dialog", pane=BOSS, change=3, choice="delegate")[0] == 409
+    assert from_phone(world, gw, kind="dialog", pane=W1, choice="allow")[0] == 400  # no change
+    world.agent(W1, "working", change=8)
+    assert from_phone(world, gw, kind="dialog", pane=W1, change=8, choice="allow")[0] == 409
+    assert world.herdr_calls[keys:] == [c for c in world.herdr_calls[keys:]
+                                        if c[:2] != ("agent", "send-keys")]  # no keys sent
+
+
 def from_phone(w, gw, **action):
     """An action from the paired phone (127.0.0.1 is its tailnet node in the world)."""
     action.setdefault("id", f"a{len(w.events())}-{action.get('kind')}")
@@ -936,6 +1117,9 @@ def test_cancel_quits_the_new_orchestrator_and_closes_only_its_pane(world, monke
     world.serve.orch_push.save_phones({"nPHONE": {"node": "phone", "device": "OnePlus 12"}})
     gw = world.serve.Gateway()
     world.post(gw, **start_action(id="st1"))  # plan first: it reads, the run is registered
+    qid = world.orch.ask(NEW, "Plan ready", [{"label": "Approve and start workers"}], "plan")
+    lineage = Path(world.orch.load(world.orch.STARTS / "st1" / "new.json")["lineage"])
+    assert lineage.is_dir()
     status, out = from_phone(world, gw, id="c1", kind="start_cancel", action="st1")
     assert status == 202 and out["status"] == "picked" and out["picked_at"] == world.t
     assert (NEW, "/exit") in world.prompts and NEW not in world.agents
@@ -946,7 +1130,12 @@ def test_cancel_quits_the_new_orchestrator_and_closes_only_its_pane(world, monke
     assert lead["activity"] == "done" and lead["start"] is None
     [event] = [e for e in world.events() if e["kind"] == "start-cancel"]
     assert event["pane"] == NEW and event["action"] == "st1" and event["by"] == "phone (OnePlus 12)"
-    assert event["body"] == f"by phone (OnePlus 12): run stopped; pane {NEW} closed"
+    assert event["body"] == (f"by phone (OnePlus 12): run stopped; pane {NEW} closed; "
+                             "its unused decision log removed")
+    assert not lineage.exists() and not lineage.parent.exists()  # nothing was written to it
+    [plan] = world.orch.load_run(NEW)["questions"]
+    assert (plan["id"], plan["answer"], plan["answered"]) == (
+        qid, "(the start was cancelled by phone (OnePlus 12))", world.t)
     again = world.post(gw, id="c2", kind="start_cancel", action="st1")
     assert again[0] == 409 and again[1]["error"] == "the start st1 was cancelled already"
     assert world.post(gw, id="c3", kind="start_cancel", action="nope")[0] == 404
@@ -968,11 +1157,12 @@ def test_retry_runs_a_failed_start_again_from_its_failed_step(world, monkeypatch
     world.tab_ok = False
     assert world.post(gw, **start_action(id="st1"))[0] == 502
     world.tab_ok = True
+    at = world.t
     assert world.post(gw, id="r1", kind="start_retry", action="st1")[0] == 202
     rec = world.orch.load(world.orch.STARTS / "st1" / "new.json")
     assert [(s["step"], s["status"]) for s in rec["steps"]] == [
         ("pane", "ok"), ("claude", "ok"), ("run", "ok"), ("read", "doing")]
-    assert rec["retries"] == [{"time": world.t, "by": "the app", "step": "pane", "account": "2"}]
+    assert rec["retries"] == [{"time": at, "by": "the app", "step": "pane", "account": "2"}]
     again = world.post(gw, id="r2", kind="start_retry", action="st1")
     assert again[0] == 409 and "has not failed" in again[1]["error"]
 
@@ -984,10 +1174,12 @@ def test_retry_on_another_account_restarts_claude_after_nobody_trusted_the_folde
     world.screen = TRUST
     run = world.herdr
 
-    def herdr(*args, **kw):  # Claude on account 2 stops at the trust question
+    def herdr(*args, **kw):  # Claude on account 2 stops at the trust question, on 1 it doesn't
         out = run(*args, **kw)
         if args[:2] == ("pane", "run") and " 2 --session-id " in args[3]:
             world.agents[args[2]]["agent_status"] = "blocked"
+        elif args[:2] == ("pane", "run"):
+            world.screen = ""
         return out
 
     monkeypatch.setattr(world.orch, "herdr", herdr)
@@ -1034,6 +1226,7 @@ def test_retry_picks_up_a_start_whose_process_died(world, monkeypatch):
     gone.wait()
     world.orch.save(path, dict(world.orch.load(path), pid=gone.pid))  # killed meanwhile
     world.agents[NEW]["agent_status"] = "idle"  # and the question was answered in the pane
+    world.screen = ""
     allow_starts(world, monkeypatch)  # the retry runs in-process
     assert world.post(gw, id="r2", kind="start_retry", action="st1")[0] == 202
     rec = world.orch.load(path)
@@ -1049,8 +1242,10 @@ def test_the_app_answers_only_a_new_orchestrators_trust_question(world, monkeypa
     gw = world.serve.Gateway()
     rec = trust_step(world, gw)
     answer = {"kind": "dialog", "pane": NEW, "change": 4, "choice": "allow"}
-    early = from_phone(world, gw, **answer)  # the start isn't at its trust step yet
-    assert early[0] == 400 and "answer this dialog in the pane" in early[1]["error"]
+    world.orch.start_step(rec, "claude", "ok")  # the start is past its trust question
+    late = from_phone(world, gw, **answer)
+    assert late[0] == 400 and "answer this dialog in the pane" in late[1]["error"]
+    world.orch.start_step(rec, "claude", "doing")
     world.orch.start_step(rec, "trust", "doing")
     world.agent(W2, "blocked", change=2)
     assert from_phone(world, gw, **dict(answer, pane=W2, change=2))[0] == 400  # not a start's
@@ -1069,6 +1264,21 @@ def test_the_app_answers_only_a_new_orchestrators_trust_question(world, monkeypa
     assert event["pane"] == NEW and event["action"] == "st1" and event["choice"] == "allow"
     assert event["by"] == "phone (OnePlus 12)" and event["source"] == "app"
     assert event["body"] == "~/Repo/my-app on account 2, by phone (OnePlus 12)"
+
+
+def test_the_trust_question_is_marked_and_answerable_as_soon_as_it_shows(world, monkeypatch):
+    allow_starts(world, monkeypatch, run_it=False)
+    gw = world.serve.Gateway()
+    rec = trust_step(world, gw)  # Claude starts; the start hasn't seen it blocked for 3 s yet
+    world.agents[NEW]["cwd"] = str(world.home / "Repo" / "my-app")
+    claude_at = next(s["time"] for s in rec["steps"] if s["step"] == "claude")
+    [dialog] = lead_of(world, gw, NEW)["dialogs"]
+    assert (dialog["kind"], dialog["since"], dialog["label"]) == ("trust", claude_at, "my-app")
+    world.screen = BASH  # another dialog of that pane is not the trust question
+    assert lead_of(world, gw, NEW)["dialogs"][0]["kind"] == "permission"
+    world.screen = TRUST
+    assert world.post(gw, kind="dialog", pane=NEW, change=4, choice="allow")[0] == 202
+    assert ("agent", "send-keys", NEW, "down", "enter") in world.herdr_calls
 
 
 def test_denying_the_trust_question_quits_claude_and_cancels_the_start(world, monkeypatch):
@@ -1421,6 +1631,7 @@ def test_start_steps_become_start_pushes_high_only_when_one_failed(world, cloud,
     pair(world, gw)
     gw.pusher.cycle()
     cloud.pushes.clear()
+    at = world.t
     world.post(gw, **start_action(id="st1", plan_first=False))
     gw.pusher.cycle()
     starts = [p for p in cloud.pushes if p["message"]["kind"] == "start"]
@@ -1430,7 +1641,7 @@ def test_start_steps_become_start_pushes_high_only_when_one_failed(world, cloud,
     assert starts[0]["android"] == {"priority": "NORMAL", "ttl": "86400s"}  # not collapsed
     assert starts[0]["message"]["orchestrator"] == NEW
     assert starts[0]["message"]["body"] == {"action": "st1", "pane": NEW, "step": "pane",
-                                            "status": "ok", "error": None, "time": world.t}
+                                            "status": "ok", "error": None, "time": at}
     seqs = [p["message"]["seq"] for p in starts]
     assert seqs == sorted(set(seqs))  # each counts
     cloud.pushes.clear()
@@ -1545,7 +1756,7 @@ def test_a_usage_alert_is_sent_once_per_window_even_days_later(world, cloud):
 
     def burning():  # account 1 at 4 %/h: full long before its reset in days
         (world.root / "usage.json").write_text(json.dumps({"accounts": {"1": {
-            "time": world.t - 30, "windows": {"seven_day": {"used_percentage": 80,
+            "read_at": world.t - 30, "windows": {"seven_day": {"used_percentage": 80,
                                                         "resets_at": resets}}}}}))
         with open(world.root / "usage-history.jsonl", "a") as f:
             f.writelines(json.dumps({"time": world.t - 3600 + i * 900, "account": "1", "windows": {

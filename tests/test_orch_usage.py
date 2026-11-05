@@ -24,8 +24,9 @@ def u(tmp_path):
 
 
 def statusline(session="s1", five=20.0, five_reset=T0 + 3 * HOUR, week=60.0,
-               week_reset=T0 + 4 * 86400):
+               week_reset=T0 + 4 * 86400, transcript=None):
     return json.dumps({"session_id": session, "model": {"id": "claude-opus-5-5"},
+                       "transcript_path": transcript,
                        "rate_limits": {
                            "five_hour": {"used_percentage": five, "resets_at": five_reset},
                            "seven_day": {"used_percentage": week, "resets_at": week_reset}}})
@@ -36,14 +37,32 @@ def history(u):
     return [json.loads(x) for x in path.read_text().splitlines()] if path.exists() else []
 
 
+def transcript_of(u, session):
+    return u.root.parent / "sessions" / f"{session}.jsonl"
+
+
+def reading(u, t, session="s1", env=None, root=None, **limits):
+    """The session gets an API response at `t` and its statusline captures the limits."""
+    path = transcript_of(u, session)
+    write(path, assistant(f"m{t}", t))
+    u.capture(statusline(session=session, transcript=str(path), **limits), env or {},
+              root or u.root, t)
+
+
+def refresh(u, at, session="s1", **limits):
+    """The statusline of a session that got no new API response repeats its limits at `at`."""
+    u.capture(statusline(session=session, transcript=str(transcript_of(u, session)), **limits),
+              {}, u.root, at)
+
+
 # --- capture --------------------------------------------------------------------------------------
 
 def test_capture_keeps_the_latest_per_account_and_history_every_5_minutes(u):
-    u.capture(statusline(five=20.0), {}, u.root, T0)
-    u.capture(statusline(five=21.0), {}, u.root, T0 + 30)  # changed: latest, no history line
-    u.capture(statusline(session="s2", five=70.0),
-              {"CLAUDE_CONFIG_DIR": str(Path.home() / ".claude-2")}, u.root, T0 + 40)
-    u.capture(statusline(five=22.0), {}, u.root, T0 + 301)
+    reading(u, T0, five=20.0)
+    reading(u, T0 + 30, five=21.0)  # changed: latest, no history line
+    reading(u, T0 + 40, session="s2", five=70.0,
+            env={"CLAUDE_CONFIG_DIR": str(Path.home() / ".claude-2")})
+    reading(u, T0 + 301, five=22.0)
 
     cur = json.loads((u.root / "usage.json").read_text())
     assert cur["accounts"]["1"]["windows"]["five_hour"]["used_percentage"] == 22.0
@@ -56,18 +75,101 @@ def test_capture_keeps_the_latest_per_account_and_history_every_5_minutes(u):
 
 def test_capture_creates_its_folder(u):
     root = u.root / "not-yet"
-    u.capture(statusline(), {}, root, T0)
-    assert json.loads((root / "usage.json").read_text())["accounts"]["1"]["time"] == T0
+    reading(u, T0, root=root)
+    assert json.loads((root / "usage.json").read_text())["accounts"]["1"]["read_at"] == T0
     assert len((root / "usage-history.jsonl").read_text().splitlines()) == 1
 
 
+def test_capture_starts_a_new_line_after_a_torn_history_record(u):
+    # a capture killed mid-write leaves a record without its newline (seen cut at a page edge)
+    (u.root / "usage-history.jsonl").write_text(
+        json.dumps({"time": T0 - 600, "account": "1", "windows": {}}) + "\n"
+        + '{"time": %s, "account": "1", "windows": {"seven_day": {"resets_at": 179' % (T0 - 5))
+    reading(u, T0)
+    assert [h["time"] for h in u.history(u.root, 0)] == [T0 - 600, T0]
+
+
 def test_capture_does_not_rewrite_an_unchanged_file(u):
-    u.capture(statusline(), {}, u.root, T0)
+    reading(u, T0)
     mtime = (u.root / "usage.json").stat().st_mtime_ns
-    u.capture(statusline(), {}, u.root, T0 + 20)
+    refresh(u, T0 + 20)
+    refresh(u, T0 + 61)
     assert (u.root / "usage.json").stat().st_mtime_ns == mtime
-    u.capture(statusline(), {}, u.root, T0 + 61)  # refreshed once a minute: freshness
-    assert json.loads((u.root / "usage.json").read_text())["accounts"]["1"]["time"] == T0 + 61
+
+
+def test_an_idle_sessions_repeated_limits_keep_the_age_of_its_last_api_response(u):
+    # 2026-11-05: two idle sessions re-dated a reading a day old every minute, and the app, which
+    # keeps each account's freshest reading, flipped between 98% and 42%. Their transcripts
+    # still got entries of Claude Code's own, so the file's time doesn't date the reading.
+    reading(u, T0, week=42.0)
+    write(transcript_of(u, "s1"), [{"type": "system", "subtype": "away_summary",
+                                    "timestamp": stamp(T0 + 3 * HOUR)}])
+    for later in range(1, 30):
+        refresh(u, T0 + later * 600, week=42.0)
+
+    account = u.windows_report(u.root, T0 + 5 * HOUR)["1"]
+    assert account["updated"] == T0 and account["stale"] is True
+    assert [h["time"] for h in history(u)] == [T0]  # burn rates see one point, not 30
+
+
+def test_an_idle_session_never_replaces_a_newer_reading(u):
+    reading(u, T0 - HOUR, session="idle", week=42.0)
+    reading(u, T0, session="live", week=98.0)  # replaces the older one, as it should
+    refresh(u, T0 + 10, session="idle", week=42.0)
+
+    account = u.windows_report(u.root, T0 + 20)["1"]
+    assert account["windows"]["seven_day"]["used_percentage"] == 98.0
+    assert account["updated"] == T0 and account["stale"] is False
+
+
+def test_limits_that_change_before_their_response_is_written_are_kept(u):
+    reading(u, T0, week=60.0)
+    refresh(u, T0 + 5, week=61.0)  # a response is streaming: the transcript has no line for it
+
+    account = u.windows_report(u.root, T0 + 10)["1"]
+    assert account["windows"]["seven_day"]["used_percentage"] == 61.0 and account["updated"] == T0
+
+
+@pytest.mark.parametrize("entries", [
+    [],
+    [{"type": "user", "timestamp": "2026-11-05T10:00:00.000Z"}],
+    [{"type": "assistant", "timestamp": "2026-11-05T10:00:00.000Z",
+      "message": {"model": "<synthetic>", "usage": {"input_tokens": 0}}}],
+    [{"type": "assistant", "timestamp": "2026-11-05T10:00:00.000Z",
+      "message": {"model": "claude-opus-5-5"}}],
+], ids=["empty", "no reply", "own notice", "no usage"])
+def test_a_reading_of_unknown_age_is_dropped(u, entries):
+    write(transcript_of(u, "s1"), entries)
+    refresh(u, T0)
+    u.capture(statusline(transcript=str(u.root / "missing.jsonl")), {}, u.root, T0)
+    u.capture(statusline(), {}, u.root, T0)  # no transcript named
+
+    assert u.windows_report(u.root, T0) == {} and history(u) == []
+
+
+def test_a_response_found_is_the_last_real_one_inside_the_files_end(u, monkeypatch):
+    path = transcript_of(u, "s1")
+    write(path, assistant("old", T0 - HOUR) + assistant("new", T0) + [
+        {"type": "assistant", "timestamp": stamp(T0 + 60),
+         "message": {"model": "<synthetic>", "usage": {"input_tokens": 0}}}])
+    assert u.last_response(path) == T0
+
+    size = len(path.read_bytes().splitlines()[-1])  # the search starts inside the line before
+    monkeypatch.setattr(u, "TAIL", size + 20)
+    assert u.last_response(path) is None
+
+
+def test_a_reading_stored_before_readings_were_dated_counts_for_nothing(u):
+    (u.root / "usage.json").write_text(json.dumps({"accounts": {"1": {
+        "time": T0, "history_time": T0, "config_dir": "",
+        "windows": {"seven_day": {"used_percentage": 42.0, "resets_at": T0 + 86400}}}}}))
+    assert u.windows_report(u.root, T0) == {}
+
+    reading(u, T0 - HOUR, week=50.0)  # older than the stored time, which was a capture's
+
+    cur = json.loads((u.root / "usage.json").read_text())["accounts"]["1"]
+    assert cur["read_at"] == T0 - HOUR and "time" not in cur
+    assert u.windows_report(u.root, T0)["1"]["windows"]["seven_day"]["used_percentage"] == 50.0
 
 
 def test_capture_is_silent_on_bad_input(u, capsys, monkeypatch):
@@ -84,7 +186,7 @@ def test_capture_is_silent_on_bad_input(u, capsys, monkeypatch):
 
 def feed(u, points, account_env=None):
     for t, five in points:
-        u.capture(statusline(five=five), account_env or {}, u.root, t)
+        reading(u, t, five=five, env=account_env)
 
 
 def test_burn_rate_and_projection_before_the_reset(u):
@@ -103,14 +205,14 @@ def test_burn_rate_and_projection_before_the_reset(u):
 
 def test_burn_rate_needs_enough_history_in_the_same_window(u):
     feed(u, [(T0 - 2 * HOUR, 90.0)])  # the previous window (another reset time)
-    u.capture(statusline(five=5.0, five_reset=T0 + 5 * HOUR), {}, u.root, T0 - 600)
-    u.capture(statusline(five=8.0, five_reset=T0 + 5 * HOUR), {}, u.root, T0)
+    reading(u, T0 - 600, five=5.0, five_reset=T0 + 5 * HOUR)
+    reading(u, T0, five=8.0, five_reset=T0 + 5 * HOUR)
     w = u.windows_report(u.root, T0)["1"]["windows"]["five_hour"]
     assert w["used_percentage"] == 8.0 and w["burn_per_hour"] is None  # 10 min is too little
 
 
 def test_a_window_past_its_reset_is_marked(u):
-    u.capture(statusline(five=97.0, five_reset=T0 + 60), {}, u.root, T0)
+    reading(u, T0, five=97.0, five_reset=T0 + 60)
     acc = u.windows_report(u.root, T0 + 120)["1"]
     assert acc["windows"]["five_hour"]["reset"] is True and acc["stale"] is False
     assert u.windows_report(u.root, T0 + 3600)["1"]["stale"] is True
@@ -222,7 +324,7 @@ def test_report_per_agent_run_day_and_window_share(u):
     write(u.projects / "p" / "oldsession-1.jsonl", assistant("o1", T0 - 3 * HOUR, read=0, w1=0))
     write(u.projects / "p" / "loose.jsonl", assistant("l1", T0 - HOUR, model="claude-x-1",
                                                       read=0, w1=0))
-    u.capture(statusline(session="boss", five=30.0), {}, u.root, T0)
+    reading(u, T0, session="boss", five=30.0)
     agents = {"w1:p1": {"name": "builder-agent", "agent_session": {"value": "work"}}}
 
     rep = u.report(u.root, u.projects, agents, T0, 24)
@@ -263,17 +365,19 @@ def test_report_lists_every_known_account_and_points_of_the_last_hour_and_today(
           assistant("h", T0 - HOUR / 2, inp=0, out=1000, read=0, w1=0)  # $0.02, the last hour
           + assistant("t", T0 - 3 * HOUR, inp=0, out=3000, read=0, w1=0)  # $0.06, today
           + assistant("y", T0 - 20 * HOUR, inp=0, out=6000, read=0, w1=0))  # $0.12, yesterday
-    u.capture(statusline(session="boss", week=60.0), {}, u.root, T0)  # 60 points for $0.20
+    reading(u, T0, session="boss", week=60.0)  # 60 points for $0.20
 
-    rep = u.report(u.root, u.projects, {}, T0, 24, {"1": {"name": "main"}, "2": {"name": "spare"}})
+    rep = u.report(u.root, u.projects, {}, T0, 24, {"1": {"name": "main", "login": "abc"},
+                                                    "2": {"name": "spare"}})
 
     week = rep["accounts"]["1"]["windows"]["seven_day"]
     assert rep["accounts"]["1"]["id"] == "1" and rep["accounts"]["1"]["name"] == "main"
+    assert rep["accounts"]["1"]["login"] == "abc"
     assert week["machine_cost_usd"] == 0.2
     assert week["agents"]["w1:p0"] == {"share": 1.0, "estimated_points": 60.0,
                                        "points_last_hour": 6.0, "points_today": 24.0}
-    assert rep["accounts"]["2"] == {"id": "2", "name": "spare", "updated": None, "stale": True,
-                                    "windows": {}}  # no statusline ran on it yet
+    assert rep["accounts"]["2"] == {"id": "2", "name": "spare", "login": None, "updated": None,
+                                    "stale": True, "windows": {}}  # no statusline ran on it yet
     assert list(rep["accounts"]) == ["1", "2"]
     assert "account 2 (spare): no reading yet" in u.human(rep)
 

@@ -426,6 +426,133 @@ def test_answer_prompts_the_asker_once(world, capsys):
     assert len(world.prompts) == 1
 
 
+def ask_with_default(world, by="+30m"):
+    start_run(world)
+    world.agent(BOSS, "idle")
+    world.run("ask", "Both defaults OK?", "--option", "Both OK", "--option", "Only the first",
+              "--default", "Both OK", "--by", by)
+    return json.loads((world.root / "runs" / "w1-p0.json").read_text())["questions"][0]
+
+
+def question_now(world):
+    return json.loads((world.root / "runs" / "w1-p0.json").read_text())["questions"][0]
+
+
+def default_prompts(world, q):
+    return [text for _, text in world.prompts if q["id"] in text]
+
+
+def test_a_question_goes_to_its_default_at_its_time_and_the_asker_is_told(world, capsys):
+    q = ask_with_default(world)
+    assert q["default"] == "Both OK" and q["default_at"] == T0 + 1800
+    [asked] = [e for e in world.events() if e["kind"] == "ask"]
+    assert asked["default"] == "Both OK" and asked["default_at"] == T0 + 1800
+    assert "Goes to 'Both OK' at" in asked["body"]
+
+    world.t = T0 + 1799
+    world.run("watchdog")
+    assert default_prompts(world, q) == [] and not question_now(world)["answered"]
+
+    world.t = T0 + 1800
+    world.run("watchdog")
+
+    [text] = default_prompts(world, q)
+    by = world.orch.clock(T0 + 1800)
+    assert text.endswith(f"went to its default: Both OK (default, no reply by {by})")
+    assert "owner answered" not in text  # nobody did
+    closed = question_now(world)
+    assert closed["answer"] == "Both OK" and closed["answered"] == T0 + 1800
+    assert closed["by_default"] is True
+    [event] = [e for e in world.events() if e["kind"] == "answer"]
+    assert event["id"] == q["id"] and event["by_default"] is True
+
+    world.t += 600  # once only, and a late answer finds it closed
+    world.run("watchdog")
+    assert len(default_prompts(world, q)) == 1
+    with pytest.raises(SystemExit):
+        world.run("answer", q["id"], "Only the first")
+
+
+def test_the_owner_can_answer_before_the_default(world, capsys):
+    q = ask_with_default(world)
+    world.t = T0 + 600
+
+    world.run("answer", q["id"], "Only the first")
+    world.t = T0 + 3600
+    world.run("watchdog")
+
+    closed = question_now(world)
+    assert closed["answer"] == "Only the first" and closed["answered"] == T0 + 600
+    assert closed["by_default"] is False and len(default_prompts(world, q)) == 1
+    assert capsys.readouterr().err == ""  # a closed question isn't tried at every pass
+
+
+@pytest.mark.parametrize("state", ["blocked", None], ids=["at a dialog", "gone"])
+def test_a_default_waits_for_an_asker_it_can_reach(world, state):
+    q = ask_with_default(world)
+    if state:
+        world.agent(BOSS, state)  # typing would answer the dialog
+    else:
+        world.agents.pop(BOSS)
+    world.t = T0 + 3600
+
+    world.run("watchdog")
+
+    assert default_prompts(world, q) == [] and not question_now(world)["answered"]
+    world.agent(BOSS, "idle")
+    world.run("watchdog")
+    assert len(default_prompts(world, q)) == 1 and question_now(world)["by_default"] is True
+
+
+def test_a_failed_default_prompt_leaves_the_question_open_and_the_watchdog_running(
+        world, monkeypatch):
+    ask_with_default(world)
+    world.t = T0 + 3600
+    monkeypatch.setattr(world.orch, "prompt", lambda pane, text: False)
+
+    assert world.run("watchdog") == 0
+
+    assert not question_now(world)["answered"]
+    assert [e for e in world.events() if e["kind"] == "answer"] == []
+
+
+def test_a_default_is_taken_in_the_pass_that_ends_the_run_and_survives_its_save(world):
+    ask_with_default(world)
+    world.t = T0 + 9 * 3600  # past the default and the run's end: this pass saves the run too
+
+    world.run("watchdog")
+
+    run = json.loads((world.root / "runs" / "w1-p0.json").read_text())
+    assert run["ended"] == world.t and run["questions"][0]["answer"] == "Both OK"
+
+
+@pytest.mark.parametrize("argv, error", [
+    (["--default", "Merge"], "go together"),
+    (["--by", "+30m"], "go together"),
+    (["--default", "Later", "--by", "+30m"], "isn't one of the question's options"),
+    (["--default", "Deploy", "--by", "+30m"], "the owner has to pick it"),
+    (["--default", "Merge", "--by", "soon"], "can't read the time"),
+    (["--default", "Merge", "--by", "2020-01-01 10:00"], "has passed"),
+    (["--default", "Merge", "--by", "+30m", "--kind", "plan"], "a plan waits"),
+], ids=["no by", "no default", "not an option", "dangerous", "bad time", "past", "plan"])
+def test_a_default_silence_could_not_be_trusted_with_is_refused(world, argv, error):
+    start_run(world)
+
+    with pytest.raises(world.orch.Refused) as refused:
+        world.run("ask", "Ship?", "--option", "Merge", "--option", "Deploy", "--danger", "deploy",
+                  *argv)
+
+    assert error in refused.value.text
+    assert world.events() == [] or all(e["kind"] != "ask" for e in world.events())
+    assert not json.loads((world.root / "runs" / "w1-p0.json").read_text()).get("questions")
+
+
+def test_a_default_needs_a_run_for_the_watchdog_to_find_it_in(world):
+    with pytest.raises(world.orch.Refused) as refused:
+        world.orch.ask(W1, "Ship?", [{"label": "Merge"}], default="Merge", by="+30m")
+    assert "outside a run" in refused.value.text
+
+
 def test_a_question_asked_outside_a_run_can_be_answered(world):
     world.run("ask", "Which branch?")
     [ask] = [e for e in world.events() if e["kind"] == "ask"]
@@ -739,7 +866,8 @@ def test_accounts_are_named_in_account_status_and_usage(world, accounts, capsys,
     monkeypatch.setenv("HOME", str(tmp_path))  # no transcripts
     world.run("usage", "--json")  # no reading for any account yet: each one is still listed
     assert json.loads(capsys.readouterr().out)["accounts"]["2"] == {
-        "id": "2", "name": "spare", "updated": None, "stale": True, "windows": {}}
+        "id": "2", "name": "spare", "login": None, "updated": None, "stale": True,
+        "windows": {}}
 
 
 def test_account_switch_when_idle_resumes_a_small_context(world, accounts, capsys):
@@ -863,8 +991,34 @@ def test_a_switch_now_clears_a_pending_one(world, accounts):
 
 def usage_at(world, pct, window="seven_day", age=30, resets_in=86400):
     (world.root / "usage.json").write_text(json.dumps({"accounts": {"1": {
-        "time": world.t - age, "windows": {window: {"used_percentage": pct,
+        "read_at": world.t - age, "windows": {window: {"used_percentage": pct,
                                                     "resets_at": world.t + resets_in}}}}}))
+
+
+def test_a_login_hash_is_the_same_for_one_login_whatever_its_local_number(world, accounts,
+                                                                           tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    first, second = tmp_path / ".claude.json", tmp_path / "claude-2" / ".claude.json"
+
+    def login(path, **who):
+        path.write_text(json.dumps({"oauthAccount": who}))
+
+    me = {"accountUuid": "u1", "organizationUuid": "o1", "emailAddress": "me@example.com"}
+    login(first, **me)
+    login(second, **me, displayName="the same login, another copy of its profile")
+    listed = world.orch.account_list()
+    assert listed["1"]["login"] == listed["2"]["login"]
+    assert len(listed["1"]["login"]) == 16 and "example" not in json.dumps(listed)
+
+    login(second, **dict(me, accountUuid="u2"))
+    assert world.orch.account_login(2) != listed["1"]["login"]
+    login(second, **dict(me, organizationUuid="o2"))  # its limits are the organization's
+    assert world.orch.account_login(2) != listed["1"]["login"]
+
+    login(second, emailAddress="me@example.com")  # no ids to tell it by: never the same
+    assert world.orch.account_login(2) is None
+    second.unlink()
+    assert world.orch.account_login(2) is None
 
 
 def test_spill_moves_account_one_agents_once_it_reaches_the_threshold(world, accounts, capsys):
@@ -896,7 +1050,8 @@ def test_spill_moves_account_one_agents_once_it_reaches_the_threshold(world, acc
     world.run("watchdog")
 
     acc = json.loads((world.root / "accounts.json").read_text())
-    assert acc["spill"]["active"] == {"window": "seven_day", "used": 98, "since": world.t}
+    assert acc["spill"]["active"] == {"window": "seven_day", "used": 98, "since": world.t,
+                                      "resets_at": world.t + 86400}
     assert set(acc["switch"]) == {W1}  # on account 1; W2 is on 2, BOSS has no claude here
     assert acc["switch"][W1]["reason"] == "spill" and acc["switch"][W1]["when"] == "idle"
     assert "98% of its seven_day window" in acc["switch"][W1]["why"]
@@ -911,6 +1066,67 @@ def test_spill_moves_account_one_agents_once_it_reaches_the_threshold(world, acc
     usage_at(world, 3, resets_in=7 * 86400)  # the week reset
     world.run("watchdog")
     assert json.loads((world.root / "accounts.json").read_text())["spill"]["active"] is None
+
+
+def active_spill(world):
+    return json.loads((world.root / "accounts.json").read_text())["spill"]["active"]
+
+
+def test_spill_ends_when_its_window_resets_with_no_new_reading(world, accounts, capsys):
+    world.run("account", "--spill", "1:98:2")
+    usage_at(world, 98)
+    world.run("watchdog")
+    assert active_spill(world)["resets_at"] == T0 + 86400
+
+    world.t = T0 + 86399  # every agent left the account: this is the last reading it gets
+    world.run("watchdog")
+    assert active_spill(world)
+    capsys.readouterr()
+    world.run("account", "--for-new")
+    assert capsys.readouterr().out.strip() == "2"
+
+    world.t = T0 + 86400
+    world.run("watchdog")
+
+    assert active_spill(world) is None
+    capsys.readouterr()
+    world.run("account", "--for-new")
+    assert capsys.readouterr().out.strip() == "1"
+    ended = [e for e in world.events() if e["kind"] == "spill"][-1]
+    assert ended["title"] == "Account 1's seven_day window has reset"
+
+
+@pytest.mark.parametrize("entry", [{"read_at": T0}, {"time": T0}], ids=["dated", "old format"])
+def test_a_spill_fired_before_it_kept_the_reset_time_ends_by_the_stored_one(world, accounts,
+                                                                            entry):
+    world.run("account", "--spill", "1:98:2")
+    path = world.root / "accounts.json"
+    acc = json.loads(path.read_text())
+    acc["spill"]["active"] = {"window": "seven_day", "used": 98, "since": T0}
+    path.write_text(json.dumps(acc))
+    (world.root / "usage.json").write_text(json.dumps({"accounts": {"1": dict(entry, windows={
+        "seven_day": {"used_percentage": 98, "resets_at": T0 + 3600}})}}))
+
+    world.t = T0 + 3599
+    world.run("watchdog")
+    assert active_spill(world)
+
+    world.t = T0 + 3600
+    world.run("watchdog")
+    assert active_spill(world) is None
+
+
+def test_a_spill_stays_active_without_a_known_reset_time(world, accounts):
+    world.run("account", "--spill", "1:98:2")
+    path = world.root / "accounts.json"
+    acc = json.loads(path.read_text())
+    acc["spill"]["active"] = {"window": "seven_day", "used": 98, "since": T0}
+    path.write_text(json.dumps(acc))
+
+    world.t = T0 + 30 * 86400
+    world.run("watchdog")
+
+    assert active_spill(world)
 
 
 def test_spill_off_drops_its_pending_switches_and_bad_rules_are_refused(world, accounts, capsys):
@@ -965,6 +1181,51 @@ def test_spill_states_per_agent_and_the_runs_progress(world, accounts, capsys, t
     assert w2["spill"]["state"] == "cant_move" and "at a dialog" in w2["spill"]["reason"]
     world.run("watchdog")  # not queued again
     assert W2 not in json.loads((world.root / "accounts.json").read_text())["switch"]
+
+
+def test_an_agent_moved_by_hand_counts_as_moved_and_is_no_longer_cant_move(
+        world, accounts, capsys, tmp_path, monkeypatch):
+    # 2026-11-05: one agent's resume stopped at the trust question, which was answered in the
+    # pane; another was restarted by hand. Both ran on the target and the rule didn't know.
+    monkeypatch.setattr(world.orch, "PROJECTS", tmp_path / "projects")
+    start_run(world)
+    world.agent(BOSS, "working")
+    idle_with_status(world, W1)
+    world.agent(W2, "working")
+    world.turn_end(W2)
+
+    def runs_on(pane, account):
+        path = world.root / "agents" / f"{pane.replace(':', '-')}.json"
+        path.write_text(json.dumps(dict(json.loads(path.read_text()), pid=4242, account=account,
+                                        session=f"s-{pane}", context_tokens=20_000)))
+
+    runs_on(W2, "1")
+    world.run("account", "--spill", "1:98:2")
+    usage_at(world, 98)
+    monkeypatch.setattr(world.orch, "run_switch", lambda job: type(
+        "R", (), {"returncode": 1, "stderr": "the new agent is at a dialog"})())
+    world.run("watchdog")
+    capsys.readouterr()
+    world.run("status", "--json")
+    status = json.loads(capsys.readouterr().out)
+    assert [w["spill"]["state"] for w in status["workers"]] == ["cant_move", "waiting"]
+    assert (status["spill"]["moved"], status["spill"]["total"]) == (0, 2)
+
+    runs_on(W1, "2")  # someone answered it, and restarted the other one
+    runs_on(W2, "2")
+    world.agent(W2, "idle")
+    world.t += 300
+    usage_at(world, 98)
+    world.run("watchdog")
+    capsys.readouterr()
+    world.run("status", "--json")
+    status = json.loads(capsys.readouterr().out)
+
+    assert [w["spill"] for w in status["workers"]] == [
+        {"state": "moved_idle", "reason": "by hand", "time": world.t, "account": "2"}] * 2
+    assert (status["spill"]["moved"], status["spill"]["total"]) == (2, 2)
+    acc = json.loads((world.root / "accounts.json").read_text())
+    assert acc["failed"] == {} and acc["switch"] == {}
 
 
 def transcript(world, session, *entries):

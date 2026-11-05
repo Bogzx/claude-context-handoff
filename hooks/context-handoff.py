@@ -621,6 +621,20 @@ def respawn(job):
         return herdr("agent", "wait", pane, "--until", "working", "--timeout", "30000",
                      timeout=60).returncode == 0
 
+    def at_dialog():
+        """Whether the screen ends with one of Claude Code's dialogs ("Enter to confirm · Esc
+        to cancel", "Esc to cancel · Tab to amend"). herdr can call a new agent idle while it
+        shows the folder-trust question of another account, and typing there answers it: on
+        2026-11-05 a takeover prompt's Enter picked "No, exit" and Claude quit."""
+        out = herdr("agent", "read", pane, "--source", "visible", "--lines", "40", "--format",
+                    "text", timeout=20)
+        words = (out.stdout or "").split() if out.returncode == 0 else []
+        return "Esc to cancel" in " ".join(words[-8:])  # words: a narrow pane wraps the line
+
+    def ready():
+        """The new agent is idle and shows no dialog."""
+        return status() in ("idle", "done") and not at_dialog()
+
     try:
         agent = json.loads(herdr("agent", "get", pane).stdout)["result"]["agent"]
         name = agent.get("name")
@@ -681,30 +695,34 @@ def respawn(job):
             prefix = "".join(f"{k}={shlex.quote(v)} " for k, v in job.get("env", {}).items())
             command = prefix + " ".join(shlex.quote(a) for a in ["claude", *job["args"]])
         herdr("pane", "run", pane, command)
-        blocked = 0
+        blocked, waiting = 0, False
         deadline = time.time() + 90
-        while time.time() < deadline:
-            agent = pane_agent()
-            state = (agent or {}).get("agent_status")
-            if state in ("idle", "done"):
+        while True:
+            while time.time() < deadline:
+                agent = pane_agent()
+                state = (agent or {}).get("agent_status")
+                if state in ("idle", "done") and not at_dialog():
+                    break
+                blocked = blocked + 1 if state in ("blocked", "idle", "done") else 0
+                dialog = ("the new agent is at a dialog in the pane (on another account: folder "
+                          "trust or permissions?), answer it there; ran " + command)
+                if blocked >= 3 and resume:  # orch is waiting on this switch: say so now
+                    return fail(dialog)
+                if blocked >= 3 and not waiting:  # a takeover: its prompt follows the answer
+                    waiting = True
+                    say(f"waiting up to {DIALOG_WAIT // 60} min: {dialog}")
+                    herdr("notification", "show", "Takeover waits at a dialog", "--body",
+                          f"{pane}: {dialog}")
+                    emit("respawn-dialog", "Takeover waits at a dialog", f"{pane}: {dialog}",
+                         pane, push=True)
+                    deadline = time.time() + DIALOG_WAIT
+                time.sleep(1)
+            else:
+                return fail(f"no ready agent after running {command}"
+                            + (f"; handoff at {saved}" if saved else ""))
+            time.sleep(2)  # let the input box settle, or a late dialog show, before prompting
+            if ready():
                 break
-            blocked = blocked + 1 if state == "blocked" else 0
-            dialog = ("the new agent is at a dialog in the pane (on another account: folder "
-                      "trust or permissions?), answer it there; ran " + command)
-            if blocked >= 3 and resume:  # orch is waiting on this switch: say so now
-                return fail(dialog)
-            if blocked == 3:  # a takeover: its prompt follows once someone answers the dialog
-                say(f"waiting up to {DIALOG_WAIT // 60} min: {dialog}")
-                herdr("notification", "show", "Takeover waits at a dialog", "--body",
-                      f"{pane}: {dialog}")
-                emit("respawn-dialog", "Takeover waits at a dialog", f"{pane}: {dialog}", pane,
-                     push=True)
-                deadline = time.time() + DIALOG_WAIT
-            time.sleep(1)
-        else:
-            return fail(f"no ready agent after running {command}"
-                        + (f"; handoff at {saved}" if saved else ""))
-        time.sleep(2)  # let the input box settle before prompting
         if name:
             herdr("agent", "rename", pane, name)
         if resume:
@@ -722,9 +740,12 @@ def respawn(job):
         # then send it once more before giving up loudly.
         herdr("agent", "prompt", pane, prompt)
         if not started():
+            if at_dialog():  # Enter would answer it
+                return fail("the new agent is at a dialog instead of starting on the takeover "
+                            f"prompt; handoff at {saved}")
             herdr("agent", "send-keys", pane, "enter")
             if not started():
-                if status() == "blocked":
+                if status() == "blocked" or at_dialog():
                     return fail("the new agent is at a dialog instead of starting on the takeover "
                                 f"prompt; handoff at {saved}")
                 herdr("agent", "prompt", pane, prompt)

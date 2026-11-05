@@ -184,16 +184,86 @@ def question_json(q):
     return {"id": q.get("id"), "pane": q.get("pane"), "time": q.get("time"),
             "text": q.get("text") or "", "options": q.get("options") or [],
             "evidence": q.get("evidence") or [], "rule": q.get("rule"), "kind": q.get("kind"),
-            "answer": q.get("answer"), "answered": q.get("answered")}
+            "answer": q.get("answer"), "answered": q.get("answered"),
+            "default": q.get("default"), "default_at": q.get("default_at"),
+            "by_default": bool(q.get("by_default"))}
+
+
+ASKED = re.compile(r"^\s*(Do you want to .+\?)\s*$")
+NUMBERED = re.compile(r"^\s*(?P<cursor>[❯›>])?\s*(?P<n>\d+)\.\s+(?P<label>\S.*?)\s*$")
+RULE = re.compile(r"^\s*[╌─━-]{8,}\s*$")
+HEADER = re.compile(r"[A-Z]\w* command")
+
+
+def permission(lines):
+    """Claude Code's tool permission prompt on a screen, else None: {question, tool, command,
+    options, cursor}. As Claude Code 2.1 draws it: the tool's block, "Do you want to
+    proceed?" (or "... create FILE?", "... make this edit to FILE?"), numbered options with the
+    cursor on the one picked ("1. Yes" first), and a line starting "Esc to cancel". A short
+    terminal shows only the cursor's option; a long option wraps onto indented lines."""
+    lines = [x.rstrip() for x in lines or []]
+    q = next((i for i in range(len(lines) - 1, -1, -1) if ASKED.match(lines[i])), None)
+    if q is None:
+        return None
+    options, cursor = [], None
+    for line in lines[q + 1:]:
+        if not line.strip():
+            continue
+        if line.strip().startswith("Esc to cancel"):
+            break
+        m = NUMBERED.match(line)
+        if m:
+            cursor = len(options) if m["cursor"] else cursor
+            options.append(f"{m['n']}. {m['label']}")
+        elif options:
+            options[-1] += " " + line.strip()
+        else:
+            return None
+    else:
+        return None  # no "Esc to cancel": another dialog (the trust question has "Enter to ...")
+    if cursor is None:
+        return None
+    question = ASKED.match(lines[q])[1]
+    tool = command = None
+    m = re.fullmatch(r"Do you want to (create|make this edit to) (.+)\?", question)
+    if m:
+        tool, command = ("Write" if m[1] == "create" else "Edit"), m[2]
+    else:
+        block, top = [], q  # the command: the lines right above the question
+        for i in range(q - 1, -1, -1):
+            if RULE.match(lines[i]) or not lines[i].strip():
+                if block:
+                    break
+                continue
+            if HEADER.fullmatch(lines[i].strip()):
+                break
+            block.insert(0, lines[i].strip())
+            top = i
+        header = next((x.strip() for x in reversed(lines[:top]) if HEADER.fullmatch(x.strip())),
+                      None)  # "Bash command", above the block in a tall terminal
+        tool, command = header and header.split()[0], "\n".join(block)[:500] or None
+    return {"question": question, "tool": tool, "command": command, "options": options,
+            "cursor": options[cursor]}
+
+
+def permission_keys(found, choice):
+    """allow: Enter on "1. Yes" (only there: Claude Code puts the cursor on it); deny: Esc,
+    which Claude Code takes as "No" and stops the turn."""
+    if choice == "deny":
+        return ["esc"]
+    return ["enter"] if found["cursor"] == "1. Yes" else None
 
 
 def dialog_json(a, agent):
     report = a["report"] or {}
-    return {"pane": a["pane"], "label": a["label"], "since": a["since"],
-            "change": (agent or {}).get("state_change_seq"),
-            "text": "\n".join(orch.screen_lines(a["pane"], 40, "visible") or []),
-            "doing": report.get("summary") or orch.first_line(a["last"], 160),
-            "danger": True}  # no rule yet: every dialog answer is treated as dangerous
+    lines = orch.screen_lines(a["pane"], 40, "visible") or []
+    found = permission(lines)
+    return dict({"pane": a["pane"], "label": a["label"], "since": a["since"],
+                 "change": (agent or {}).get("state_change_seq"), "text": "\n".join(lines),
+                 "doing": report.get("summary") or orch.first_line(a["last"], 160),
+                 "danger": True},  # no rule yet: every dialog answer is treated as dangerous
+                **({"kind": "permission", "tool": found["tool"], "command": found["command"]}
+                   if found else {}))
 
 
 def stall_json(reasons, workers, report, nudged_at):
@@ -287,9 +357,7 @@ def last_work(path, gitdir):
 
 def trusted(account):
     """Folders Claude Code was told to trust on the account (its .claude.json project list)."""
-    path = (Path.home() / ".claude.json" if str(account) == "1"
-            else orch.account_dir(account) / ".claude.json")
-    projects = orch.load(path).get("projects") or {}
+    projects = orch.load(orch.account_config(account)).get("projects") or {}
     return {Path(p) for p, v in projects.items()
             if isinstance(v, dict) and v.get("hasTrustDialogAccepted")}
 
@@ -422,7 +490,8 @@ class Gateway:
                "addr": tailscale_ip(), "orchestrators": self.orchestrators(),
                "accounts": self.account_names(), "push": self.pusher.health(phone)}
         why = orch_new.cannot_start(read_env(self.config))
-        out.update(can_start=why is None, **({"cannot_start": why} if why else {}))
+        out.update(can_start=why is None, **({"cannot_start": why} if why else {}),
+                   dialogs=["trust", "permission"])
         if any(p.get("relay_uid") for p in orch_push.load_phones().values()):
             out["relay"] = dict(self.pusher.relay)
         return out
@@ -541,11 +610,12 @@ class Gateway:
         name = lead_name(pane, run, agent, (start or {}).get("cwd"))
         if start:  # a new orchestrator: its start's steps until the brief or the plan's OK
             activity, since, stall = "starting", start.get("time"), None
-            trust = next((s for s in start["steps"]
-                          if s["step"] == "trust" and s["status"] == "doing"), None)
-            for d in dialogs if trust else ():
-                if d["pane"] == pane:  # a new agent has no label, turn or report yet
-                    d.update(kind="trust", cwd=start.get("cwd"), since=d["since"] or trust["time"],
+            doing = {s["step"]: s["time"] for s in start["steps"] if s["status"] == "doing"}
+            for d in dialogs:
+                if d["pane"] == pane and at_trust(start, d["text"].split("\n")):
+                    # a new agent has no label, turn or report yet
+                    d.update(kind="trust", cwd=start.get("cwd"),
+                             since=d["since"] or doing.get("trust") or doing.get("claude"),
                              label=d["label"] or name,
                              doing=d["doing"] or orch.first_line(start.get("goal") or "", 160))
         return {
@@ -624,6 +694,7 @@ class Gateway:
                     and abs((h["windows"][name].get("resets_at") or 0)
                             - (win.get("resets_at") or 0)) < 120]
             out[acc] = {"id": acc, "name": orch.account_name(acc, names),
+                        "login": (known.get(acc) or {}).get("login"),
                         "config_dir": "~/.claude" if acc == "1" else f"~/.claude-{acc}",
                         "logged_in": (known.get(acc) or {}).get("logged_in", False),
                         "updated": w["updated"], "stale": w["stale"], "windows": w["windows"]}
@@ -839,8 +910,24 @@ def target(pane):
     return {"pane": pane, "change": agent.get("state_change_seq")}
 
 
+def typable(pane):
+    """Refuse typed input to a new orchestrator's pane until Claude runs there and its
+    folder-trust question is answered: before that a shell reads the text, and during the
+    dialog the keys and Enter could answer it without the app's hold."""
+    start = orch.start_of(pane)
+    if not start or orch.start_cancelled(start):
+        return
+    steps = {s["step"]: s["status"] for s in start.get("steps") or []}
+    if steps.get("trust") == "doing":
+        raise Reject(f"{pane} is a new orchestrator at Claude's folder-trust question: "
+                     "answer that first")
+    if steps.get("claude") != "ok" or start.get("restart"):
+        raise Reject(f"{pane} is a new orchestrator whose Claude isn't running yet")
+
+
 def act_prompt(gw, body, rec):
     pane, text = need(body, "pane"), need(body, "text")
+    typable(pane)
     out = target(pane)
     if not orch.prompt(pane, text):
         raise Reject(f"could not prompt {pane}", 502, "failed")
@@ -850,13 +937,16 @@ def act_prompt(gw, body, rec):
 def act_answer(gw, body, rec):
     qid, text = need(body, "question"), need(body, "text")
     run, q = orch.find_question(qid)
-    out = target((q or {}).get("pane") or (run or {}).get("orchestrator") or "")
+    pane = (q or {}).get("pane") or (run or {}).get("orchestrator") or ""
+    typable(pane)
+    out = target(pane)
     orch.answer(qid, text)
     return out
 
 
 def act_interrupt(gw, body, rec):
     pane = need(body, "pane")
+    typable(pane)
     out = target(pane)
     result = orch.herdr("pane", "send-keys", pane, "esc")
     if not result or result.returncode != 0:
@@ -897,6 +987,7 @@ def act_run(gw, body, rec):
 
 def act_nudge(gw, body, rec):
     lead, text = need(body, "orchestrator"), need(body, "text")
+    typable(lead)
     out = target(lead)
     if not orch.prompt(lead, text):
         raise Reject(f"could not prompt {lead}", 502, "failed")
@@ -1015,14 +1106,14 @@ def act_start_retry(gw, body, rec):
 
 
 def act_dialog(gw, body, rec):
-    """Only Claude Code's folder-trust question of a new orchestrator: allow picks Yes, deny
-    picks No (Claude exits) and cancels the start. Every other dialog is answered in the pane."""
+    """Claude Code's folder-trust question of a new orchestrator (allow picks Yes, deny picks No:
+    Claude exits and the start is cancelled), or a tool permission prompt (act_permission).
+    Every other dialog is answered in the pane."""
     pane, choice = need(body, "pane"), need(body, "choice")
     start = orch.start_of(pane)
-    if not start or orch.start_cancelled(start) or not any(
-            s["step"] == "trust" and s["status"] == "doing" for s in start.get("steps") or []):
-        raise Reject("this gateway answers only a new orchestrator's folder-trust question: "
-                     "answer this dialog in the pane", 400)
+    lines = orch.screen_lines(pane, 40, "visible")
+    if not start or not at_trust(start, lines):
+        return act_permission(gw, body, rec, pane, choice)
     if choice not in ("allow", "deny"):
         raise Reject(f"choice {choice!r}: allow or deny for the folder-trust question", 400)
     agent = (orch.agents() or {}).get(pane) or {}
@@ -1030,7 +1121,7 @@ def act_dialog(gw, body, rec):
         raise Reject(f"{pane} is not at the folder-trust question any more")
     if body.get("change") is not None and body["change"] != agent.get("state_change_seq"):
         raise Reject("the dialog changed since the app showed it: refresh")
-    keys = orch_new.trust_keys(orch.screen_lines(pane, 40, "visible"), choice)
+    keys = orch_new.trust_keys(lines, choice)
     if keys is None:
         raise Reject(f"{pane} doesn't show Claude Code's folder-trust question")
     by = gw.who(rec.get("phone"))
@@ -1042,6 +1133,71 @@ def act_dialog(gw, body, rec):
               action=start["id"], choice=choice, by=by, source=rec["source"])
     if choice == "deny":  # "No" quits Claude: the start is cancelled
         out["wait"] = lambda: {"result": orch_new.cancel(start, by)}
+    return out
+
+
+def at_trust(start, lines):
+    """Whether a start's own Claude is at its folder-trust question: during the trust step, or
+    from the moment the question shows while Claude starts (the trust step begins a few
+    seconds later, once the start has seen it blocked)."""
+    if orch.start_cancelled(start):
+        return False
+    steps = {s["step"]: s["status"] for s in start.get("steps") or []}
+    return steps.get("trust") == "doing" or (
+        steps.get("claude") == "doing" and orch_new.trust_keys(lines, "allow") is not None)
+
+
+def act_permission(gw, body, rec, pane, choice):
+    """A tool permission prompt of an agent in a run, as the fleet lists it: allow picks
+    "1. Yes", deny presses Esc (Claude Code's "No"), delegate asks the run's orchestrator to
+    answer it in the pane. Only at the same dialog the app saw (blocked, same change) with the
+    prompt still on screen; who answered is logged (a `permission` event)."""
+    if choice not in ("allow", "deny", "delegate"):
+        raise Reject(f"choice {choice!r}: allow, deny or delegate for a permission prompt", 400)
+    change = need(body, "change", int)  # the dialog the app saw, never a later one
+    run, role = orch.run_of(pane)
+    if not run:
+        raise Reject(f"{pane} is in no active run: answer this dialog in the pane", 400)
+    agent = (orch.agents() or {}).get(pane) or {}
+    if agent.get("agent_status") != "blocked":
+        raise Reject(f"{pane} is not at a dialog any more")
+    if change != agent.get("state_change_seq"):
+        raise Reject("the dialog changed since the app showed it: refresh")
+    lines = orch.screen_lines(pane, 40, "visible")
+    found = permission(lines)
+    if not found:
+        raise Reject(f"{pane} doesn't show a tool permission prompt: answer this dialog in "
+                     "the pane", 400)
+    label = (((run.get("workers") or {}).get(pane) or {}).get("label") or agent.get("name")
+             or pane)
+    what = " ".join(x for x in (found["tool"], found["command"]) if x) or found["question"]
+    by = gw.who(rec.get("phone"))
+    if choice == "delegate":
+        if role != "worker":
+            raise Reject(f"{pane} is the run's orchestrator itself: answer it in the pane")
+        lead = run["orchestrator"]
+        typable(lead)
+        out = target(lead)
+        text = (f"The owner leaves this permission prompt to you: {label} ({pane}) asks "
+                f"\"{found['question']}\" for {what}. The screen:\n" + "\n".join(lines)
+                + f"\nDecide and answer it in that pane: `herdr agent send-keys {pane} enter` "
+                f"allows (the cursor is on {found['cursor']!r}), `herdr agent send-keys {pane} "
+                "esc` denies.")
+        if not orch.prompt(lead, text):
+            raise Reject(f"could not prompt {lead}", 502, "failed")
+    else:
+        keys = permission_keys(found, choice)
+        if keys is None:
+            raise Reject(f"the cursor in {pane} is on {found['cursor']!r}, not \"1. Yes\": "
+                         "answer it in the pane")
+        out = target(pane)
+        result = orch.herdr("agent", "send-keys", pane, *keys)
+        if not result or result.returncode != 0:
+            raise Reject(f"could not answer the dialog in {pane}", 502, "failed")
+    done = {"allow": "allowed", "deny": "denied", "delegate": "left to the orchestrator"}
+    orch.emit("permission", f"Permission {done[choice]} from the app",
+              f"{label} ({pane}): {what}, by {by}", pane, choice=choice, by=by,
+              tool=found["tool"], command=found["command"], source=rec["source"])
     return out
 
 

@@ -128,7 +128,7 @@ the whole fleet overnight (11.8 h), and "today's work is done" with three worker
 | `orch run start --until 09:00 --goal "..." --workers w17:pB7=builder,...` | Registers the run of the orchestrator in this pane (`--until` takes `HH:MM`, `YYYY-MM-DD HH:MM` or `+4h`). `run set`, `run stop` and `run show` change, end or show it. |
 | `orch wait` | The orchestrator's one background watcher. It returns when a worker's turn ended with nothing left running, a worker is blocked at a dialog, a pane lost its agent (3 min), a worker has waited 90 min on its own job, a `--check '<cmd>'` exits 0, or after the 30 min heartbeat. It prints one line per worker. An event is reported once: the next wait doesn't repeat it (`--reset` does). |
 | `orch park <pane> --reason "..." [--until HH:MM]` | Standby with a reason. It ends at the worker's next turn end or at `--until`. `orch unpark` ends it. |
-| `orch ask "<question>" [--option "Deploy" --danger deploy --option "Not yet"]` | Logs a question for the owner in the run and pushes it, with an id and the options the owner's app shows as buttons. `--danger` (`none`, `deploy`, `prod`, `destructive`) applies to the option before it. `--kind plan` marks a new orchestrator's plan question (see orch new); it replaces the pane's open plan question. |
+| `orch ask "<question>" [--option "Deploy" --danger deploy --option "Not yet"]` | Logs a question for the owner in the run and pushes it, with an id and the options the owner's app shows as buttons. `--danger` (`none`, `deploy`, `prod`, `destructive`) applies to the option before it. `--kind plan` marks a new orchestrator's plan question (see orch new); it replaces the pane's open plan question. `--default "<option>" --by <time>` says what you go ahead with: see below. |
 | `orch answer <id> "<text>"` | Records the owner's answer and prompts the agent that asked. An answered question can't be answered again. |
 | `orch status [--json]`, `orch last <pane>` | The fleet, and a worker's last message and background tasks. `--json` also has the open questions, each agent's latest report and account, and pending account switches. |
 | `orch decisions [--pane P] [--json]` | The pane's newest decision log, parsed: id, time, who (user or agent), the user's quote, what, why (only from an explicit "Why:" or "because"; everything else stays in what), and `superseded_by` when a later entry says "replaces D7", "instead of D7" or "supersedes D7". In log order. |
@@ -155,6 +155,12 @@ It prompts at most every 15 minutes. After three prompts in a row about the same
 slows down to hourly. It also alerts the owner, without prompting, when the orchestrator pane has had no agent for 5
 minutes or has been at a dialog for 10. When the run's end time passes, it marks the run ended and alerts once.
 
+A question asked with `--default "<option>" --by <time>` says what the agent goes ahead with. The owner can answer
+until then. With no answer, the watchdog's next pass closes the question with that option, marks it `by_default` and
+prompts the asker with the answer marked "(default, no reply by HH:MM)". An asker that is gone or at a dialog gets it
+at a later pass. The default has to be one of the question's options with no `--danger`, and a plan has none: silence
+never approves a deploy or a plan. A default needs a run.
+
 ### Alerts
 
 Everything goes to `~/.claude/handoffs/events.jsonl`, one JSON object per line: `time`, `host` (the hostname; the
@@ -168,8 +174,8 @@ plus the fields of its kind:
 | `orch-missing`, `orch-blocked` | the orchestrator pane has no agent, or sits at a dialog | orchestrator | | yes |
 | `nudge` | the watchdog prompts an idle orchestrator | orchestrator | | |
 | `orch-not-acting` | the same problem after several nudges, or the nudge could not be sent | orchestrator | | yes |
-| `ask` | `orch ask` or the MCP `ask_owner` | the agent that asks | `id`, `question`, `options` (`label`, `danger`), `question_kind` (`plan` or null) | yes |
-| `answer` | `orch answer` or the app answers | the agent that asked | `id` | |
+| `ask` | `orch ask` or the MCP `ask_owner` | the agent that asks | `id`, `question`, `options` (`label`, `danger`), `question_kind` (`plan` or null), `default`, `default_at` | yes |
+| `answer` | `orch answer`, the app, or the watchdog taking a question's default | the agent that asked | `id`, `by_default` | |
 | `report` | the MCP `report` tool | the agent | `report` | |
 | `account` | a switch is queued, asked, resumed or done, or the default changes | the agent; null for the default | `account`; `when` (`handoff`, `idle`, `now`); `how` (`handoff`, `resume`) when a switch starts; `reason` (`spill`, `limit`) when the spill rule queued it; `session` after a resume | |
 | `account-failed`, `respawn-failed` | a switch or takeover failed | the agent | | yes |
@@ -179,6 +185,7 @@ plus the fields of its kind:
 | `start` | a step of `orch new` or the gateway's `start` action is doing, ok or failed | the new orchestrator, once its tab exists | `action` (the start's id), `step`, `status`, `error`; the `pane` step also `folder`, `goal`, `by` (`cli`, `phone`) | when it fails |
 | `start-cancel` | a start was cancelled (the app's `start_cancel`, or "No" at its trust question) | the new orchestrator, or null | `action`, `by` | |
 | `trust` | the app answered a new orchestrator's folder-trust question | the new orchestrator | `action`, `choice` (`allow`, `deny`), `by` (the phone), `source` | |
+| `permission` | the app answered a tool permission prompt, or left it to the orchestrator | the agent at the prompt | `choice` (`allow`, `deny`, `delegate`), `by`, `tool`, `command`, `source` | |
 | `test` | `orch notify` | null | | yes |
 | `pair` | a phone pairs or unpairs with the gateway | null | | |
 | `action` | the gateway handles an app action | its agent or orchestrator, else null | `action` (its kind), `id`, `status` (`delivered`, `rejected`, `failed`), `error`, `source` (`app`, `relay`), `fields` (the action's other fields) | |
@@ -207,8 +214,9 @@ as `orch`. It takes the agent's pane from `HERDR_PANE_ID` and offers no tools ou
 
   `role` is taken from the pane's run (orchestrator or worker) unless the call sets it. A report that doesn't fit the
   schema is refused with the reason, so the agent can fix it.
-- `ask_owner`: `question` and `options` [{`label`, `danger`}], the same as `orch ask` with options. It returns the
-  question id; the answer comes back as a prompt once `orch answer` runs.
+- `ask_owner`: `question` and `options` [{`label`, `danger`}], the same as `orch ask` with options, and `default` and
+  `by`, the same as `--default` and `--by`. It returns the question id; the answer comes back as a prompt once
+  `orch answer` runs.
 
 The Stop hook asks for the report. When an agent is the orchestrator or a worker of an active run, its turn used
 tools, and that turn didn't call `mcp__orch__report`, the hook blocks the turn's end once with a one-line reason.
@@ -252,6 +260,8 @@ and the gateway.
 `orch account --spill 1:98:2` uses account 1 until it is nearly full, then moves its agents to account 2. When
 account 1's week or 5-hour window reaches 98%, every agent on account 1 gets a pending `--when-idle` switch to
 account 2. Only fresh data counts: a stale `usage.json` or a window that has already reset is treated as unknown.
+The rule ends when a fresh reading is under the threshold, or when the window that fired it resets. That needs no
+reading, because by then every agent may have left the account.
 The trigger is pushed once (kind `spill`). An agent on account 1 whose last turn ended with Claude Code's limit
 message ("You've hit your weekly limit · resets ...", an API error `rate_limit` in the transcript) is resumed on
 account 2 at the next pass. The account of each agent is read from its claude process (`CLAUDE_CONFIG_DIR`).
@@ -265,9 +275,12 @@ an agent started on account 1 while the rule is active is moved by the watchdog 
 
 The rule's progress shows as `spill` in `orch status --json` and the gateway's fleet (when it fired, `moved` of
 `total`). Each agent also gets a `spill` entry:
-- `moved_idle` or `moved_limit`, with how (handoff or resume) and when;
+- `moved_idle` or `moved_limit`, with how (handoff, resume or by hand) and when;
 - `waiting`, with what on: working, own job running, writing its handoff, or the next watchdog pass;
 - `cant_move`, with the error. A resume that failed is not retried until the rule fires again.
+
+An agent found running on the target anyway, because its pane was restarted there or its dialog was answered, counts
+as moved by hand.
 
 ### Usage
 
@@ -281,6 +294,16 @@ printf '%s' "$input" | python3 ~/.claude/hooks/orch.py usage capture >/dev/null 
 
 `orch usage capture` keeps the latest limits per account in `usage.json` and adds a line to `usage-history.jsonl`
 at most every 5 minutes per account. It prints nothing and ignores input it can't read.
+
+A statusline repeats its session's last limits on every refresh for as long as the session stays open, so an idle
+session can report a value that is days old. A reading is therefore dated by the session's last API response in its
+transcript, never by the capture, and only a newer reading replaces the stored one. A reading whose response can't be
+found is dropped. An account counts as stale once its reading is 10 minutes old: no session on it has had an API
+response since, on this machine.
+
+Account numbers are local to a machine. `login` in `orch account --json`, `orch usage --json` and the gateway's
+accounts is a hash of the account's login and organization (null without a login), and it is what says that two
+machines share an account.
 
 `orch usage --json` reports, per account and window, the percentage used, the reset time, the burn rate over the last
 1-2 hours of history, the projected time to 100% and whether that comes before the reset. It also counts tokens
@@ -300,7 +323,10 @@ the next one under a second.
 `orch new --cwd DIR --goal TEXT --until T` starts an orchestrator in a new herdr tab in `DIR` and prints its pane
 first. The gateway's `start` action runs the same code. Each step is `doing`, `ok` or `failed`:
 
-1. `pane`: with `--worktree`, `git worktree add <DIR>-<name> -b orch/<name>` first. Then a herdr tab in the folder
+1. `pane`: with `--worktree`, `git worktree add <DIR>-<name> -b orch/<name>` first. Without `--name` the name is
+   the goal's first three words in lowercase, joined by `-`, at most 24 characters (`add-csv-export`). If that
+   folder or branch exists already, `-2`, `-3`, ... is added. A given name whose folder or branch exists is refused
+   before any step. Then a herdr tab in the folder
    (its root pane is the orchestrator's), a new decision log for that pane that starts with the goal (D1) and each
    `--rules` text (D2, ...) as the owner's entries, and a brief at `~/.claude/orch/new/<id>/brief.md` with the goal,
    the rules, the run and the worker limits (`--worker-model`, `--max-workers`).
@@ -309,7 +335,8 @@ first. The gateway's `start` action runs the same code. Each step is `doing`, `o
    `HANDOFF_LINEAGE` pointing at the new log. `--name` names the herdr agent.
 3. `trust`, only when the new agent stops at a dialog (Claude Code's folder trust question on that account): it
    waits up to 15 minutes for an answer in the pane, as a takeover does. From the CLI it also pushes
-   `respawn-dialog`.
+   `respawn-dialog`. The screen counts as well as herdr's status, which can read idle at the question: nothing is
+   typed into a pane that shows a dialog.
 4. `run`: the run is registered (goal, `--until`, cwd, no workers) with the start's settings in `run.settings`.
 5. `brief`, or `read` with `--plan-first`: the agent is prompted to read the brief, with the same Enter-and-resend
    check as a takeover prompt. With `--plan-first` the brief asks for a roadmap in a `report` and
@@ -392,12 +419,22 @@ question), the diff view, the activity lanes and the per-agent model.
 - `dialog {pane, change, choice}` answers Claude Code's folder-trust question, and only for the pane a start opened
   while that start is at its `trust` step: `allow` picks "Yes", `deny` picks "No" (Claude exits) and cancels the
   start. The gateway checks that the agent is still blocked at the same `change` and that the screen shows a trust
-  question with Yes and No, and it logs who answered (a `trust` event). Any other dialog is answered in the pane.
+  question with Yes and No, and it logs who answered (a `trust` event).
+- `dialog` also answers a tool permission prompt ("Do you want to proceed?", "Do you want to create FILE?", ...) of
+  an agent in an active run: `allow` presses Enter, and only while the cursor is on "1. Yes", where Claude Code
+  puts it; `deny` presses Esc, which Claude Code takes as "No" (the turn stops and the agent waits for a message);
+  `delegate` sends the screen to the run's orchestrator and asks it to answer in the pane (refused for the
+  orchestrator's own prompt). `change` is required; the agent must still be blocked at it, with the prompt on
+  screen. A `permission` event logs who answered. Any other dialog is answered in the pane. A short terminal shows
+  only the option under the cursor, which is enough for these answers.
+- `prompt`, `nudge`, `interrupt` and `answer` are refused (409) for a start's pane until Claude runs there and its
+  folder-trust question is answered. Before that, a shell would read the text, or its keys could answer the dialog.
 - `/v1/health` has `can_start` and, when false, `cannot_start`: ORCH_START_ROOTS not set, herdr not running, or
-  claude-acc missing.
+  claude-acc missing; and `dialogs: ["trust", "permission"]`, the dialog kinds the `dialog` action answers.
 - `/v1/fleet` shows an unfinished start (the last day's, until `brief` or `plan` is ok) as an orchestrator with
   activity `starting` and `start: {action, goal, plan_first, until, steps: [{step, status, time, error?}]}`; its
-  agent's dialog during the `trust` step has `kind: "trust"` and the folder as `cwd`. Questions carry `kind`
+  agent's dialog during the `trust` step has `kind: "trust"` and the folder as `cwd`. A tool permission prompt
+  has `kind: "permission"` with `tool` and `command` when the screen shows them. Questions carry `kind`
   (`"plan"`), runs started this way `run.settings`, and a `start` action's status its `pane`.
 - `/v1/folders` lists the git checkouts that are a root or directly under one, plus the herdr agents' checkouts
   deeper under a root, never an excluded one, newest work first: `path` (`~` form), `branch` (a short sha when

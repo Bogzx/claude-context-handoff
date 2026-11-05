@@ -41,6 +41,7 @@ import orch
 READY_WAIT = 90  # seconds for the new agent to come up, as a takeover's
 EXIT_WAIT = 15  # seconds for a Claude to quit (cancel, or a restart on another account)
 BLOCKED_POLLS = 3  # one-second polls at a dialog before it counts as waiting there
+SETTLE = 2  # seconds an idle agent gets for a late dialog to show before it is typed into
 WORD = re.compile(r"[A-Za-z0-9._\[\]-]{1,64}")  # model, effort, name: nothing for a shell
 
 PLAN_FIRST = """\
@@ -161,10 +162,13 @@ def check(opts, strict=False):
     if opts.get("worktree"):
         if not (folder / ".git").exists():
             orch.die(f"{tilde(str(folder))} is not a git checkout: no worktree")
-        name = name or folder.name
+        name = name or free_name(folder, slug(goal) or folder.name)
         cwd = folder.parent / f"{folder.name}-{name}"
         if cwd.exists():
             orch.die(f"{tilde(str(cwd))} exists already: pick another name for the worktree")
+        if has_branch(folder, f"orch/{name}"):
+            orch.die(f"{tilde(str(folder))} has a branch orch/{name} already: pick another name "
+                     "for the worktree")
     if strict:
         env = orch.read_env()
         roots, machine = paths(env.get("ORCH_START_ROOTS")), orch.machine_name(env)
@@ -191,6 +195,30 @@ def check(opts, strict=False):
             "tab": None, "pane": None, "lineage": None,
             "brief": str(orch.STARTS / sid / "brief.md"), "step": None, "status": "accepted",
             "steps": [], "error": None}
+
+
+def slug(goal):
+    """The goal's first three words, lowercase, letters and digits joined by "-", at most 24
+    characters: a worktree's name when none is given, as the app names it (UI-SPEC 4.30)."""
+    words = re.sub(r"[^a-z0-9]+", " ", goal.lower()).split()
+    return "-".join(words[:3])[:24].rstrip("-")
+
+
+def has_branch(repo, branch):
+    return subprocess.run(["git", "-C", str(repo), "show-ref", "--verify", "--quiet",
+                           f"refs/heads/{branch}"], check=False, timeout=30).returncode == 0
+
+
+def free_name(repo, base):
+    """base, else base-2, base-3, ...: the first name with no worktree folder next to the repo
+    and no orch/<name> branch in it, so a second start in a repo doesn't fail on the first's."""
+    n = 1
+    while True:
+        name = base if n == 1 else f"{base}-{n}"
+        if not ((repo.parent / f"{repo.name}-{name}").exists()
+                or has_branch(repo, f"orch/{name}")):
+            return name
+        n += 1
 
 
 def accept(rec):
@@ -385,8 +413,9 @@ def start(rec, dry=False):
 
         current = "read" if rec["plan_first"] else "brief"
         text = f"Read {rec['brief']} and do it."
-        if not dry and not deliver(pane, text):
-            step(current, "failed", f"the agent in {pane} did not start on {text!r} (sent twice)")
+        problem = "" if dry else deliver(pane, text)
+        if problem:
+            step(current, "failed", problem)
             return 1
         step(current, "doing" if rec["plan_first"] else "ok",
              "reading the folder and writing the plan" if rec["plan_first"]
@@ -403,20 +432,35 @@ def start(rec, dry=False):
         return 1
 
 
+def at_dialog(pane):
+    """Whether the screen ends with one of Claude Code's dialogs ("Enter to confirm · Esc to
+    cancel", "Esc to cancel · Tab to amend"). herdr can call a new agent idle while it shows
+    the folder-trust question, and typing there answers it."""
+    words = " ".join(orch.screen_lines(pane, 40, "visible") or []).split()
+    return "Esc to cancel" in " ".join(words[-8:])  # words: a narrow pane wraps the line
+
+
 def ready(rec, pane, dialog_wait, step, trust=False):
     """Wait for the new agent: "ready", or "claude"/"trust" for the step that timed out. Up to
     READY_WAIT seconds, or dialog_wait once it sits at a dialog (the `trust` step; `trust`: it
     was there already, a retry)."""
+    def status():
+        now = ((orch.agents() or {}).get(pane) or {}).get("agent_status")
+        return "blocked" if now in ("idle", "done") and at_dialog(pane) else now
+
     blocked = 0
     deadline = orch.now() + (dialog_wait if trust else READY_WAIT)
     while orch.now() < deadline:
         if orch.start_cancelled(rec):
             raise Cancelled
-        state = ((orch.agents() or {}).get(pane) or {}).get("agent_status")
+        state = status()
         if state in ("idle", "done"):
-            if trust:
-                step("trust", "ok", "answered")
-            return "ready"
+            orch.sleep(SETTLE)
+            state = status()
+            if state in ("idle", "done"):
+                if trust:
+                    step("trust", "ok", "answered")
+                return "ready"
         blocked = blocked + 1 if state == "blocked" else 0
         if blocked == BLOCKED_POLLS and not trust:
             trust = True
@@ -434,18 +478,21 @@ def ready(rec, pane, dialog_wait, step, trust=False):
 
 def deliver(pane, text):
     """Prompt the agent and check that it started: Enter if the text sits in the input box,
-    then the prompt once more."""
+    then the prompt once more. "" once it started, else what went wrong. Nothing is typed while
+    a dialog shows: a retry comes here without ready(), and Enter would answer the dialog."""
     def started():
         return orch.herdr("agent", "wait", pane, "--until", "working", "--timeout", "30000",
                           timeout=60).returncode == 0
-    orch.prompt(pane, text)
-    if started():
-        return True
-    orch.herdr("agent", "send-keys", pane, "enter")
-    if started():
-        return True
-    orch.prompt(pane, text)
-    return started()
+
+    for send in (lambda: orch.prompt(pane, text),
+                 lambda: orch.herdr("agent", "send-keys", pane, "enter"),
+                 lambda: orch.prompt(pane, text)):
+        if at_dialog(pane):
+            return f"the agent in {pane} is at a dialog: answer it there, then retry"
+        send()
+        if started():
+            return ""
+    return f"the agent in {pane} did not start on {text!r} (sent twice)"
 
 
 
@@ -456,7 +503,7 @@ def exit_agent(pane):
         return ((orch.agents() or {}).get(pane) or {}).get("agent_status")
 
     now = state()
-    keys = trust_keys(orch.screen_lines(pane, 40, "visible"), "deny") if now == "blocked" else None
+    keys = trust_keys(orch.screen_lines(pane, 40, "visible"), "deny") if now else None
     if keys:
         orch.herdr("agent", "send-keys", pane, *keys)
     elif now:
@@ -479,6 +526,9 @@ def cancel(rec, by):
     run = orch.load_run(pane) if pane else {}
     if orch.active(run):
         run["ended"] = orch.now()
+        for q in run.get("questions") or []:  # the plan question: nobody is left to answer
+            if not q.get("answered"):
+                q.update(answer=f"(the start was cancelled by {by})", answered=orch.now())
         orch.save_run(pane, run, "stop")
         done.append("run stopped")
     if pane:
@@ -488,10 +538,35 @@ def cancel(rec, by):
         done.append(f"pane {pane} closed")
         if rec.get("tab") and orch.herdr("tab", "get", rec["tab"]).returncode == 0:
             done.append(f"tab {rec['tab']} kept: it has other panes")
+    if rec.get("lineage") and drop_unused_log(Path(rec["lineage"])):
+        done.append("its unused decision log removed")
     text = "; ".join(done) or "nothing was open"
     orch.emit("start-cancel", f"Start of {os.path.basename(rec.get('cwd') or '')} cancelled",
               f"by {by}: {text}", pane, action=rec["id"], by=by)
     return text
+
+
+def drop_unused_log(lineage):
+    """Remove the decision log folder a start made, and its cwd's folder if that is empty now,
+    when it holds only what orch new wrote (the log and its sealed copy, unchanged); True if
+    removed. A log the agent wrote to stays."""
+    sealed = hook().SEALED
+    try:
+        names = {p.name for p in lineage.iterdir()}
+        log = (lineage / "decisions.md").read_bytes()
+        if names != {"decisions.md", sealed} or log != (lineage / sealed).read_bytes():
+            return False
+        (lineage / "decisions.md").unlink()
+        (lineage / sealed).unlink()
+        lineage.rmdir()
+    except OSError:
+        return False
+    if lineage.parent.parent == orch.ROOT:
+        try:
+            lineage.parent.rmdir()  # only when no other lineage of that folder is left
+        except OSError:
+            pass
+    return True
 
 
 def retry(rec, account, by):
