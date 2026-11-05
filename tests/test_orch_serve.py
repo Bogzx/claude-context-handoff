@@ -866,6 +866,7 @@ def test_a_start_without_a_pane_fails_or_answers_without_it(world, monkeypatch):
     world.tab_ok = False
     status, out = world.post(gw, **start_action(id="f1"))
     assert status == 502 and out["status"] == "failed" and out["pane"] is None
+    assert out["delivered_at"] is None  # it never reached an agent
     assert out["error"] == "herdr couldn't open a tab: no such workspace"
     world.tab_ok = True
     allow_starts(world, monkeypatch, run_it=False)  # the start runs on but has no pane yet
@@ -884,11 +885,15 @@ def test_a_start_at_the_trust_dialog_shows_a_trust_dialog(world, monkeypatch):
     for step, status in [("pane", "ok"), ("claude", "doing"), ("trust", "doing")]:
         world.orch.start_step(rec, step, status)
     world.agent(NEW, "blocked", change=4)
+    world.agents[NEW]["cwd"] = str(app)  # Claude runs in the start's folder
     lead = lead_of(world, gw, NEW)
     assert lead["activity"] == "starting" and lead["run"] is None
     [dialog] = lead["dialogs"]
     conforms(dialog, DIALOG)
     assert dialog["kind"] == "trust" and dialog["cwd"] == str(app) and dialog["change"] == 4
+    trust_at = next(s["time"] for s in rec["steps"] if s["step"] == "trust")
+    assert (dialog["label"], dialog["since"], dialog["doing"]) == ("my-app", trust_at,
+                                                                  "Ship the beta")
     world.orch.start_step(rec, "trust", "ok")
     [dialog] = lead_of(world, gw, NEW)["dialogs"]
     assert "kind" not in dialog  # another dialog of the same agent

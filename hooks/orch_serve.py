@@ -538,14 +538,18 @@ class Gateway:
                 stall = stall_json(reasons, workers, v["report"], nudges.get(pane))
         dialogs = [dialog_json(a, ags.get(a["pane"])) for a in [lead, *workers]
                    if a["state"] == "blocked"]
+        name = lead_name(pane, run, agent, (start or {}).get("cwd"))
         if start:  # a new orchestrator: its start's steps until the brief or the plan's OK
             activity, since, stall = "starting", start.get("time"), None
-            if any(s["step"] == "trust" and s["status"] == "doing" for s in start["steps"]):
-                for d in dialogs:
-                    if d["pane"] == pane:
-                        d.update(kind="trust", cwd=start.get("cwd"))
+            trust = next((s for s in start["steps"]
+                          if s["step"] == "trust" and s["status"] == "doing"), None)
+            for d in dialogs if trust else ():
+                if d["pane"] == pane:  # a new agent has no label, turn or report yet
+                    d.update(kind="trust", cwd=start.get("cwd"), since=d["since"] or trust["time"],
+                             label=d["label"] or name,
+                             doing=d["doing"] or orch.first_line(start.get("goal") or "", 160))
         return {
-            "pane": pane, "name": lead_name(pane, run, agent, (start or {}).get("cwd")),
+            "pane": pane, "name": name,
             "machine": self.machine(),
             "cwd": (agent or {}).get("cwd") or (run or {}).get("cwd") or (start or {}).get("cwd"),
             "activity": activity, "activity_since": since, "agent": lead,
@@ -789,8 +793,8 @@ class Gateway:
         if wait:  # the slow part (a start's wait for its pane, a cancel): reads go on meanwhile
             try:
                 rec.update(wait() or {})
-            except Reject as e:
-                rec.update(status=e.status, error=e.text, code=e.code)
+            except Reject as e:  # never delivered after all
+                rec.update(status=e.status, error=e.text, code=e.code, delivered_at=None)
             with self.lock:
                 log = self.load_actions()
                 log[aid] = rec
