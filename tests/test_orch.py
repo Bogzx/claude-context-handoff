@@ -2,6 +2,7 @@
 # ruff: noqa: DTZ001  (orch reads and prints the machine's local time, like its users)
 import importlib.util
 import json
+import os
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -349,3 +350,350 @@ def test_status_json(world, capsys):
     assert data["run"]["goal"] == "fix the board"
     assert [(v["pane"], v["state"], v["last"]) for v in data["workers"]] == [
         (W1, "idle", "all green"), (W2, "working", "")]
+
+
+# --- questions with options, answers ----------------------------------------------------------
+
+def event_log(tmp_path, monkeypatch):
+    """A notify command that records ORCH_EVENT (the whole event) for each push."""
+    pushed = tmp_path / "events-pushed.jsonl"
+    script = tmp_path / "notify-event.py"
+    script.write_text("import os\n"
+                      f"open({str(pushed)!r}, 'a').write(os.environ['ORCH_EVENT'] + '\\n')\n")
+    monkeypatch.setenv("ORCH_NOTIFY_CMD", f"{sys.executable} {script}")
+    return lambda: ([json.loads(x) for x in pushed.read_text().splitlines()]
+                    if pushed.exists() else [])
+
+
+def test_ask_with_options_gives_the_push_its_buttons(world, tmp_path, monkeypatch, capsys):
+    pushed = event_log(tmp_path, monkeypatch)
+    start_run(world)
+
+    world.run("ask", "Deploy 2.14 to staging?", "--option", "Deploy", "--danger", "deploy",
+              "--option", "Not yet")
+
+    [q] = json.loads((world.root / "runs" / "w1-p0.json").read_text())["questions"]
+    assert q["id"].startswith("q") and q["pane"] == BOSS and q["answered"] is None
+    assert q["options"] == [{"label": "Deploy", "danger": "deploy"},
+                            {"label": "Not yet", "danger": "none"}]
+    [event] = pushed()
+    assert event["kind"] == "ask" and event["id"] == q["id"]
+    assert event["options"] == q["options"] and event["question"] == "Deploy 2.14 to staging?"
+    assert event["body"].endswith("Options: Deploy [deploy] / Not yet")
+    assert q["id"] in capsys.readouterr().out
+
+
+def test_danger_needs_an_option_before_it(world):
+    with pytest.raises(SystemExit):
+        world.run("ask", "x?", "--danger", "prod", "--option", "Yes")
+
+
+def test_answer_prompts_the_asker_once(world, capsys):
+    start_run(world)
+    world.run("ask", "Merge PR #4?", "--option", "Merge", "--option", "Wait")
+    [q] = json.loads((world.root / "runs" / "w1-p0.json").read_text())["questions"]
+    world.t += 60
+
+    assert world.run("answer", q["id"], "Merge") == 0
+
+    [(pane, text)] = world.prompts
+    assert pane == BOSS and q["id"] in text and "Merge PR #4?" in text and text.endswith(": Merge")
+    [q] = json.loads((world.root / "runs" / "w1-p0.json").read_text())["questions"]
+    assert q["answer"] == "Merge" and q["answered"] == T0 + 60
+    assert world.events()[-1]["kind"] == "answer" and world.events()[-1]["id"] == q["id"]
+    with pytest.raises(SystemExit):  # closed: a replayed answer is refused
+        world.run("answer", q["id"], "Wait")
+    with pytest.raises(SystemExit):
+        world.run("answer", "q00000000", "Merge")
+    assert len(world.prompts) == 1
+
+
+def test_a_question_asked_outside_a_run_can_be_answered(world):
+    world.run("ask", "Which branch?")
+    [ask] = [e for e in world.events() if e["kind"] == "ask"]
+
+    world.run("answer", ask["id"], "main")
+
+    text = f"The owner answered your question {ask['id']} ('Which branch?'): main"
+    assert world.prompts == [(BOSS, text)]
+    with pytest.raises(SystemExit):
+        world.run("answer", ask["id"], "again")
+
+
+def test_answer_is_not_recorded_when_the_prompt_fails(world, monkeypatch):
+    start_run(world)
+    world.run("ask", "Go?")
+    [q] = json.loads((world.root / "runs" / "w1-p0.json").read_text())["questions"]
+    monkeypatch.setattr(world.orch, "prompt", lambda pane, text: False)
+
+    with pytest.raises(SystemExit):
+        world.run("answer", q["id"], "yes")
+
+    [q] = json.loads((world.root / "runs" / "w1-p0.json").read_text())["questions"]
+    assert q["answered"] is None
+
+
+def test_status_json_shows_open_questions_reports_and_accounts(world, capsys):
+    start_run(world)
+    world.agent(W1, "idle")
+    world.turn_end(W1, last="all green")
+    world.agent(W2, "working")
+    world.run("ask", "First?")
+    world.run("ask", "Second?")
+    first = json.loads((world.root / "runs" / "w1-p0.json").read_text())["questions"][0]
+    world.run("answer", first["id"], "ok")
+    world.orch.write_report(BOSS, {"role": "orchestrator", "summary": "3 of 5 fixes",
+                                   "progress": {"done": 3, "total": 5}})
+    world.orch.write_report(W1, {"role": "worker", "summary": "fixed #12", "status": "done"})
+    path = world.root / "agents" / "w1-p1.json"
+    path.write_text(json.dumps(dict(json.loads(path.read_text()), account="2")))
+    capsys.readouterr()
+
+    world.run("status", "--json")
+
+    data = json.loads(capsys.readouterr().out)
+    assert [q["text"] for q in data["questions"]] == ["Second?"]
+    assert data["report"]["progress"] == {"done": 3, "total": 5}
+    w1 = data["workers"][0]
+    assert w1["report"]["summary"] == "fixed #12" and w1["account"] == "2"
+    assert w1["last"] == "all green"  # the report kept the Stop hook's fields
+    assert [e["kind"] for e in world.events()].count("report") == 2
+
+
+# --- decisions --------------------------------------------------------------------------------
+
+LOG = """# Decision log
+
+Started 2026-11-05 10:00. Append-only.
+
+## Generation 1
+- **D1** 2026-11-05 10:40, user: "Use the MCP tool, not a CLI". Agent built orch_mcp.py.
+- **D2** 2026-11-05 10:50, agent: question ids are random hex. Why: no counter file to lock.
+- **D3** 2026-11-05 11:00, agent: poll herdr every 15 s.
+  The gateway samples state for the activity strip.
+
+## Generation 2: takeover by w1 in herdr pane w1:p0, 2026-11-05 12:00, from gen-01.md
+- D4 12:05, orchestrator: sample every 30 s instead of D3, because 15 s cost too much CPU.
+- **D5** 2026-11-05 12:10, the user (Bogdan): "drop the widget". Replaces **D2** and D1.
+- **D6** 2026-11-05 ~12:20, user proposed: "ship it today". Agent agreed.
+- **D7** 2026-11-05 12:30 EET (10:30 UTC), agent: shipped.
+- **D8** 2026-11-05 12:40 EET (date), agent: tagged v1.
+- **D9** 2026-11-05 12:50 EET, user (checking in at 12:49): "keep going". Agent kept going.
+- **D10** 2026-11-05 ~12:55, user picked option "Merge now, tag later (Recommended)": merged.
+"""
+
+
+def write_log(world, name, text, mtime):
+    lineage = world.root / "home-bogdan-Repo-x" / name
+    lineage.mkdir(parents=True)
+    (lineage / "decisions.md").write_text(text)
+    os.utime(lineage / "decisions.md", (mtime, mtime))
+    return lineage / "decisions.md"
+
+
+def d_of(data, did):
+    return next(e for e in data["decisions"] if e["id"] == did)
+
+
+def test_decisions_parses_the_newest_log_of_the_pane(world, capsys):
+    write_log(world, "w1-p0-20261104-090000-aaaaaaaa", "- **D1** 09:00, agent: old.\n", 100)
+    log = write_log(world, "w1-p0-20261105-100000-bbbbbbbb", LOG, 200)
+    write_log(world, "w1-p00-20261105-100000-cccccccc", "- **D1** 09:00, agent: other.\n", 300)
+
+    world.run("decisions", "--json")
+
+    data = json.loads(capsys.readouterr().out)
+    assert data["log"] == str(log)
+    d = {e["id"]: e for e in data["decisions"]}
+    assert [e["id"] for e in data["decisions"]] == [
+        "D1", "D5", "D6", "D9", "D10", "D2", "D3", "D4", "D7", "D8"]  # owner first
+    assert d_of(data, "D9")["by"] == "user (checking in at 12:49)"
+    assert d_of(data, "D9")["quote"] == "keep going"
+    assert d_of(data, "D10")["by"] == "" and d_of(data, "D10")["who"] == "user"
+    assert d["D1"]["who"] == "user" and d["D1"]["quote"] == "Use the MCP tool, not a CLI"
+    assert d["D1"]["what"] == "Agent built orch_mcp.py." and d["D1"]["time"] == "2026-11-05 10:40"
+    assert d["D2"]["who"] == "agent" and d["D2"]["what"] == "question ids are random hex."
+    assert d["D2"]["why"] == "no counter file to lock."
+    assert d["D3"]["why"] == "The gateway samples state for the activity strip."
+    assert d["D4"]["by"] == "orchestrator" and d["D4"]["time"] == "12:05"
+    assert d["D4"]["why"] == "15 s cost too much CPU." and d["D4"]["generation"] == 2
+    assert d["D5"]["who"] == "user" and d["D5"]["by"] == "the user (Bogdan)"
+    assert {k: d[k]["superseded_by"] for k in d if d[k]["superseded_by"]} == {
+        "D1": "D5", "D2": "D5", "D3": "D4"}
+    assert (d["D6"]["who"], d["D6"]["time"], d["D6"]["quote"]) == ("user", "2026-11-05 ~12:20",
+                                                                  "ship it today")
+    assert (d["D7"]["who"], d["D7"]["time"], d["D7"]["what"]) == ("agent", "2026-11-05 12:30 EET",
+                                                                  "shipped.")
+    assert (d["D8"]["by"], d["D8"]["what"]) == ("agent", "tagged v1.")
+
+
+def test_decisions_without_a_log(world):
+    with pytest.raises(SystemExit):
+        world.run("decisions", "--pane", "w9:p9")
+
+
+# --- accounts -------------------------------------------------------------------------------
+
+@pytest.fixture
+def accounts(world, tmp_path, monkeypatch):
+    """Accounts 1 and 2 logged in, 3 not; the switch itself is recorded instead of run."""
+    def account_dir(n):
+        return tmp_path / ("claude" if str(n) == "1" else f"claude-{n}")
+    for n in ("1", "2", "3"):
+        account_dir(n).mkdir()
+    for n in ("1", "2"):
+        (account_dir(n) / ".credentials.json").write_text("{}")
+    monkeypatch.setattr(world.orch, "account_dir", account_dir)
+    monkeypatch.setattr(world.orch, "is_claude", lambda pid: pid == 4242)
+    jobs = []
+    monkeypatch.setattr(world.orch, "run_switch", lambda job: jobs.append(job) or
+                        type("R", (), {"returncode": 0, "stderr": ""})())
+    return jobs
+
+
+def idle_with_status(world, pane, **extra):
+    world.agent(pane, "idle", session="s-new")
+    world.turn_end(pane, session="s-new")
+    path = world.root / "agents" / f"{pane.replace(':', '-')}.json"
+    st = dict(json.loads(path.read_text()), pid=4242, account="1",
+              relaunch=["--dangerously-skip-permissions", "--model", "claude-haiku-5-5"])
+    path.write_text(json.dumps(dict(st, **extra)))
+
+
+def test_account_switch_at_handoff_is_queued(world, accounts, capsys):
+    world.run("account", W1, "2")
+
+    acc = json.loads((world.root / "accounts.json").read_text())
+    assert acc["switch"] == {W1: {"account": "2", "time": T0, "when": "handoff"}}
+    [event] = world.events()
+    assert event["kind"] == "account" and event["account"] == "2" and event["when"] == "handoff"
+    assert accounts == []
+    with pytest.raises(SystemExit):  # not logged in
+        world.run("account", W1, "3")
+    with pytest.raises(SystemExit):
+        world.run("account", W1, "pibo2")
+
+
+def test_account_switch_now_resumes_an_idle_agent(world, accounts, capsys):
+    idle_with_status(world, W1)
+
+    assert world.run("account", W1, "2", "--now") == 0
+
+    [job] = accounts
+    assert job == {"pane": W1, "pid": 4242, "resume": "s-new", "account": "2",
+                   "args": ["--dangerously-skip-permissions", "--model", "claude-haiku-5-5"],
+                   "session": "s-new", "created": 0}
+    assert "now runs on account 2" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("setup, message", [
+    (lambda w: w.agent(W1, "working"), "working"),
+    (lambda w: idle_with_status(w, W1, background_tasks=[{"what": "pytest"}]), "background"),
+    (lambda w: w.agent(W1, "idle", session="never-ended-a-turn"), "no turn end"),
+    (lambda w: idle_with_status(w, W1, account="2"), "already runs on account 2"),
+    (lambda w: idle_with_status(w, W1, pid=999), "no turn end"),  # resumed since: stale
+])
+def test_account_switch_now_refuses(world, accounts, capsys, setup, message):
+    setup(world)
+    with pytest.raises(SystemExit):
+        world.run("account", W1, "2", "--now")
+    assert message in capsys.readouterr().err
+    assert accounts == []
+
+
+def test_account_default_and_listing(world, accounts, capsys):
+    world.run("account", "--default", "2")
+    world.run("account", W2, "1")
+    capsys.readouterr()
+
+    world.run("account", "--json")
+
+    data = json.loads(capsys.readouterr().out)
+    assert data["default"] == "2" and data["switch"][W2]["account"] == "1"
+
+
+def test_account_switch_when_idle_is_done_by_the_watchdog(world, accounts, capsys):
+    start_run(world)
+    world.agent(W1, "working")
+    world.run("account", W1, "2", "--when-idle")
+    capsys.readouterr()
+    world.run("status", "--json")
+    [w1, _] = json.loads(capsys.readouterr().out)["workers"]
+    assert w1["switch"] == {"account": "2", "time": T0, "when": "idle"}
+
+    world.agent(W2, "working")
+    world.run("watchdog")  # still working: nothing yet
+    assert accounts == []
+    idle_with_status(world, W1, background_tasks=[{"what": "pytest"}])
+    world.run("watchdog")  # idle, but waiting on its own job
+    assert accounts == []
+
+    idle_with_status(world, W1)
+    world.run("watchdog")
+
+    [job] = accounts
+    assert job["pane"] == W1 and job["account"] == "2" and job["resume"] == "s-new"
+    assert job["when"] == "idle"
+    assert json.loads((world.root / "accounts.json").read_text())["switch"] == {}
+    world.run("watchdog")
+    assert len(accounts) == 1
+
+
+def test_status_json_shows_the_orchestrators_pending_switch(world, accounts, capsys):
+    start_run(world)
+    world.agent(W1, "working")
+    world.agent(W2, "working")
+    world.run("account", BOSS, "2", "--at-handoff")
+    capsys.readouterr()
+    world.run("status", "--json")
+    assert json.loads(capsys.readouterr().out)["switch"]["when"] == "handoff"
+
+
+def test_the_watchdog_switches_one_agent_per_pass(world, accounts):
+    world.run("account", W1, "2", "--when-idle")
+    world.run("account", W2, "2", "--when-idle")
+    idle_with_status(world, W1)
+    idle_with_status(world, W2)
+
+    world.run("watchdog")
+    assert [j["pane"] for j in accounts] == [W1]
+    world.run("watchdog")
+    assert [j["pane"] for j in accounts] == [W1, W2]
+
+
+def test_a_failed_idle_switch_is_dropped(world, accounts, monkeypatch):
+    world.run("account", W1, "2", "--when-idle")
+    idle_with_status(world, W1)
+    monkeypatch.setattr(world.orch, "run_switch", lambda job: type(
+        "R", (), {"returncode": 1, "stderr": "the new agent is at a dialog"})())
+
+    world.run("watchdog")
+
+    assert json.loads((world.root / "accounts.json").read_text())["switch"] == {}
+    dropped = world.events()[-1]
+    assert dropped["kind"] == "account" and "at a dialog" in dropped["body"]
+
+
+def test_an_idle_switch_to_the_current_account_is_dropped(world, accounts):
+    world.run("account", W1, "2", "--when-idle")
+    idle_with_status(world, W1, account="2")
+
+    world.run("watchdog")
+
+    assert accounts == []
+    assert json.loads((world.root / "accounts.json").read_text())["switch"] == {}
+
+
+def test_a_switch_now_clears_a_pending_one(world, accounts):
+    world.run("account", W1, "2")  # at its handoff
+    idle_with_status(world, W1)
+
+    world.run("account", W1, "2", "--now")
+
+    assert len(accounts) == 1
+    assert json.loads((world.root / "accounts.json").read_text())["switch"] == {}
+
+
+def test_is_claude(world):
+    assert world.orch.is_claude(os.getpid()) is False  # pytest
+    assert world.orch.is_claude(None) is False and world.orch.is_claude(2 ** 30) is False

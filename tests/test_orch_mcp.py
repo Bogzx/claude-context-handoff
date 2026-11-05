@@ -1,0 +1,134 @@
+"""Tests for hooks/orch_mcp.py: a real stdio round trip, then the tools in process."""
+import importlib.util
+import io
+import json
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+import pytest
+
+HOOKS = Path(__file__).resolve().parent.parent / "hooks"
+PANE = "w1:p0"
+
+
+def rpc(*messages):
+    return "".join(json.dumps(m) + "\n" for m in messages)
+
+
+def call(mid, name, arguments):
+    return {"jsonrpc": "2.0", "id": mid, "method": "tools/call",
+            "params": {"name": name, "arguments": arguments}}
+
+
+def test_stdio_round_trip_writes_the_report(tmp_path):
+    env = dict(os.environ, HOME=str(tmp_path), HERDR_ENV="1", HERDR_PANE_ID=PANE,
+               ORCH_NOTIFY_CMD="true", PATH="/usr/bin:/bin")
+    report = {"summary": "4 of 9 fixes merged", "state": "waiting_on_workers",
+              "progress": {"done": 4, "total": 9, "label": "fixes"},
+              "waiting_on": [{"who": "w1:p1 builder", "what": "PR #12 tests", "eta": "15m"}],
+              "roadmap": [{"id": "R3", "title": "flaky test", "status": "doing", "owner": "w1:p1"}],
+              "milestones": [{"kind": "pr_merged", "ref": "#11", "url": "https://x/11"}]}
+    out = subprocess.run(
+        [sys.executable, str(HOOKS / "orch_mcp.py")], env=env, capture_output=True, text=True,
+        timeout=30, check=True,
+        input=rpc({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                   "params": {"protocolVersion": "2025-06-18", "capabilities": {},
+                              "clientInfo": {"name": "test", "version": "0"}}},
+                  {"jsonrpc": "2.0", "method": "notifications/initialized"},
+                  {"jsonrpc": "2.0", "id": 2, "method": "tools/list"},
+                  call(3, "report", report)))
+    init, listed, called = [json.loads(x) for x in out.stdout.splitlines()]
+
+    assert init["id"] == 1 and init["result"]["protocolVersion"] == "2025-06-18"
+    assert init["result"]["capabilities"] == {"tools": {}}
+    assert [t["name"] for t in listed["result"]["tools"]] == ["report", "ask_owner"]
+    assert called["result"] == {"content": [{"type": "text", "text": "Report recorded."}],
+                                "isError": False}
+    root = tmp_path / ".claude" / "handoffs"
+    status = json.loads((root / "agents" / "w1-p0.json").read_text())
+    assert status["pane"] == PANE
+    saved = status["report"]
+    assert saved["role"] == "orchestrator"  # from its fields: no run registered
+    assert {k: saved[k] for k in report} == report and abs(saved["time"] - time.time()) < 60
+    [event] = [json.loads(x) for x in (root / "events.jsonl").read_text().splitlines()]
+    assert event["kind"] == "report" and event["pane"] == PANE
+    assert event["body"] == "4 of 9 fixes merged" and event["report"] == saved
+
+
+@pytest.fixture
+def mcp(tmp_path, monkeypatch):
+    spec = importlib.util.spec_from_file_location("orch_mcp", HOOKS / "orch_mcp.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    monkeypatch.setattr(module.orch, "ROOT", tmp_path / "handoffs")
+    monkeypatch.setattr(module.orch, "herdr", lambda *a, **k: None)
+    monkeypatch.setenv("ORCH_NOTIFY_CMD", "true")
+
+    def run(*messages, pane=PANE):
+        monkeypatch.setenv("HERDR_ENV", "1" if pane else "")
+        if pane:
+            monkeypatch.setenv("HERDR_PANE_ID", pane)
+        out = io.StringIO()
+        module.main(io.StringIO(rpc(*messages)), out)
+        return [json.loads(x) for x in out.getvalue().splitlines()]
+    run.module = module
+    run.root = tmp_path / "handoffs"
+    return run
+
+
+def test_report_role_comes_from_the_run(mcp):
+    run = mcp.root / "runs" / "w1-p0.json"
+    run.parent.mkdir(parents=True)
+    run.write_text(json.dumps({"orchestrator": PANE, "until": time.time() + 3600,
+                               "workers": {"w1:p1": {"label": "builder"}}, "ended": None}))
+
+    mcp(call(1, "report", {"summary": "fixed #12", "status": "done",
+                           "tests": [{"cmd": "pytest -q", "passed": 40, "failed": 0}],
+                           "changed_files": ["hooks/orch.py"]}), pane="w1:p1")
+
+    saved = json.loads((mcp.root / "agents" / "w1-p1.json").read_text())["report"]
+    assert saved["role"] == "worker" and saved["tests"][0]["passed"] == 40
+
+
+def test_ask_owner_logs_a_question_with_options(mcp):
+    [resp] = mcp(call(1, "ask_owner", {"question": "Deploy to prod?",
+                                       "options": [{"label": "Deploy", "danger": "prod"},
+                                                   {"label": "Not yet"}]}))
+
+    text = resp["result"]["content"][0]["text"]
+    [event] = [json.loads(x) for x in (mcp.root / "events.jsonl").read_text().splitlines()]
+    assert event["kind"] == "ask" and event["id"] in text and not resp["result"]["isError"]
+    assert event["options"] == [{"label": "Deploy", "danger": "prod"},
+                                {"label": "Not yet", "danger": "none"}]
+
+
+@pytest.mark.parametrize("arguments, error", [
+    ({"status": "done"}, "arguments.summary is required"),
+    ({"summary": "x", "status": "finished"}, "arguments.status must be one of"),
+    ({"summary": "x", "progress": {"done": "3", "total": 5}}, "progress.done must be a whole"),
+    ({"summary": "x", "tests": [{"cmd": "pytest", "passed": True}]}, "tests[0].passed"),
+    ({"summary": "x", "mood": "great"}, "arguments.mood is not a field"),
+])
+def test_report_rejects_what_does_not_fit_the_schema(mcp, arguments, error):
+    [resp] = mcp(call(1, "report", arguments))
+    assert resp["result"]["isError"] and error in resp["result"]["content"][0]["text"]
+    assert not (mcp.root / "agents").exists()
+
+
+def test_outside_herdr_there_are_no_tools(mcp):
+    listed, called = mcp({"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
+                         call(2, "report", {"summary": "x"}), pane=None)
+    assert listed["result"] == {"tools": []}
+    assert called["error"]["code"] == -32601
+
+
+def test_unknown_methods_and_bad_json(mcp):
+    out = io.StringIO()
+    mcp.module.main(io.StringIO('{"jsonrpc":"2.0","id":7,"method":"resources/list"}\nnot json\n'),
+                    out)
+    unknown, bad = [json.loads(x) for x in out.getvalue().splitlines()]
+    assert unknown["id"] == 7 and unknown["error"]["code"] == -32601
+    assert bad["id"] is None and bad["error"]["code"] == -32700

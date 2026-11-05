@@ -10,14 +10,23 @@ at every turn end (background tasks still running, last message). From those two
                   (a worker finished or idle, blocked, gone, waiting too long on its own job,
                   a --check command passing) or after the heartbeat, and prints the fleet.
   orch park       a worker on standby, with a reason (and an end); unparked workers don't idle.
-  orch ask        a question for the owner: logged and pushed, the fleet keeps working.
+  orch ask        a question for the owner, with options: logged and pushed, the fleet keeps
+                  working; `orch answer <id> <text>` records the answer and prompts the asker.
   orch watchdog   run every 5 minutes by a systemd user timer, outside any Claude session:
                   prompts an idle orchestrator whose workers sit idle, and alerts the owner
                   when it is gone, blocked or not acting.
+  orch decisions  the pane's current decision log, parsed (who, what, why, superseded).
+  orch account    which Claude account (claude-acc N) an agent runs on, and switching it: now,
+                  when it is next idle (the watchdog does it) or at its next handoff.
+  orch usage      account windows from the statusline and tokens per agent (orch_usage.py).
+
+Agents report at turn end through the orch MCP server (orch_mcp.py), into
+~/.claude/handoffs/agents/<pane>.json next to the Stop hook's status.
 
 Events go to ~/.claude/handoffs/events.jsonl. Owner alerts also go to the notify command:
 $ORCH_NOTIFY_CMD, else an executable ~/.claude/handoffs/notify, called as
-`<command> <title> <body>` with ORCH_EVENT_KIND set. Python 3.8 compatible (ob1).
+`<command> <title> <body>` with ORCH_EVENT_KIND set and the whole event as JSON in
+ORCH_EVENT. Python 3.8 compatible (ob1).
 """
 import argparse
 import json
@@ -42,6 +51,8 @@ ORCH_SILENT = 60 * 60  # orchestrator idle this long whatever it waits on
 NUDGE_EVERY = 15 * 60
 NUDGE_BACKOFF = 60 * 60  # after IGNORED nudges in a row on the same problem
 IGNORED = 3
+DANGER = ("none", "deploy", "prod", "destructive")  # what saying yes to an option does
+HOOK = Path(__file__).resolve().parent / "context-handoff.py"
 
 
 def now():
@@ -111,9 +122,9 @@ def prompt(pane, text):
 
 # --- events -----------------------------------------------------------------------------
 
-def emit(kind, title, body, pane=None, push=False):
+def emit(kind, title, body, pane=None, push=False, **extra):
     event = {"time": now(), "host": socket.gethostname(), "kind": kind, "pane": pane,
-             "title": title, "body": body}
+             "title": title, "body": body, **extra}
     ROOT.mkdir(parents=True, exist_ok=True)
     with open(ROOT / "events.jsonl", "a") as f:
         f.write(json.dumps(event) + "\n")
@@ -125,7 +136,8 @@ def emit(kind, title, body, pane=None, push=False):
     if command:
         try:
             subprocess.run(shlex.split(command) + [title, body], capture_output=True, timeout=20,
-                           env=dict(os.environ, ORCH_EVENT_KIND=kind), check=False)
+                           env=dict(os.environ, ORCH_EVENT_KIND=kind, ORCH_EVENT=json.dumps(event)),
+                           check=False)
         except (OSError, subprocess.SubprocessError):
             pass
 
@@ -147,6 +159,28 @@ def active(run, at=None):
 def all_runs():
     return [load(p) for p in sorted((ROOT / "runs").glob("*.json"))
             if not p.name.endswith(".seen.json")]
+
+
+def run_of(pane, at=None):
+    """(run, role) for the active run this pane leads or works in, else (None, None)."""
+    run = load_run(pane)
+    if active(run, at):
+        return run, "orchestrator"
+    for run in all_runs():
+        if active(run, at) and pane in (run.get("workers") or {}):
+            return run, "worker"
+    return None, None
+
+
+def status_of(pane):
+    """The pane's status file: the Stop hook's turn end plus its latest report."""
+    return load(ROOT / "agents" / f"{slug(pane)}.json")
+
+
+# --- accounts (claude-acc N: account 1 is ~/.claude, account N is ~/.claude-N) ----------------
+
+def account_dir(account):
+    return Path.home() / (".claude" if str(account) == "1" else f".claude-{account}")
 
 
 def parse_until(text, at):
@@ -191,7 +225,7 @@ def orchestrator(args):
 
 def view(pane, agent, run, at):
     """One worker, as orch sees it."""
-    st = load(ROOT / "agents" / f"{slug(pane)}.json")
+    st = status_of(pane)
     session = ((agent or {}).get("agent_session") or {}).get("value")
     fresh = st if st and session and st.get("session") == session else {}
     park = ((run or {}).get("parked") or {}).get(pane)
@@ -211,6 +245,9 @@ def view(pane, agent, run, at):
         "bg": fresh.get("background_tasks") or [],
         "last": fresh.get("last") or "",
         "park": park,
+        "report": st.get("report"),  # the latest, whichever session wrote it (it has its time)
+        "account": fresh.get("account"),
+        "switch": (load(ROOT / "accounts.json").get("switch") or {}).get(pane),  # pending
     }
 
 
@@ -302,15 +339,105 @@ def cmd_park(args):
     return 0
 
 
-def cmd_ask(args):
-    orch = orchestrator(args)
-    run = load_run(orch)
+def ask(pane, text, options=()):
+    """Log a question for the owner in the pane's run and events.jsonl and push it; returns its
+    id. options: [{"label", "danger"}], the answers the owner's app offers as buttons."""
+    options = [{"label": o["label"], "danger": o.get("danger") or "none"} for o in options]
+    qid = "q" + os.urandom(4).hex()
+    run, _ = run_of(pane)
     if run:
-        run.setdefault("questions", []).append({"time": now(), "text": args.text})
-        save(run_path(orch), run)
-    emit("ask", f"Question from {orch} on {socket.gethostname()}", args.text, orch, push=True)
-    print("sent to the owner; keep the rest of the fleet working while you wait for the answer")
+        run.setdefault("questions", []).append(
+            {"id": qid, "time": now(), "pane": pane, "text": text, "options": options,
+             "answer": None, "answered": None})
+        save(run_path(run["orchestrator"]), run)
+    body = text
+    if options:
+        body += "\nOptions: " + " / ".join(
+            o["label"] + (f" [{o['danger']}]" if o["danger"] != "none" else "") for o in options)
+    emit("ask", f"Question from {pane} on {socket.gethostname()}", body, pane, push=True, id=qid,
+         question=text, options=options)
+    return qid
+
+
+class OptionAction(argparse.Action):
+    """--option LABEL [--danger KIND]: the danger applies to the option just before it."""
+
+    def __call__(self, parser, namespace, value, option_string=None):
+        options = list(getattr(namespace, "options", None) or [])
+        if option_string == "--danger":
+            if not options:
+                parser.error("--danger goes after the --option it applies to")
+            options[-1] = dict(options[-1], danger=value)
+        else:
+            options.append({"label": value, "danger": "none"})
+        namespace.options = options
+
+
+def cmd_ask(args):
+    qid = ask(orchestrator(args), args.text, args.options or [])
+    print(f"sent to the owner as {qid}; keep the rest of the fleet working while you wait for the "
+          "answer")
     return 0
+
+
+def find_question(qid):
+    """(run or None, question) for a question id: from the runs, else (asked outside a run) from
+    events.jsonl with its answer, if any."""
+    for run in all_runs():
+        for q in run.get("questions") or []:
+            if q.get("id") == qid:
+                return run, q
+    found = None
+    try:
+        with open(ROOT / "events.jsonl") as f:
+            for line in f:
+                if qid not in line:
+                    continue
+                try:
+                    e = json.loads(line)
+                except ValueError:
+                    continue
+                if e.get("id") != qid:
+                    continue
+                if e.get("kind") == "ask":
+                    found = {"id": qid, "time": e.get("time"), "pane": e.get("pane"),
+                             "text": e.get("question") or e.get("body"),
+                             "options": e.get("options") or [], "answer": None, "answered": None}
+                elif e.get("kind") == "answer" and found:
+                    found.update(answer=e.get("body"), answered=e.get("time"))
+    except OSError:
+        pass
+    return None, found
+
+
+def cmd_answer(args):
+    run, q = find_question(args.id)
+    if not q:
+        die(f"no question {args.id}")
+    if q.get("answered"):
+        die(f"{args.id} was already answered at {clock(q['answered'], True)}: {q.get('answer')!r}")
+    pane = q.get("pane") or (run or {}).get("orchestrator")
+    text = (f"The owner answered your question {args.id} ({first_line(q.get('text') or '', 160)!r}):"
+            f" {args.text}")
+    if not prompt(pane, text):
+        die(f"could not prompt {pane}; the answer is not recorded")
+    q.update(answer=args.text, answered=now())
+    if run:
+        save(run_path(run["orchestrator"]), run)
+    emit("answer", f"Answer to {args.id}", args.text, pane, id=args.id)
+    print(f"answered {args.id}; prompted {pane}")
+    return 0
+
+
+def write_report(pane, report):
+    """Store an agent's turn-end report in its status file (keeping the Stop hook's fields)
+    and log it."""
+    path = ROOT / "agents" / f"{slug(pane)}.json"
+    st = load(path) or {"pane": pane}
+    st["report"] = report
+    save(path, st)
+    emit("report", f"{report.get('role', 'agent').capitalize()} report: {pane}",
+         report.get("summary") or "", pane, report=report)
 
 
 def cmd_last(args):
@@ -341,7 +468,12 @@ def cmd_status(args):
     if ags is None:
         die("herdr is not reachable")
     if args.json:
-        print(json.dumps({"run": run, "orchestrator": ags.get(orch), "workers": views},
+        lead = view(orch, ags.get(orch), None, at)
+        print(json.dumps({"run": run, "orchestrator": ags.get(orch), "workers": views,
+                          "report": lead["report"], "account": lead["account"],
+                          "switch": lead["switch"],
+                          "questions": [q for q in (run or {}).get("questions") or []
+                                        if not q.get("answered")]},
                          indent=1))
         return 0
     if run:
@@ -491,6 +623,7 @@ def cmd_watchdog(args):
     ags = agents()
     if ags is None:
         return 0  # herdr is down; there is nothing to prompt
+    idle_switches(ags, args.dry_run)
     state_path = ROOT / "watchdog.json"
     state = load(state_path)
     at = now()
@@ -556,6 +689,244 @@ def cmd_watchdog(args):
     return 0
 
 
+# --- decisions ------------------------------------------------------------------------------
+
+ENTRY = re.compile(r"\s{0,3}(?:[-*]\s+)?(?:\*\*)?D(\d+)\b(?:\*\*)?[.:]?\s*(.*)", re.DOTALL)
+WHEN = re.compile(r"(~?(?:\d{4}-\d{2}-\d{2}(?:[ T]~?\d{1,2}:\d{2}(?::\d{2})?)?|\d{1,2}:\d{2})"
+                  r"(?:\s*(?:[A-Z]{2,5}\b|[+-]\d{2}:?\d{2}))?)"  # "13:55 EET", "~09:05"
+                  r"(?:\s*\([^)]*\))?\s*[,;]?\s*")  # "(13:55 UTC)"
+WHO = re.compile(r"((?:[^:,.(]|\([^)]*\)){1,60}?):\s+")  # "agent: ", "user (at 22:27): "
+QUOTE = re.compile(r"\s*([\"\u201c])(.*?)[\"\u201d]\.?\s*", re.DOTALL)
+REPLACES = re.compile(r"\b(?:replaces|replacing|supersedes|superseding|instead of|overrides|"
+                      r"overriding)\s+((?:\*\*)?D\d+(?:\*\*)?(?:\s*(?:,|and|&|/)\s*(?:\*\*)?D\d+"
+                      r"(?:\*\*)?)*)", re.IGNORECASE)
+WHY = re.compile(r"\b(?:why|because|reason)\b:?\s*", re.IGNORECASE)
+
+
+def lineage_of(pane):
+    """The pane's newest decision log (lineage folders are <pane>-<date>-<time>-<session>)."""
+    name = re.compile(re.escape(slug(pane)) + r"-\d{8}-\d{6}-[^-/]+$")
+    logs = [p for p in ROOT.glob(f"*/{slug(pane)}-*/decisions.md") if name.match(p.parent.name)]
+    return max(logs, key=lambda p: p.stat().st_mtime) if logs else None
+
+
+def sentences(text):
+    return [x for x in re.split(r"(?<=[.!?])\s+(?=[A-Z\"(`])", text.strip()) if x]
+
+
+def parse_decisions(text):
+    """Entries of a decision log: id, time, who (user or agent), by (as written), quote (the
+    user's words), what (first sentence), why, superseded_by, generation, line."""
+    entries, generation, current = [], 1, None
+    for number, line in enumerate(text.splitlines(), 1):
+        if line.startswith("#"):
+            m = re.match(r"## Generation (\d+)", line)
+            generation = int(m.group(1)) if m else generation
+            current = None  # a heading ends the entry before it
+            continue
+        m = ENTRY.match(line)
+        if m:
+            current = {"id": f"D{m.group(1)}", "generation": generation, "line": number,
+                       "text": m.group(2).strip()}
+            entries.append(current)
+        elif current and line.strip():
+            current["text"] += " " + line.strip()  # a continuation line
+    out, latest = [], {}
+    for e in entries:
+        rest = e.pop("text")
+        when = WHEN.match(rest)
+        e["time"] = when.group(1) if when else None
+        rest = rest[when.end():] if when else rest
+        who = WHO.match(rest)
+        e["by"] = who.group(1).strip() if who else ""
+        rest = rest[who.end():] if who else rest
+        user = bool(re.search(r"\b(?:user|owner)\b", e["by"], re.IGNORECASE) if e["by"] else
+                    re.match(r"(?:the\s+)?(?:user|owner)\b", rest, re.IGNORECASE))
+        e["who"] = "user" if user else "agent"
+        quote = QUOTE.match(rest) if user else None
+        e["quote"] = quote.group(2).strip() if quote else None
+        body = rest[quote.end():] if quote else rest
+        parts = sentences(body) or sentences(e["quote"] or "")
+        e["what"] = parts[0] if parts else body.strip()
+        why = WHY.search(body)
+        e["why"] = (body[why.end():] if why else " ".join(parts[1:])).strip()[:1000]
+        e["superseded_by"] = None
+        for ref in REPLACES.findall(rest):
+            for old in re.findall(r"D\d+", ref):
+                if old in latest and old != e["id"]:
+                    latest[old]["superseded_by"] = e["id"]
+        latest[e["id"]] = e
+        out.append(e)
+    return sorted(out, key=lambda e: e["who"] != "user")  # owner rules first, then log order
+
+
+def cmd_decisions(args):
+    pane = args.pane or orchestrator(args)
+    log = lineage_of(pane)
+    if not log:
+        die(f"no decision log for {pane} under {ROOT}")
+    entries = parse_decisions(log.read_text(errors="replace"))
+    if args.json:
+        print(json.dumps({"pane": pane, "log": str(log), "decisions": entries}, indent=1))
+        return 0
+    print(f"{log} ({len(entries)} decisions)")
+    for e in entries:
+        print(f"  {e['id']:<5} {e['who']:<5} {e['time'] or '':<16} {first_line(e['what'], 100)}"
+              + (f" (superseded by {e['superseded_by']})" if e["superseded_by"] else ""))
+    return 0
+
+
+# --- account switching -----------------------------------------------------------------------
+
+def check_account(account):
+    if not re.fullmatch(r"\d+", account):
+        die(f"accounts are numbers (claude-acc N), not {account!r}")
+    if not (account_dir(account) / ".credentials.json").exists():
+        die(f"account {account} is not logged in ({account_dir(account)}/.credentials.json is "
+            f"missing): run `claude-acc {account}` once and log in")
+
+
+def switch_job(pane, account, agent):
+    """(respawn job, None) to restart the pane's agent on `account` now, or (None, why not).
+    Only an idle agent with no background tasks is restarted."""
+    state = (agent or {}).get("agent_status", "missing")
+    if state not in ("idle", "done"):
+        return None, f"{pane} is {state}, not idle"
+    session = (agent.get("agent_session") or {}).get("value")
+    st = status_of(pane)
+    # A resumed session keeps its id, so the pid tells whether the status is from this process.
+    if not session or st.get("session") != session or not is_claude(st.get("pid")):
+        return None, f"no turn end recorded for {pane}'s running agent yet"
+    if st.get("background_tasks"):
+        return None, (f"{pane} has {len(st['background_tasks'])} background task(s) running "
+                      f"({st['background_tasks'][0].get('what', '')})")
+    if st.get("account") == account:
+        return None, f"{pane} already runs on account {account}"
+    return {"pane": pane, "pid": st["pid"], "resume": session, "account": account,
+            "args": st.get("relaunch") or [], "session": session, "created": 0}, None
+
+
+def is_claude(pid):
+    try:
+        return Path(f"/proc/{int(pid)}/comm").read_text().strip() == "claude"
+    except (OSError, TypeError, ValueError):
+        return False
+
+
+def apply_switch(job):
+    """Run the switch; on success drop any switch still pending for the pane. Returns the error
+    text, or None."""
+    result = run_switch(job)
+    if result.returncode != 0:
+        return (result.stderr or "").strip() or "see ~/.claude/handoffs/respawn.log"
+    path = ROOT / "accounts.json"
+    acc = load(path)
+    if (acc.get("switch") or {}).pop(job["pane"], None):
+        save(path, acc)
+    return None
+
+
+def switch_now(pane, account):
+    """Restart an idle agent on another account: exit it and resume its session in the same pane
+    with `claude-acc N --resume`, through the handoff hook's respawn (resume mode)."""
+    ags = agents()
+    if ags is None:
+        die("herdr is not reachable")
+    job, why = switch_job(pane, account, ags.get(pane))
+    if not job:
+        die(f"{why}: --now needs an idle agent with no background tasks; use --when-idle or "
+            "--at-handoff")
+    error = apply_switch(job)
+    if error:
+        die(f"switching {pane} to account {account} failed: {error}")
+    print(f"{pane} now runs on account {account} (session {job['session']} resumed)")
+    return 0
+
+
+def idle_switches(ags, dry_run):
+    """Watchdog: carry out one pending --when-idle switch whose agent is idle now (a switch can
+    take two minutes, so one per pass). A switch that fails is dropped: the failure was pushed."""
+    path = ROOT / "accounts.json"
+    acc = load(path)
+    for pane, sw in sorted((acc.get("switch") or {}).items()):
+        if sw.get("when") != "idle":
+            continue
+        job, why = switch_job(pane, sw["account"], ags.get(pane))
+        if not job:
+            if why.endswith(f"already runs on account {sw['account']}"):
+                acc["switch"].pop(pane)
+                save(path, acc)
+            continue
+        if dry_run:
+            print(f"would switch {pane} to account {sw['account']}")
+            return
+        error = apply_switch(dict(job, when="idle"))
+        if error:
+            acc = load(path)
+            (acc.get("switch") or {}).pop(pane, None)
+            save(path, acc)
+            emit("account", f"Account switch dropped: {pane}", error, pane,
+                 account=sw["account"], when="idle")
+        return
+
+
+def run_switch(job):
+    return subprocess.run([sys.executable, str(HOOK), "--respawn", json.dumps(job)],
+                          capture_output=True, text=True, timeout=600, check=False)
+
+
+def cmd_account(args):
+    path = ROOT / "accounts.json"
+    acc = load(path)
+    at = now()
+    if args.default:
+        check_account(args.default)
+        acc["default"] = args.default
+        save(path, acc)
+        emit("account", f"Default account: {args.default}", "for new agents", None,
+             account=args.default)
+        print(f"default account for new agents: {args.default}")
+        return 0
+    if not args.pane:
+        n, accounts = 1, {}
+        while account_dir(n).exists():
+            accounts[str(n)] = {"dir": str(account_dir(n)),
+                                "logged_in": (account_dir(n) / ".credentials.json").exists()}
+            n += 1
+        out = {"accounts": accounts, "default": acc.get("default") or "1",
+               "switch": acc.get("switch") or {}}
+        if args.json:
+            print(json.dumps(out, indent=1))
+            return 0
+        for k, a in accounts.items():
+            print(f"account {k}: {a['dir']}" + ("" if a["logged_in"] else " (not logged in)")
+                  + (" (default)" if k == out["default"] else ""))
+        for pane, sw in out["switch"].items():
+            print(f"  {pane} moves to account {sw['account']} "
+                  + ("when idle" if sw.get("when") == "idle" else "at its next handoff"))
+        return 0
+    if not args.account:
+        die("usage: orch account PANE N [--now | --at-handoff]")
+    check_account(args.account)
+    if args.now:
+        return switch_now(args.pane, args.account)
+    when = "idle" if args.when_idle else "handoff"
+    text = ("when it is next idle with no background tasks (the watchdog restarts it and resumes "
+            "the session)" if args.when_idle else "at its next handoff (no extra tokens)")
+    acc.setdefault("switch", {})[args.pane] = {"account": args.account, "time": at, "when": when}
+    save(path, acc)
+    emit("account", f"Account switch queued: {args.pane}",
+         f"moves to account {args.account} {text}", args.pane, account=args.account, when=when)
+    print(f"{args.pane} moves to account {args.account} {text}")
+    return 0
+
+
+def cmd_usage(args):
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import orch_usage
+    return orch_usage.main(args, ROOT, now(), agents)
+
+
 def cmd_notify(args):
     emit("test", args.title, args.body, push=True)
     return 0
@@ -587,7 +958,16 @@ def main(argv=None):
 
     a = sub.add_parser("ask", help="send the owner a question (logged and pushed)")
     a.add_argument("text")
+    a.add_argument("--option", action=OptionAction, dest="options", metavar="LABEL",
+                   help="an answer the owner can pick (repeatable)")
+    a.add_argument("--danger", action=OptionAction, dest="options", choices=DANGER,
+                   help="what the option before it does when picked (default none)")
     a.set_defaults(func=cmd_ask)
+
+    ans = sub.add_parser("answer", help="record the owner's answer and prompt the asker")
+    ans.add_argument("id")
+    ans.add_argument("text")
+    ans.set_defaults(func=cmd_answer)
 
     s = sub.add_parser("status", help="the fleet of this run")
     s.add_argument("--workers")
@@ -614,6 +994,34 @@ def main(argv=None):
     d = sub.add_parser("watchdog", help="one watchdog pass (the systemd timer runs this)")
     d.add_argument("--dry-run", action="store_true")
     d.set_defaults(func=cmd_watchdog)
+
+    dec = sub.add_parser("decisions", help="the pane's current decision log, parsed")
+    dec.add_argument("--pane", help="default: this pane (or --orch)")
+    dec.add_argument("--json", action="store_true")
+    dec.set_defaults(func=cmd_decisions)
+
+    acct = sub.add_parser("account", help="show accounts, or move an agent to another one")
+    acct.add_argument("pane", nargs="?")
+    acct.add_argument("account", nargs="?", help="N as in claude-acc N")
+    when = acct.add_mutually_exclusive_group()
+    when.add_argument("--now", action="store_true",
+                      help="restart the idle agent now and resume its session (re-reads its "
+                           "context uncached on the new account)")
+    when.add_argument("--when-idle", action="store_true",
+                      help="like --now, the next time it is idle with no background tasks "
+                           "(the watchdog does it)")
+    when.add_argument("--at-handoff", action="store_true",
+                      help="at its next context handoff (default; costs nothing extra)")
+    acct.add_argument("--default", metavar="N", help="the account for new agents")
+    acct.add_argument("--json", action="store_true")
+    acct.set_defaults(func=cmd_account)
+
+    u = sub.add_parser("usage", help="account windows and tokens per agent")
+    u.add_argument("action", nargs="?", choices=["capture"],
+                   help="capture: read the statusline JSON on stdin (run by the statusline)")
+    u.add_argument("--hours", type=float, default=24, help="period for agents (default 24)")
+    u.add_argument("--json", action="store_true")
+    u.set_defaults(func=cmd_usage)
 
     n = sub.add_parser("notify", help="send a test alert through the notify command")
     n.add_argument("title")

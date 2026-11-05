@@ -49,6 +49,7 @@ elif args[:2] == ["agent", "wait"] and "--until" in args:
     rc = 0 if (agent() or {}).get("agent_status") == "working" else 1
 elif args[:2] == ["pane", "run"]:
     st["phase"] = "new"
+    st["new"] = cfg.get("new", st["new"])
 path.write_text(json.dumps(st))
 sys.exit(rc)
 """
@@ -471,3 +472,236 @@ def test_stop_in_herdr_records_the_agents_turn_end(hook, run, tmp_path, monkeypa
     status = json.loads(hook.status_path(PANE).read_text())
     assert status["background_tasks"] == []
     assert status["last"] == "Task 3 is done: 2 commits, tests pass."
+
+
+# --- turn-end reports for orch runs ---------------------------------------------------------
+
+def entry(kind, content, **extra):
+    return {"type": kind, "uuid": extra.pop("uuid", None) or f"u{abs(hash(str(content))) % 10**8}",
+            "message": {"role": kind, "content": content, "model": "claude-opus-5-5",
+                        "usage": {"input_tokens": 1000}}, **extra}
+
+
+def tool(name):
+    return entry("assistant", [{"type": "tool_use", "id": "t", "name": name, "input": {}}])
+
+
+RESULT = entry("user", [{"type": "tool_result", "tool_use_id": "t", "content": "ok"}])
+
+
+@pytest.fixture
+def in_run(hook, tmp_path, monkeypatch, capsys):
+    """This pane is a worker of an active run, the orch MCP server is registered, and stop()
+    ends a turn whose transcript is the given entries."""
+    monkeypatch.setattr(hook, "IN_HERDR", True)
+    monkeypatch.setattr(hook, "claude_pid", lambda: None)
+    monkeypatch.setenv("HERDR_PANE_ID", PANE)
+    config = tmp_path / "config"
+    config.mkdir()
+    (config / ".claude.json").write_text(json.dumps({"mcpServers": {"orch": {"command": "x"}}}))
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config))
+    run = hook.ROOT / "runs" / "w1-p0.json"
+    run.parent.mkdir(parents=True)
+    run.write_text(json.dumps({"orchestrator": "w1:p0", "until": time.time() + 3600,
+                               "ended": None, "workers": {PANE: {"label": "builder"}}}))
+    transcript = tmp_path / "s1.jsonl"
+
+    def stop(*entries, **extra):
+        transcript.write_text("".join(json.dumps(e) + "\n" for e in entries))
+        data = {"hook_event_name": "Stop", "session_id": "s1", "cwd": "/work/proj",
+                "transcript_path": str(transcript), **extra}
+        monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(data)))
+        hook.main()
+        out = capsys.readouterr().out
+        return json.loads(out) if out.strip() else None
+    stop.run = run
+    stop.config = config
+    return stop
+
+
+def test_a_working_turn_without_a_report_is_blocked_once(in_run):
+    turn = [entry("user", "fix #12", uuid="p1"), tool("Bash"), RESULT,
+            entry("assistant", [{"type": "text", "text": "done"}])]
+
+    out = in_run(*turn)
+    assert out["decision"] == "block"
+    assert "worker turn used tools but sent no report" in out["reason"]
+    assert "mcp__orch__report" in out["reason"] and "\n" not in out["reason"]
+    # The agent continues; its Stop then comes with stop_hook_active, or (another hook's
+    # continuation) without it: neither is blocked again for the same turn.
+    feedback = entry("user", "Stop hook feedback: ...", isMeta=True)
+    assert in_run(*turn, feedback, entry("assistant", [{"type": "text", "text": "ok"}]),
+                  stop_hook_active=True) is None
+    assert in_run(*turn, feedback, entry("assistant", [{"type": "text", "text": "ok"}])) is None
+    # The next working turn without a report is blocked again.
+    assert in_run(*turn, entry("user", "next task", uuid="p2"), tool("Edit"), RESULT)
+
+
+def test_a_turn_that_reported_is_not_blocked(in_run):
+    assert in_run(entry("user", "fix #12"), tool("Bash"), RESULT, tool("mcp__orch__report"),
+                  RESULT, entry("assistant", [{"type": "text", "text": "done"}])) is None
+
+
+def test_a_chat_only_turn_is_not_blocked(in_run):
+    assert in_run(entry("user", "fix #12"), tool("Bash"), RESULT,
+                  entry("user", "what is the status?", uuid="p2"),
+                  entry("assistant", [{"type": "text", "text": "3 of 5 done"}])) is None
+
+
+def test_no_report_is_asked_outside_an_active_run(in_run):
+    turn = [entry("user", "fix #12"), tool("Bash"), RESULT]
+    in_run.run.write_text(json.dumps({"orchestrator": "w1:p0", "until": time.time() + 3600,
+                                      "ended": time.time() - 5, "workers": {PANE: {}}}))
+    assert in_run(*turn) is None
+    in_run.run.write_text(json.dumps({"orchestrator": "w1:p0", "until": time.time() + 3600,
+                                      "ended": None, "workers": {"w1:p7": {}}}))
+    assert in_run(*turn) is None
+
+
+def test_no_report_is_asked_when_the_orch_server_is_missing(in_run):
+    (in_run.config / ".claude.json").write_text(json.dumps({"mcpServers": {}}))
+    assert in_run(entry("user", "fix #12"), tool("Bash"), RESULT) is None
+
+
+def test_no_report_is_asked_while_a_handoff_is_underway(hook, in_run):
+    state = hook.ROOT / "state" / "s1.json"
+    state.parent.mkdir(parents=True, exist_ok=True)
+    state.write_text(json.dumps({"dir": "/nowhere", "soft": 1.0, "stop_soft": True,
+                                 "respawned": 2.0}))  # the takeover is starting
+    assert in_run(entry("user", "fix #12"), tool("Bash"), RESULT) is None
+
+
+def test_the_orchestrator_is_asked_for_its_fields(in_run):
+    in_run.run.write_text(json.dumps({"orchestrator": PANE, "until": time.time() + 3600,
+                                      "ended": None, "workers": {}}))
+    out = in_run(entry("user", "orch wait returned"), tool("Bash"), RESULT)
+    assert "this orchestrator turn" in out["reason"]
+
+
+def test_the_status_file_keeps_the_report_and_records_the_account(hook, run, monkeypatch,
+                                                                   tmp_path):
+    monkeypatch.setattr(hook, "IN_HERDR", True)
+    monkeypatch.setenv("HERDR_PANE_ID", PANE)
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(Path.home() / ".claude-2"))
+    monkeypatch.setattr(hook, "claude_pid", os.getpid)  # cmdline: this pytest
+    path = hook.status_path(PANE)
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps({"pane": PANE, "report": {"summary": "fixed #12"}}))
+
+    run("Stop", tokens=1000, effort={"level": "high"})
+
+    status = json.loads(path.read_text())
+    assert status["report"] == {"summary": "fixed #12"} and status["account"] == "2"
+    assert status["pid"] == os.getpid() and status["relaunch"][-2:] == ["--effort", "high"]
+    assert status["relaunch"][-4:-2] == ["--model", "claude-opus-5-5"]
+
+
+@pytest.mark.parametrize("config_dir, account", [
+    (None, "1"), ("~/.claude", "1"), ("~/.claude-2", "2"), ("~/.claude-2/", "2"),
+    ("/opt/other", "/opt/other")])
+def test_account_of(hook, config_dir, account):
+    assert hook.account_of(config_dir) == account
+
+
+# --- account switches ---------------------------------------------------------------------------
+
+def test_a_queued_account_switch_applies_at_the_takeover(hook, run, monkeypatch, tmp_path,
+                                                         herdr_stub):
+    monkeypatch.setattr(hook, "IN_HERDR", True)
+    monkeypatch.setenv("HERDR_PANE_ID", PANE)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    started, popen = [], hook.subprocess.Popen
+    monkeypatch.setattr(hook, "claude_pid", os.getpid)
+    monkeypatch.setattr(hook.subprocess, "Popen", lambda args, **kw: started.append(args))
+    (hook.ROOT / "accounts.json").parent.mkdir(parents=True, exist_ok=True)
+    (hook.ROOT / "accounts.json").write_text(json.dumps({"switch": {PANE: {"account": "2"}}}))
+    run("PostToolUse", tokens=450_000)
+    [lineage] = lineages(hook)
+    write_handoff(lineage)
+    append(lineage / "decisions.md", "- D1 a decision\n")
+
+    run("Stop", tokens=450_000)
+
+    job = json.loads(started[0][-1])
+    assert job["env"]["CLAUDE_CONFIG_DIR"] == str(tmp_path / ".claude-2")
+    assert job["account"] == "2"
+    monkeypatch.setattr(hook.subprocess, "Popen", popen)  # the respawn runs herdr for real
+    monkeypatch.setattr(hook.time, "sleep", lambda seconds: None)
+    job["pid"] = os.getpid()  # not claude: nothing is signalled
+    assert hook.respawn(job) is True
+    calls, _ = herdr_stub
+    [command] = [c[3] for c in calls() if c[:2] == ["pane", "run"]]
+    assert f"CLAUDE_CONFIG_DIR={tmp_path / '.claude-2'} claude " in command
+    assert json.loads((hook.ROOT / "accounts.json").read_text())["switch"] == {}
+    events = [json.loads(x) for x in (hook.ROOT / "events.jsonl").read_text().splitlines()]
+    assert [e["kind"] for e in events] == ["respawn", "account"]
+    assert events[-1]["account"] == "2" and events[-1]["when"] == "handoff"
+
+
+@pytest.fixture
+def switch(hook, tmp_path, monkeypatch, herdr_stub):
+    """An idle agent in the pane and a resume job for account 2, as orch account --now sends."""
+    monkeypatch.setattr(hook.time, "sleep", lambda seconds: None)
+    acc = tmp_path / "bin" / "claude-acc"
+    acc.write_text("#!/bin/sh\n")
+    acc.chmod(0o755)
+    job = {"pane": PANE, "pid": os.getpid(), "resume": "s1", "account": "2",
+           "args": ["--dangerously-skip-permissions", "--model", "claude-haiku-5-5"],
+           "session": "s1", "created": 0}
+    return job, acc
+
+
+def test_account_switch_now_resumes_the_session_on_the_other_account(hook, switch, herdr_stub):
+    job, acc = switch
+    calls, _ = herdr_stub
+
+    assert hook.respawn(job) is True
+
+    assert ["agent", "prompt", PANE, "/exit"] in calls()
+    [command] = [c[3] for c in calls() if c[:2] == ["pane", "run"]]
+    assert command == f"{acc} 2 --resume s1 --model claude-haiku-5-5"
+    assert ["agent", "rename", PANE, "w1"] in calls()
+    assert prompts(calls) == []  # no takeover prompt: the resumed agent waits
+    [event] = [json.loads(x) for x in (hook.ROOT / "events.jsonl").read_text().splitlines()]
+    assert event["kind"] == "account" and event["when"] == "now" and event["account"] == "2"
+    hook.respawn(dict(job, when="idle"))  # carried out by the watchdog for --when-idle
+    assert json.loads((hook.ROOT / "events.jsonl").read_text().splitlines()[-1])["when"] == "idle"
+    assert "switched w1 to account 2" in (hook.ROOT / "respawn.log").read_text()
+
+
+def test_account_switch_now_refuses_a_busy_agent(hook, switch, herdr_stub, capsys):
+    job, _ = switch
+    calls, configure = herdr_stub
+    configure(old="working")
+
+    assert hook.respawn(job) is False
+
+    assert ["agent", "prompt", PANE, "/exit"] not in calls()
+    assert "not idle" in capsys.readouterr().err
+    assert not (hook.ROOT / "events.jsonl").exists()
+
+
+def test_account_switch_now_refuses_with_background_tasks(hook, switch, herdr_stub):
+    job, _ = switch
+    calls, _ = herdr_stub
+    status = hook.status_path(PANE)
+    status.parent.mkdir(parents=True)
+    status.write_text(json.dumps({"session": "s1", "time": time.time() - 600,
+                                  "background_tasks": [{"type": "bash"}]}))
+
+    assert hook.respawn(job) is False
+    assert ["agent", "prompt", PANE, "/exit"] not in calls()
+
+
+def test_account_switch_now_reports_a_dialog_in_the_new_agent(hook, switch, herdr_stub, capsys):
+    job, _ = switch
+    calls, configure = herdr_stub
+    configure(new="blocked")  # e.g. account 2 has not trusted this folder yet
+
+    assert hook.respawn(job) is False
+
+    err = capsys.readouterr().err
+    assert "at a dialog in the pane" in err and "folder trust" in err
+    assert len([c for c in calls() if c[:2] == ["agent", "list"]]) < 10  # did not wait 90 s
+    [event] = [json.loads(x) for x in (hook.ROOT / "events.jsonl").read_text().splitlines()]
+    assert event["kind"] == "account-failed"
