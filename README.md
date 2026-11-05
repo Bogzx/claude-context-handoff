@@ -309,7 +309,8 @@ first. The gateway's `start` action runs the same code. Each step is `doing`, `o
    `HANDOFF_LINEAGE` pointing at the new log. `--name` names the herdr agent.
 3. `trust`, only when the new agent stops at a dialog (Claude Code's folder trust question on that account): it
    waits up to 15 minutes for an answer in the pane, as a takeover does. From the CLI it also pushes
-   `respawn-dialog`.
+   `respawn-dialog`. The screen counts as well as herdr's status, which can read idle at the question: nothing is
+   typed into a pane that shows a dialog.
 4. `run`: the run is registered (goal, `--until`, cwd, no workers) with the start's settings in `run.settings`.
 5. `brief`, or `read` with `--plan-first`: the agent is prompted to read the brief, with the same Enter-and-resend
    check as a takeover prompt. With `--plan-first` the brief asks for a roadmap in a `report` and

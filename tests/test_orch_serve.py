@@ -846,8 +846,9 @@ def test_a_start_is_refused_outside_the_roots_in_excluded_or_busy_folders(world,
 def test_a_start_runs_once_per_id(world, monkeypatch):
     allow_starts(world, monkeypatch)
     gw = world.serve.Gateway()
-    first = world.post(gw, **start_action(id="st1"))
-    assert world.post(gw, **start_action(id="st1")) == first  # the app's retry
+    action = start_action(id="st1", time=world.t)
+    first = world.post(gw, **action)
+    assert world.post(gw, **action) == first  # the app's retry: the same body
     other = world.post(gw, **start_action(id="st1", goal="Something else"))
     assert other[0] == 409 and "already used" in other[1]["error"]
     (world.root / "gateway-actions.json").unlink()  # the action log forgot it: the start didn't
@@ -968,11 +969,12 @@ def test_retry_runs_a_failed_start_again_from_its_failed_step(world, monkeypatch
     world.tab_ok = False
     assert world.post(gw, **start_action(id="st1"))[0] == 502
     world.tab_ok = True
+    at = world.t
     assert world.post(gw, id="r1", kind="start_retry", action="st1")[0] == 202
     rec = world.orch.load(world.orch.STARTS / "st1" / "new.json")
     assert [(s["step"], s["status"]) for s in rec["steps"]] == [
         ("pane", "ok"), ("claude", "ok"), ("run", "ok"), ("read", "doing")]
-    assert rec["retries"] == [{"time": world.t, "by": "the app", "step": "pane", "account": "2"}]
+    assert rec["retries"] == [{"time": at, "by": "the app", "step": "pane", "account": "2"}]
     again = world.post(gw, id="r2", kind="start_retry", action="st1")
     assert again[0] == 409 and "has not failed" in again[1]["error"]
 
@@ -984,10 +986,12 @@ def test_retry_on_another_account_restarts_claude_after_nobody_trusted_the_folde
     world.screen = TRUST
     run = world.herdr
 
-    def herdr(*args, **kw):  # Claude on account 2 stops at the trust question
+    def herdr(*args, **kw):  # Claude on account 2 stops at the trust question, on 1 it doesn't
         out = run(*args, **kw)
         if args[:2] == ("pane", "run") and " 2 --session-id " in args[3]:
             world.agents[args[2]]["agent_status"] = "blocked"
+        elif args[:2] == ("pane", "run"):
+            world.screen = ""
         return out
 
     monkeypatch.setattr(world.orch, "herdr", herdr)
@@ -1034,6 +1038,7 @@ def test_retry_picks_up_a_start_whose_process_died(world, monkeypatch):
     gone.wait()
     world.orch.save(path, dict(world.orch.load(path), pid=gone.pid))  # killed meanwhile
     world.agents[NEW]["agent_status"] = "idle"  # and the question was answered in the pane
+    world.screen = ""
     allow_starts(world, monkeypatch)  # the retry runs in-process
     assert world.post(gw, id="r2", kind="start_retry", action="st1")[0] == 202
     rec = world.orch.load(path)
@@ -1421,6 +1426,7 @@ def test_start_steps_become_start_pushes_high_only_when_one_failed(world, cloud,
     pair(world, gw)
     gw.pusher.cycle()
     cloud.pushes.clear()
+    at = world.t
     world.post(gw, **start_action(id="st1", plan_first=False))
     gw.pusher.cycle()
     starts = [p for p in cloud.pushes if p["message"]["kind"] == "start"]
@@ -1430,7 +1436,7 @@ def test_start_steps_become_start_pushes_high_only_when_one_failed(world, cloud,
     assert starts[0]["android"] == {"priority": "NORMAL", "ttl": "86400s"}  # not collapsed
     assert starts[0]["message"]["orchestrator"] == NEW
     assert starts[0]["message"]["body"] == {"action": "st1", "pane": NEW, "step": "pane",
-                                            "status": "ok", "error": None, "time": world.t}
+                                            "status": "ok", "error": None, "time": at}
     seqs = [p["message"]["seq"] for p in starts]
     assert seqs == sorted(set(seqs))  # each counts
     cloud.pushes.clear()

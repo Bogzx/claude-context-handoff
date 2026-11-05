@@ -41,6 +41,7 @@ import orch
 READY_WAIT = 90  # seconds for the new agent to come up, as a takeover's
 EXIT_WAIT = 15  # seconds for a Claude to quit (cancel, or a restart on another account)
 BLOCKED_POLLS = 3  # one-second polls at a dialog before it counts as waiting there
+SETTLE = 2  # seconds an idle agent gets for a late dialog to show before it is typed into
 WORD = re.compile(r"[A-Za-z0-9._\[\]-]{1,64}")  # model, effort, name: nothing for a shell
 
 PLAN_FIRST = """\
@@ -385,8 +386,9 @@ def start(rec, dry=False):
 
         current = "read" if rec["plan_first"] else "brief"
         text = f"Read {rec['brief']} and do it."
-        if not dry and not deliver(pane, text):
-            step(current, "failed", f"the agent in {pane} did not start on {text!r} (sent twice)")
+        problem = "" if dry else deliver(pane, text)
+        if problem:
+            step(current, "failed", problem)
             return 1
         step(current, "doing" if rec["plan_first"] else "ok",
              "reading the folder and writing the plan" if rec["plan_first"]
@@ -403,20 +405,35 @@ def start(rec, dry=False):
         return 1
 
 
+def at_dialog(pane):
+    """Whether the screen ends with one of Claude Code's dialogs ("Enter to confirm · Esc to
+    cancel", "Esc to cancel · Tab to amend"). herdr can call a new agent idle while it shows
+    the folder-trust question, and typing there answers it."""
+    words = " ".join(orch.screen_lines(pane, 40, "visible") or []).split()
+    return "Esc to cancel" in " ".join(words[-8:])  # words: a narrow pane wraps the line
+
+
 def ready(rec, pane, dialog_wait, step, trust=False):
     """Wait for the new agent: "ready", or "claude"/"trust" for the step that timed out. Up to
     READY_WAIT seconds, or dialog_wait once it sits at a dialog (the `trust` step; `trust`: it
     was there already, a retry)."""
+    def status():
+        now = ((orch.agents() or {}).get(pane) or {}).get("agent_status")
+        return "blocked" if now in ("idle", "done") and at_dialog(pane) else now
+
     blocked = 0
     deadline = orch.now() + (dialog_wait if trust else READY_WAIT)
     while orch.now() < deadline:
         if orch.start_cancelled(rec):
             raise Cancelled
-        state = ((orch.agents() or {}).get(pane) or {}).get("agent_status")
+        state = status()
         if state in ("idle", "done"):
-            if trust:
-                step("trust", "ok", "answered")
-            return "ready"
+            orch.sleep(SETTLE)
+            state = status()
+            if state in ("idle", "done"):
+                if trust:
+                    step("trust", "ok", "answered")
+                return "ready"
         blocked = blocked + 1 if state == "blocked" else 0
         if blocked == BLOCKED_POLLS and not trust:
             trust = True
@@ -434,18 +451,21 @@ def ready(rec, pane, dialog_wait, step, trust=False):
 
 def deliver(pane, text):
     """Prompt the agent and check that it started: Enter if the text sits in the input box,
-    then the prompt once more."""
+    then the prompt once more. "" once it started, else what went wrong. Nothing is typed while
+    a dialog shows: a retry comes here without ready(), and Enter would answer the dialog."""
     def started():
         return orch.herdr("agent", "wait", pane, "--until", "working", "--timeout", "30000",
                           timeout=60).returncode == 0
-    orch.prompt(pane, text)
-    if started():
-        return True
-    orch.herdr("agent", "send-keys", pane, "enter")
-    if started():
-        return True
-    orch.prompt(pane, text)
-    return started()
+
+    for send in (lambda: orch.prompt(pane, text),
+                 lambda: orch.herdr("agent", "send-keys", pane, "enter"),
+                 lambda: orch.prompt(pane, text)):
+        if at_dialog(pane):
+            return f"the agent in {pane} is at a dialog: answer it there, then retry"
+        send()
+        if started():
+            return ""
+    return f"the agent in {pane} did not start on {text!r} (sent twice)"
 
 
 
@@ -456,7 +476,7 @@ def exit_agent(pane):
         return ((orch.agents() or {}).get(pane) or {}).get("agent_status")
 
     now = state()
-    keys = trust_keys(orch.screen_lines(pane, 40, "visible"), "deny") if now == "blocked" else None
+    keys = trust_keys(orch.screen_lines(pane, 40, "visible"), "deny") if now else None
     if keys:
         orch.herdr("agent", "send-keys", pane, *keys)
     elif now:

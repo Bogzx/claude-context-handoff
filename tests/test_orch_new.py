@@ -21,11 +21,13 @@ def done(code=0, stdout=""):
 class Herdr:
     """herdr as orch new sees it: `tab create` gives pane w1:p7; once a command runs there its
     agent goes through `states`, one per poll (the last one stays), and works once prompted
-    `start_on` times."""
+    `start_on` times. `screens` is what `agent read` shows, one per read (the last one stays);
+    `prompted_screen` replaces them after a prompt."""
 
     def __init__(self):
         self.calls, self.prompts = [], []
         self.states, self.agent, self.start_on = ["idle"], None, 1
+        self.screens, self.prompted_screen = [""], None
 
     def __call__(self, *args, timeout=60):
         self.calls.append(args)
@@ -36,6 +38,8 @@ class Herdr:
             self.agent = "starting"
         if args[:2] == ("agent", "wait"):
             return done(0 if self.agent == "working" else 1)
+        if args[:2] == ("agent", "read"):
+            return done(stdout=self.screens.pop(0) if len(self.screens) > 1 else self.screens[0])
         return done()
 
     def agents(self):
@@ -49,6 +53,8 @@ class Herdr:
         self.prompts.append((pane, text))
         if len(self.prompts) >= self.start_on:
             self.agent = "working"
+        if self.prompted_screen is not None:
+            self.screens = [self.prompted_screen]
         return True
 
 
@@ -150,7 +156,7 @@ def test_new_starts_an_orchestrator_with_its_brief_log_and_run(world, capsys):
     assert world.herdr.prompts == [(PANE, f"Read {rec['brief']} and do it.")]
     run = world.orch.load_run(PANE)
     assert run["cwd"] == str(world.folder) and run["goal"] == "Ship the beta"
-    assert run["until"] == world.t + 8 * 3600 and run["workers"] == {}
+    assert run["until"] == T0 + 8 * 3600 and run["workers"] == {}
     assert run["settings"] == {"folder": str(world.folder), "worktree": False,
                                "model": "sonnet", "effort": "high", "worker_model": "haiku",
                                "max_workers": 3, "plan_first": True, "account": "2"}
@@ -247,6 +253,76 @@ def test_the_prompt_is_checked_then_sent_again(world):
 
     assert ("agent", "send-keys", PANE, "enter") in world.herdr.calls
     assert len(world.herdr.prompts) == 2
+
+
+# Claude Code 2.1.318's folder-trust question in a narrow pane (the footer wraps).
+TRUST_NARROW = """\
+ Accessing workspace:
+ /home/me/Repo/my-app
+ Quick safety check: Is this
+ a project you created or
+ one you trust?
+ Security guide
+ ❯ No, exit
+   Yes, I trust this folder
+ Enter to confirm · Esc to
+ cancel
+"""
+
+
+def typed(herdr):
+    return herdr.prompts + [c for c in herdr.calls if c[:2] == ("agent", "send-keys")]
+
+
+def test_a_start_never_types_into_a_trust_question_that_herdr_calls_idle(world):
+    world.herdr.screens = [TRUST_NARROW]  # nobody answers it
+
+    assert world.run("--id", "r1") == 1
+
+    assert typed(world.herdr) == []
+    assert world.steps()[-2:] == [("trust", "doing"), ("trust", "failed")]
+    assert world.orch.load_run(PANE) == {}
+
+
+def test_a_trust_question_that_shows_after_idle_holds_the_brief_until_it_is_answered(world):
+    world.herdr.screens = [""] + [TRUST_NARROW] * 10 + [""]  # herdr says idle all along
+
+    assert world.run("--id", "r1") == 0
+
+    assert world.steps()[1:4] == [("claude", "doing"), ("trust", "doing"), ("trust", "ok")]
+    assert len(world.herdr.prompts) == 1
+
+
+def test_a_dialog_that_shows_after_the_prompt_gets_no_enter(world):
+    world.herdr.start_on, world.herdr.prompted_screen = 2, TRUST_NARROW
+
+    assert world.run("--id", "r1") == 1
+
+    assert len(typed(world.herdr)) == 1  # only the prompt: Enter would pick "No, exit"
+    assert world.steps()[-1] == ("brief", "failed")
+    assert "at a dialog" in world.record()["error"]
+
+
+def test_a_retried_brief_is_not_typed_into_a_dialog(world):
+    world.herdr.start_on = 3  # the first brief never starts: the start fails at it
+    assert world.run("--id", "r1") == 1
+    assert world.steps()[-1] == ("brief", "failed")
+    world.herdr.prompts, world.herdr.screens = [], [TRUST_NARROW]
+    world.herdr.calls.clear()
+
+    assert world.new.start(world.record()) == 1
+
+    assert typed(world.herdr) == [] and "at a dialog" in world.record()["error"]
+
+
+def test_a_quit_answers_a_trust_question_that_herdr_calls_idle(world):
+    world.herdr.agent, world.herdr.screens = "idle", [TRUST_NARROW]
+    world.herdr.states = []
+
+    world.new.exit_agent(PANE)
+
+    assert world.herdr.prompts == []  # /exit would land in the question
+    assert ("agent", "send-keys", PANE, "enter") in world.herdr.calls
 
 
 def test_a_worktree_start_works_in_a_new_branch_next_to_the_folder(world, tmp_path):
