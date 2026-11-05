@@ -265,9 +265,12 @@ an agent started on account 1 while the rule is active is moved by the watchdog 
 
 The rule's progress shows as `spill` in `orch status --json` and the gateway's fleet (when it fired, `moved` of
 `total`). Each agent also gets a `spill` entry:
-- `moved_idle` or `moved_limit`, with how (handoff or resume) and when;
+- `moved_idle` or `moved_limit`, with how (handoff, resume or by hand) and when;
 - `waiting`, with what on: working, own job running, writing its handoff, or the next watchdog pass;
 - `cant_move`, with the error. A resume that failed is not retried until the rule fires again.
+
+An agent found running on the target anyway, because its pane was restarted there or its dialog was answered, counts
+as moved by hand.
 
 ### Usage
 

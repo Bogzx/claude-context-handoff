@@ -1172,7 +1172,7 @@ def idle_switches(ags, claudes, dry_run):
         if sw.get("when") != "idle" or (agent or {}).get("agent_status") not in ("idle", "done"):
             continue
         if (claudes.get(pane) or (None, None))[1] == str(sw["account"]):
-            drop_switch(pane)  # already there
+            already_there(pane, sw)
             continue
         session = (agent.get("agent_session") or {}).get("value")
         st = status_of(pane)
@@ -1215,7 +1215,7 @@ def idle_switches(ags, claudes, dry_run):
         if error:
             drop_switch(pane)
             if sw.get("reason"):
-                path_failed(pane, sw["account"], error)
+                path_failed(pane, sw["account"], error, sw["reason"])
             emit("account", f"Account switch dropped: {pane}", error, pane,
                  account=sw["account"], when="idle")
 
@@ -1238,10 +1238,29 @@ def mark_switch(pane, **fields):
         save(path, acc)
 
 
-def path_failed(pane, account, error):
+def path_failed(pane, account, error, reason):
     path = ROOT / "accounts.json"
     acc = load(path)
-    acc.setdefault("failed", {})[pane] = {"account": account, "time": now(), "error": error}
+    acc.setdefault("failed", {})[pane] = {"account": account, "time": now(), "error": error,
+                                          "reason": reason}
+    save(path, acc)
+
+
+def moved_by_hand(acc, pane, account, reason):
+    """The agent got to the account without the rule: its pane was restarted there, or the
+    dialog its resume stopped at was answered."""
+    acc.setdefault("moved", {})[pane] = {"account": account, "time": now(), "how": "by hand",
+                                         "reason": reason}
+    (acc.get("failed") or {}).pop(pane, None)
+
+
+def already_there(pane, sw):
+    """Drop the pending switch of an agent that runs on its account."""
+    path = ROOT / "accounts.json"
+    acc = load(path)
+    (acc.get("switch") or {}).pop(pane, None)
+    if sw.get("reason"):
+        moved_by_hand(acc, pane, sw["account"], sw["reason"])
     save(path, acc)
 
 
@@ -1325,8 +1344,10 @@ def spill_pass(ags, claudes, dry_run):
                  "new agents on it stay there", None)
     switches = acc.setdefault("switch", {})
     for pane, agent in sorted(ags.items()):
-        if ((claudes.get(pane) or (None, None))[1] != rule["from"]
-                or pane in (acc.get("failed") or {})):  # can't move: shown, not retried
+        on, failed = (claudes.get(pane) or (None, None))[1], (acc.get("failed") or {}).get(pane)
+        if failed and on == rule["to"]:
+            moved_by_hand(acc, pane, on, failed.get("reason") or "spill")
+        if on != rule["from"] or failed:  # can't move: shown, not retried
             continue
         sw = switches.get(pane)
         limit = (agent.get("agent_status") in ("idle", "done")

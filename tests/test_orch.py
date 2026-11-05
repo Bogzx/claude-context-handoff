@@ -994,6 +994,51 @@ def test_spill_states_per_agent_and_the_runs_progress(world, accounts, capsys, t
     assert W2 not in json.loads((world.root / "accounts.json").read_text())["switch"]
 
 
+def test_an_agent_moved_by_hand_counts_as_moved_and_is_no_longer_cant_move(
+        world, accounts, capsys, tmp_path, monkeypatch):
+    # 2026-11-05: one agent's resume stopped at the trust question, which was answered in the
+    # pane; another was restarted by hand. Both ran on the target and the rule didn't know.
+    monkeypatch.setattr(world.orch, "PROJECTS", tmp_path / "projects")
+    start_run(world)
+    world.agent(BOSS, "working")
+    idle_with_status(world, W1)
+    world.agent(W2, "working")
+    world.turn_end(W2)
+
+    def runs_on(pane, account):
+        path = world.root / "agents" / f"{pane.replace(':', '-')}.json"
+        path.write_text(json.dumps(dict(json.loads(path.read_text()), pid=4242, account=account,
+                                        session=f"s-{pane}", context_tokens=20_000)))
+
+    runs_on(W2, "1")
+    world.run("account", "--spill", "1:98:2")
+    usage_at(world, 98)
+    monkeypatch.setattr(world.orch, "run_switch", lambda job: type(
+        "R", (), {"returncode": 1, "stderr": "the new agent is at a dialog"})())
+    world.run("watchdog")
+    capsys.readouterr()
+    world.run("status", "--json")
+    status = json.loads(capsys.readouterr().out)
+    assert [w["spill"]["state"] for w in status["workers"]] == ["cant_move", "waiting"]
+    assert (status["spill"]["moved"], status["spill"]["total"]) == (0, 2)
+
+    runs_on(W1, "2")  # someone answered it, and restarted the other one
+    runs_on(W2, "2")
+    world.agent(W2, "idle")
+    world.t += 300
+    usage_at(world, 98)
+    world.run("watchdog")
+    capsys.readouterr()
+    world.run("status", "--json")
+    status = json.loads(capsys.readouterr().out)
+
+    assert [w["spill"] for w in status["workers"]] == [
+        {"state": "moved_idle", "reason": "by hand", "time": world.t, "account": "2"}] * 2
+    assert (status["spill"]["moved"], status["spill"]["total"]) == (2, 2)
+    acc = json.loads((world.root / "accounts.json").read_text())
+    assert acc["failed"] == {} and acc["switch"] == {}
+
+
 def transcript(world, session, *entries):
     path = world.orch.PROJECTS / "-work-proj" / f"{session}.jsonl"
     path.parent.mkdir(parents=True, exist_ok=True)
