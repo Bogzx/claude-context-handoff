@@ -135,6 +135,7 @@ the whole fleet overnight (11.8 h), and "today's work is done" with three worker
 | `orch account [<pane> <N>] [--now \| --when-idle \| --at-handoff]`, `orch account --default N` | Which Claude account (`claude-acc N`) an agent runs on, and moving it to another one (see Accounts). |
 | `orch usage [--json] [--hours 24]`, `orch usage capture` | Account limits and tokens per agent (see Usage). |
 | `orch watchdog [--dry-run]` | One watchdog pass. A systemd user timer runs it every 5 minutes. |
+| `orch serve`, `orch pair [--allow NODE] [--new]` | The HTTP gateway for the owner's phone app, and its pairing token (see Gateway). |
 
 Inside herdr, the Stop hook writes `~/.claude/handoffs/agents/<pane>.json` at every turn end, with the session, the
 background tasks still running and the last message. SessionStart writes it too. This is how `orch` tells a finished
@@ -174,7 +175,7 @@ as `orch`. It takes the agent's pane from `HERDR_PANE_ID` and offers no tools ou
 
   | Role | Fields |
   | --- | --- |
-  | orchestrator | `state` (`working`, `waiting_on_workers`, `waiting_on_owner`, `done`), `progress` {`done`, `total`, `label`}, `waiting_on` [{`who`, `what`, `eta`}], `next` [text], `roadmap` [{`id`, `title`, `status` (`done`, `doing`, `next`, `later`, `blocked`), `owner`, `eta`}], `risks` [text], `milestones` [{`kind` (`pr_merged`, `deploy`, `release`, `other`), `ref`, `url`}] |
+  | orchestrator | `state` (`working`, `waiting_on_workers`, `waiting_on_owner`, `done`), `progress` {`done`, `total`, `label`}, `waiting_on` [{`who`, `what`, `eta`}], `next` [text], `roadmap` [{`id`, `title`, `status` (`done`, `doing`, `next`, `later`, `blocked`), `owner`, `eta`, `why`}], `risks` [text], `milestones` [{`kind` (`pr_merged`, `deploy`, `release`, `other`), `ref`, `url`}], `suggestions` [text: messages the owner might send next] |
   | worker | `status` (`done`, `partial`, `blocked`), `tests` [{`cmd`, `passed`, `failed`}], `changed_files`, `needs_live_test`, `issues_for_others` [text] |
 
   `role` is taken from the pane's run (orchestrator or worker) unless the call sets it. A report that doesn't fit the
@@ -238,6 +239,41 @@ shares only count this machine. Transcripts are read incrementally (`usage-cache
 buckets for 8 days, and older files are skipped). On dev1, with 4.4 GB of transcripts, the first pass took 7 s and
 the next one under a second.
 
+### Gateway (orch serve)
+
+`hooks/orch_serve.py` is the HTTP gateway the phone app (orch-app) calls on each machine. The contract is orch-app's
+`docs/API.md` (v1). It uses only the standard library and runs on Python 3.8.
+
+- It listens on port 7433, on the machine's Tailscale IPv4 (`tailscale ip -4`) only, never on 0.0.0.0, and won't
+  start without one.
+- A request must come from a tailnet node in the allow-list, checked with `tailscale whois` against the node's
+  StableID, short name or full name. It must also carry the pairing token as `Authorization: Bearer <token>`. An
+  unknown node gets 403 and a missing or wrong token gets 401, both with an empty body.
+- `orch pair --allow <phone's tailnet name>` writes the token and the allow-list to `~/.config/orch/.env` (mode 600,
+  directory 700) and prints the token and a pairing string for a QR code (`orch://pair?machine=...&addr=...&port=7433&token=...`).
+  Run it again to change the list; `--new` replaces the token. The same file can name the accounts:
+  `ORCH_ACCOUNT_NAMES=1=pibo1,2=pibo2`. The gateway reads the file on every request, so changes take effect without a
+  restart.
+- `orch serve --allow-self` also admits the machine's own node. It is off by default and meant for a local test.
+- Reads: `GET /v1/fleet` (runs with their orchestrator and workers, reports, open questions, blocked dialogs with the
+  screen text, stall reasons with proposed fixes, accounts with today's samples, pending switches, recent actions),
+  `/v1/usage?hours=168`, `/v1/orchestrators/<pane>/decisions`, `/v1/orchestrators/<pane>/history?since=&limit=`,
+  `/v1/panes/<pane>/screen?lines=15` and `/v1/actions/<id>`.
+- Writes: `POST /v1/actions`, one JSON action with the app's `id` (a UUID), `time` and `kind`: `prompt`, `answer`,
+  `interrupt` (Esc), `park`, `unpark`, `run` (`extend` from the current end, or `stop`), `nudge`, `account` (`now`,
+  `idle`, `handoff`), `default_account` or `ack` (decisions seen). An id runs once: a retry with the same body gets the
+  first result, and the same id with a different body is refused. Actions older than 10 minutes are refused. The
+  answer is 202 `delivered`, 4xx `rejected` or 502 `failed`, with a sentence the app can show. An action becomes
+  `picked` once its target agent starts a turn (for an agent that was already working, at its next state change). A
+  switch `now` runs in the background, and its action ends `picked` or `failed`.
+- The gateway appends every action, refused ones included, to `events.jsonl` as kind `action` with `source: "app"`.
+- `install.sh` installs `orch-serve.service` (systemd user unit) enabled but not started. It only runs once
+  `~/.config/orch/.env` exists: `orch pair`, then `systemctl --user start orch-serve`.
+
+Not in the gateway yet: answering a permission dialog (`dialog` is refused), the diff view, the activity lanes, the
+per-agent model and context size, and the FCM push sender and the relay poller. Those two go in `BACKGROUND` in
+`orch_serve.py`, next to the job that rescans the transcripts every 5 minutes so `/v1/usage` stays fast.
+
 ## Outside herdr
 
 There is no takeover. The user is told the handoff is ready. On `/clear` or after a compaction, SessionStart injects
@@ -258,7 +294,7 @@ cd claude-context-handoff
 ```
 
 `install.sh` copies `hooks/` into `~/.claude/hooks/`, links `~/.local/bin/orch` to `orch.py`, installs and starts the
-`orch-watchdog.timer` systemd user unit, registers the `orch` MCP server at user scope in every account
+`orch-watchdog.timer` systemd user unit, installs `orch-serve.service` enabled but not started (see Gateway), registers the `orch` MCP server at user scope in every account
 (`claude mcp add --scope user orch -- python3 ~/.claude/hooks/orch_mcp.py`, skipped where it is already there), and
 runs `context-handoff-install.py`, which merges the hooks and env into `~/.claude/settings.json`. For other hosts it copies the files to `~/.cache/claude-context-handoff` there and runs the
 same script. It is idempotent and backs up the settings to `settings.json.bak-<timestamp>`
@@ -307,6 +343,8 @@ All under `~/.claude/handoffs/`:
 - `runs/<orchestrator pane>.json`: an `orch` run (end time, goal, workers, parked workers, questions with their ids,
   options and answers), and `runs/<pane>.seen.json`, the events its waits already reported.
 - `accounts.json`: pending account switches and the default account.
+- `gateway-actions.json`: the gateway's actions of the last 24 h by id (result, status), and `decisions-seen.json`,
+  the decisions the app marked as seen.
 - `usage.json` (latest limits per account, and each session's account), `usage-history.jsonl`, `usage-cache.json`.
 - `events.jsonl`: takeovers, failures, nudges, alerts and run changes. `watchdog.json`: the watchdog's memory.
 - `archive/` and `<project-path>--<pane>.md`: the flat layout used before 2026-10-26. The hook no longer reads them.

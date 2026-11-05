@@ -19,6 +19,8 @@ at every turn end (background tasks still running, last message). From those two
   orch account    which Claude account (claude-acc N) an agent runs on, and switching it: now,
                   when it is next idle (the watchdog does it) or at its next handoff.
   orch usage      account windows from the statusline and tokens per agent (orch_usage.py).
+  orch serve      the HTTP gateway for the owner's phone app, on the tailnet only, and
+  orch pair       its pairing token (orch_serve.py).
 
 Agents report at turn end through the orch MCP server (orch_mcp.py), into
 ~/.claude/handoffs/agents/<pane>.json next to the Stop hook's status.
@@ -93,9 +95,17 @@ def save(path, data):
     os.replace(tmp, path)
 
 
+class Refused(SystemExit):
+    """Why a command can't be carried out: the CLI prints it and exits 2, the gateway (orch
+    serve) answers the app with it."""
+
+    def __init__(self, text):
+        super().__init__(2)
+        self.text = text
+
+
 def die(text):
-    print(f"orch: {text}", file=sys.stderr)
-    sys.exit(2)
+    raise Refused(text)
 
 
 # --- herdr ------------------------------------------------------------------------------
@@ -303,10 +313,7 @@ def cmd_run(args):
     if args.action == "stop":
         run["ended"] = at
     if args.action != "show":
-        save(run_path(orch), run)
-        emit(f"run-{args.action}", f"Run {args.action}: {orch}",
-             f"until {clock(run['until'], True)}; {len(run['workers'])} workers; {run['goal']}",
-             orch)
+        save_run(orch, run, args.action)
     if args.json:
         print(json.dumps(run, indent=1))
         return 0
@@ -318,21 +325,34 @@ def cmd_run(args):
     return 0
 
 
-def cmd_park(args):
-    orch = orchestrator(args)
+def save_run(orch, run, action):
+    save(run_path(orch), run)
+    emit(f"run-{action}", f"Run {action}: {orch}",
+         f"until {clock(run['until'], True)}; {len(run['workers'])} workers; {run['goal']}", orch)
+
+
+def park(orch, pane, action, reason=None, until=None):
+    """Park (with a reason and an optional end) or unpark a worker of the orchestrator's run;
+    returns the run."""
     run = load_run(orch)
     if not run:
         die(f"no run registered for {orch}")
-    if args.pane not in run["workers"]:
-        die(f"{args.pane} is not a worker of this run (orch run set --add {args.pane}=label)")
-    if args.action == "unpark":
-        run.setdefault("parked", {}).pop(args.pane, None)
+    if pane not in run["workers"]:
+        die(f"{pane} is not a worker of this run (orch run set --add {pane}=label)")
+    if action == "unpark":
+        run.setdefault("parked", {}).pop(pane, None)
     else:
-        agent = (agents() or {}).get(args.pane) or {}
-        run.setdefault("parked", {})[args.pane] = {
-            "reason": args.reason, "since": now(), "seq": agent.get("completion_seq"),
-            "until": parse_until(args.until, now()) if args.until else None}
+        agent = (agents() or {}).get(pane) or {}
+        run.setdefault("parked", {})[pane] = {
+            "reason": reason, "since": now(), "seq": agent.get("completion_seq"),
+            "until": parse_until(until, now()) if until else None}
     save(run_path(orch), run)
+    return run
+
+
+def cmd_park(args):
+    run = park(orchestrator(args), args.pane, args.action, getattr(args, "reason", None),
+               getattr(args, "until", None))
     print(f"{args.action}ed {args.pane}" if args.action == "unpark" else
           f"parked {args.pane} until its next task"
           + (f" or {clock(run['parked'][args.pane]['until'])}" if args.until else ""))
@@ -410,21 +430,28 @@ def find_question(qid):
     return None, found
 
 
-def cmd_answer(args):
-    run, q = find_question(args.id)
+def answer(qid, text):
+    """Record the owner's answer to question qid and prompt the agent that asked; returns its
+    pane. A closed question or a failed prompt is refused and nothing is recorded."""
+    run, q = find_question(qid)
     if not q:
-        die(f"no question {args.id}")
+        die(f"no question {qid}")
     if q.get("answered"):
-        die(f"{args.id} was already answered at {clock(q['answered'], True)}: {q.get('answer')!r}")
+        die(f"{qid} was already answered at {clock(q['answered'], True)}: {q.get('answer')!r}")
     pane = q.get("pane") or (run or {}).get("orchestrator")
-    text = (f"The owner answered your question {args.id} ({first_line(q.get('text') or '', 160)!r}):"
-            f" {args.text}")
-    if not prompt(pane, text):
+    message = (f"The owner answered your question {qid} "
+               f"({first_line(q.get('text') or '', 160)!r}): {text}")
+    if not prompt(pane, message):
         die(f"could not prompt {pane}; the answer is not recorded")
-    q.update(answer=args.text, answered=now())
+    q.update(answer=text, answered=now())
     if run:
         save(run_path(run["orchestrator"]), run)
-    emit("answer", f"Answer to {args.id}", args.text, pane, id=args.id)
+    emit("answer", f"Answer to {qid}", text, pane, id=qid)
+    return pane
+
+
+def cmd_answer(args):
+    pane = answer(args.id, args.text)
     print(f"answered {args.id}; prompted {pane}")
     return 0
 
@@ -778,6 +805,16 @@ def cmd_decisions(args):
 
 # --- account switching -----------------------------------------------------------------------
 
+def account_list():
+    """Account number -> {dir, logged_in}: ~/.claude, then ~/.claude-2, ... while they exist."""
+    n, accounts = 1, {}
+    while account_dir(n).exists():
+        accounts[str(n)] = {"dir": str(account_dir(n)),
+                            "logged_in": (account_dir(n) / ".credentials.json").exists()}
+        n += 1
+    return accounts
+
+
 def check_account(account):
     if not re.fullmatch(r"\d+", account):
         die(f"accounts are numbers (claude-acc N), not {account!r}")
@@ -876,23 +913,13 @@ def run_switch(job):
 
 
 def cmd_account(args):
-    path = ROOT / "accounts.json"
-    acc = load(path)
-    at = now()
+    acc = load(ROOT / "accounts.json")
     if args.default:
-        check_account(args.default)
-        acc["default"] = args.default
-        save(path, acc)
-        emit("account", f"Default account: {args.default}", "for new agents", None,
-             account=args.default)
+        set_default(args.default)
         print(f"default account for new agents: {args.default}")
         return 0
     if not args.pane:
-        n, accounts = 1, {}
-        while account_dir(n).exists():
-            accounts[str(n)] = {"dir": str(account_dir(n)),
-                                "logged_in": (account_dir(n) / ".credentials.json").exists()}
-            n += 1
+        accounts = account_list()
         out = {"accounts": accounts, "default": acc.get("default") or "1",
                "switch": acc.get("switch") or {}}
         if args.json:
@@ -910,21 +937,51 @@ def cmd_account(args):
     check_account(args.account)
     if args.now:
         return switch_now(args.pane, args.account)
-    when = "idle" if args.when_idle else "handoff"
-    text = ("when it is next idle with no background tasks (the watchdog restarts it and resumes "
-            "the session)" if args.when_idle else "at its next handoff (no extra tokens)")
-    acc.setdefault("switch", {})[args.pane] = {"account": args.account, "time": at, "when": when}
-    save(path, acc)
-    emit("account", f"Account switch queued: {args.pane}",
-         f"moves to account {args.account} {text}", args.pane, account=args.account, when=when)
+    text = queue_switch(args.pane, args.account, "idle" if args.when_idle else "handoff")
     print(f"{args.pane} moves to account {args.account} {text}")
     return 0
+
+
+def set_default(account):
+    check_account(account)
+    path = ROOT / "accounts.json"
+    acc = load(path)
+    acc["default"] = account
+    save(path, acc)
+    emit("account", f"Default account: {account}", "for new agents", None, account=account)
+
+
+def queue_switch(pane, account, when):
+    """Move the pane's agent to account N when it is next idle ("idle", the watchdog does it) or
+    at its next handoff ("handoff"); returns how, in words."""
+    check_account(account)
+    path = ROOT / "accounts.json"
+    acc = load(path)
+    text = ("when it is next idle with no background tasks (the watchdog restarts it and resumes "
+            "the session)" if when == "idle" else "at its next handoff (no extra tokens)")
+    acc.setdefault("switch", {})[pane] = {"account": account, "time": now(), "when": when}
+    save(path, acc)
+    emit("account", f"Account switch queued: {pane}", f"moves to account {account} {text}", pane,
+         account=account, when=when)
+    return text
 
 
 def cmd_usage(args):
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     import orch_usage
     return orch_usage.main(args, ROOT, now(), agents)
+
+
+def cmd_serve(args):
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import orch_serve
+    return orch_serve.serve(args)
+
+
+def cmd_pair(args):
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import orch_serve
+    return orch_serve.pair(args)
 
 
 def cmd_notify(args):
@@ -1023,13 +1080,29 @@ def main(argv=None):
     u.add_argument("--json", action="store_true")
     u.set_defaults(func=cmd_usage)
 
+    sv = sub.add_parser("serve", help="the HTTP gateway for the owner's app, on the tailnet only")
+    sv.add_argument("--allow-self", action="store_true",
+                    help="also accept requests from this machine's own node (tests only)")
+    sv.set_defaults(func=cmd_serve)
+
+    pr = sub.add_parser("pair", help="create the gateway's pairing token and print it")
+    pr.add_argument("--allow", action="append", metavar="NODE",
+                    help="tailnet node allowed to call the gateway: its name or StableID "
+                         "(repeatable; replaces the list)")
+    pr.add_argument("--new", action="store_true", help="replace the token")
+    pr.set_defaults(func=cmd_pair)
+
     n = sub.add_parser("notify", help="send a test alert through the notify command")
     n.add_argument("title")
     n.add_argument("body")
     n.set_defaults(func=cmd_notify)
 
     args = p.parse_args(argv)
-    return args.func(args)
+    try:
+        return args.func(args)
+    except Refused as e:
+        print(f"orch: {e.text}", file=sys.stderr)
+        raise
 
 
 if __name__ == "__main__":

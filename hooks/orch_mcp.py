@@ -28,7 +28,8 @@ def obj(properties, required=()):
             "additionalProperties": False}
 
 
-ORCH_FIELDS = ("state", "progress", "waiting_on", "next", "roadmap", "risks", "milestones")
+ORCH_FIELDS = ("state", "progress", "waiting_on", "next", "roadmap", "risks", "milestones",
+               "suggestions")
 REPORT = obj({
     "role": {"enum": ["orchestrator", "worker"]},
     "summary": {"type": "string", "description": "one line"},
@@ -39,8 +40,11 @@ REPORT = obj({
     "next": STRS,
     "roadmap": {"type": "array", "items": obj({
         "id": STR, "title": STR, "owner": STR, "eta": STR,
+        "why": {"type": "string", "description": "one line, for a blocked item"},
         "status": {"enum": ["done", "doing", "next", "later", "blocked"]}}, ["title", "status"])},
     "risks": STRS,
+    "suggestions": {"type": "array", "items": STR,
+                    "description": "short messages the owner might send you next"},
     "milestones": {"type": "array", "items": obj({
         "kind": {"enum": ["pr_merged", "deploy", "release", "other"]}, "ref": STR, "url": STR},
         ["kind", "ref"])},
@@ -59,7 +63,7 @@ TOOLS = [
     {"name": "report",
      "description": ("End-of-turn status for the owner's app; call once at the end of each working "
                      "turn. Orchestrator: summary, state, progress, waiting_on, next, roadmap (the "
-                     "plan), risks, milestones. Worker: summary, status, tests, changed_files, "
+                     "plan), risks, milestones, suggestions. Worker: summary, status, tests, changed_files, "
                      "needs_live_test, issues_for_others."),
      "inputSchema": REPORT},
     {"name": "ask_owner",

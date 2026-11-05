@@ -93,6 +93,19 @@ def test_report_role_comes_from_the_run(mcp):
     assert saved["role"] == "worker" and saved["tests"][0]["passed"] == 40
 
 
+def test_report_takes_the_apps_suggestions_and_why_a_roadmap_item_is_blocked(mcp):
+    [resp] = mcp(call(1, "report", {
+        "summary": "waiting on the deploy answer",
+        "roadmap": [{"title": "Deploy 2.14", "status": "blocked", "why": "waits on your answer"}],
+        "suggestions": ["Deploy to staging", "Wrap up by 15:00"]}))
+
+    assert not resp["result"]["isError"]
+    saved = json.loads((mcp.root / "agents" / "w1-p0.json").read_text())["report"]
+    assert saved["role"] == "orchestrator"  # from its fields: no run registered
+    assert saved["roadmap"][0]["why"] == "waits on your answer"
+    assert saved["suggestions"] == ["Deploy to staging", "Wrap up by 15:00"]
+
+
 def test_ask_owner_logs_a_question_with_options(mcp):
     [resp] = mcp(call(1, "ask_owner", {"question": "Deploy to prod?",
                                        "options": [{"label": "Deploy", "danger": "prod"},

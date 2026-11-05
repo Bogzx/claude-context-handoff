@@ -1,0 +1,14 @@
+[Unit]
+Description=orch serve: the gateway for the owner's phone app, on the Tailscale IP only
+# Not before `orch pair` has created the token.
+ConditionPathExists=%h/.config/orch/.env
+
+[Service]
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/usr/bin/env python3 %h/.claude/hooks/orch.py serve
+Restart=on-failure
+RestartSec=30
+Nice=10
+
+[Install]
+WantedBy=default.target
