@@ -61,6 +61,15 @@ def test_capture_creates_its_folder(u):
     assert len((root / "usage-history.jsonl").read_text().splitlines()) == 1
 
 
+def test_capture_starts_a_new_line_after_a_torn_history_record(u):
+    # a capture killed mid-write leaves a record without its newline (seen cut at a page edge)
+    (u.root / "usage-history.jsonl").write_text(
+        json.dumps({"time": T0 - 600, "account": "1", "windows": {}}) + "\n"
+        + '{"time": %s, "account": "1", "windows": {"seven_day": {"resets_at": 179' % (T0 - 5))
+    u.capture(statusline(), {}, u.root, T0)
+    assert [h["time"] for h in u.history(u.root, 0)] == [T0 - 600, T0]
+
+
 def test_capture_does_not_rewrite_an_unchanged_file(u):
     u.capture(statusline(), {}, u.root, T0)
     mtime = (u.root / "usage.json").stat().st_mtime_ns

@@ -111,9 +111,13 @@ def capture(text, env, root, at):
             if due:
                 entry["history_time"] = at
                 root.mkdir(parents=True, exist_ok=True)
-                with open(root / "usage-history.jsonl", "a") as f:
-                    f.write(json.dumps({"time": at, "account": account, "windows": windows})
-                            + "\n")
+                line = json.dumps({"time": at, "account": account, "windows": windows}) + "\n"
+                with open(root / "usage-history.jsonl", "a+b") as f:
+                    if f.seek(0, os.SEEK_END):  # a record cut short by a killed capture
+                        f.seek(-1, os.SEEK_END)  # stays alone on its line
+                        if f.read(1) != b"\n":
+                            line = "\n" + line
+                    f.write(line.encode())
             changed = True
     if changed:
         save(path, cur)
