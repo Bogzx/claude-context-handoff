@@ -135,6 +135,7 @@ the whole fleet overnight (11.8 h), and "today's work is done" with three worker
 | `orch account [<pane> <N>] [--now \| --when-idle \| --at-handoff]`, `orch account --default N`, `orch account --name N NAME` | Which Claude account (`claude-acc N`) an agent runs on, and moving it to another one (see Accounts). |
 | `orch usage [--json] [--hours 24]`, `orch usage capture` | Account limits and tokens per agent (see Usage). |
 | `orch watchdog [--dry-run]` | One watchdog pass. A systemd user timer runs it every 5 minutes. |
+| `orch new --cwd DIR --goal "..." --until +8h [--model M] [--effort E] [--account N\|auto] [--plan-first] [--rules "..."] [--id ID] [--dry-run]` | Starts a new orchestrator on this machine (see New orchestrator). |
 | `orch serve`, `orch pair [--allow NODE] [--new]` | The HTTP gateway for the owner's phone app, and its pairing token (see Gateway). |
 
 Inside herdr, the Stop hook writes `~/.claude/handoffs/agents/<pane>.json` at every turn end, with the session, the
@@ -173,8 +174,9 @@ plus the fields of its kind:
 | `account` | a switch is queued, asked, resumed or done, or the default changes | the agent; null for the default | `account`; `when` (`handoff`, `idle`, `now`); `how` (`handoff`, `resume`) when a switch starts; `reason` (`spill`, `limit`) when the spill rule queued it; `session` after a resume | |
 | `account-failed`, `respawn-failed` | a switch or takeover failed | the agent | | yes |
 | `respawn` | a takeover started its fresh agent | the agent | | |
-| `respawn-dialog` | a takeover's new agent waits at a dialog | the agent | | yes |
+| `respawn-dialog` | a takeover's or `orch new`'s new agent waits at a dialog | the agent | `id` for `orch new` | yes |
 | `spill` | the spill rule is set, turned off, fires or clears | null | when it fires: `window`, `used`, `since` | when it fires |
+| `new` | a step of `orch new` | the new orchestrator, once its tab exists | `id`, `step` | when it fails |
 | `test` | `orch notify` | null | | yes |
 | `pair` | a phone pairs or unpairs with the gateway | null | | |
 | `action` | the gateway handles an app action | its agent or orchestrator, else null | `action` (its kind), `id`, `status` (`delivered`, `rejected`, `failed`), `error`, `source` (`app`, `relay`), `fields` (the action's other fields) | |
@@ -290,6 +292,28 @@ and the statusline. The cost is an estimate from list prices (`PRICES` in `hooks
 shares only count this machine. Transcripts are read incrementally (`usage-cache.json` keeps the offsets and 10-minute
 buckets for 8 days, and older files are skipped). On one machine, with 4.4 GB of transcripts, the first pass took 7 s and
 the next one under a second.
+
+### New orchestrator (orch new)
+
+`orch new` starts an orchestrator in a new herdr tab in `DIR` and prints its pane first. Its steps:
+
+1. A new decision log for that pane, starting with the goal (D1) and each `--rules` text (D2, ...) as the owner's
+   entries.
+2. A brief at `~/.claude/orch/new/<id>/brief.md` with the goal, the rules, the run and, with `--plan-first`, the
+   instruction to send a roadmap with the `report` tool and ask "Plan ready: ..." (Approve, Edit, Cancel) with
+   `ask_owner` before any other work. The owner approves with `orch answer` or the app.
+3. `claude-acc N` in the pane (`--account auto`, the default, is the account for new agents: the spill target
+   while the rule is active, else the default), with a session id chosen up front, `--model` and `--effort`, and
+   `HANDOFF_LINEAGE` pointing at the new log.
+4. A new agent stopped at a dialog (Claude Code's folder trust question on that account) pushes `respawn-dialog`
+   and waits up to 15 minutes for an answer in the pane, as a takeover does.
+5. Once the agent is up, the run is registered (goal, `--until`, cwd `DIR`, no workers) and the agent is prompted to
+   read the brief, with the same Enter-and-resend check as a takeover prompt.
+
+Each step is a `new` event with the request's `id` and `step` (`tab`, `log`, `brief`, `start`, `dialog`, `ready`,
+`run`, `prompted`, or `failed`, which alerts), and the request's state is kept in `~/.claude/orch/new/<id>/new.json`.
+The same `--id` again starts nothing and prints that state. `--dry-run` prints every step, the brief and the command,
+and changes nothing.
 
 ### Gateway (orch serve)
 

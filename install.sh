@@ -5,7 +5,7 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 hooks=(hooks/context-handoff.py hooks/context-handoff-install.py hooks/orch.py hooks/orch_mcp.py
-       hooks/orch_usage.py hooks/orch_serve.py hooks/orch_push.py)
+       hooks/orch_usage.py hooks/orch_serve.py hooks/orch_push.py hooks/orch_new.py)
 units=(systemd/orch-watchdog.service systemd/orch-watchdog.timer systemd/orch-serve.service)
 files=("${hooks[@]}" "${units[@]}" install.sh)
 if [ $# -eq 0 ]; then

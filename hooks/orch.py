@@ -19,6 +19,7 @@ at every turn end (background tasks still running, last message). From those two
   orch account    which Claude account (claude-acc N) an agent runs on, and switching it: now,
                   when it is next idle (the watchdog does it) or at its next handoff.
   orch usage      account windows from the statusline and tokens per agent (orch_usage.py).
+  orch new        a new orchestrator in a new herdr tab: brief, decision log, run (orch_new.py).
   orch serve      the HTTP gateway for the owner's phone app, on the tailnet only, and
   orch pair       its pairing token (orch_serve.py).
 
@@ -344,9 +345,8 @@ def cmd_run(args):
     if args.action == "start":
         if not args.until:
             die("--until is required (HH:MM, 'YYYY-MM-DD HH:MM' or +4h)")
-        run = {"orchestrator": orch, "host": socket.gethostname(), "cwd": os.getcwd(),
-               "created": at, "until": parse_until(args.until, at), "goal": args.goal or "",
-               "workers": parse_workers(args.workers), "parked": {}, "ended": None}
+        run = new_run(orch, parse_until(args.until, at), args.goal or "",
+                      parse_workers(args.workers), os.getcwd(), at)
     elif args.action in ("set", "stop", "show") and not run:
         die(f"no run registered for {orch}: orch run start --until ... --workers ...")
     if args.action == "set":
@@ -375,6 +375,11 @@ def cmd_run(args):
     for pane, info in run["workers"].items():
         print(f"  {pane} {info.get('label', '')}")
     return 0
+
+
+def new_run(orch, until, goal, workers, cwd, at):
+    return {"orchestrator": orch, "host": socket.gethostname(), "cwd": cwd, "created": at,
+            "until": until, "goal": goal, "workers": workers, "parked": {}, "ended": None}
 
 
 def save_run(orch, run, action):
@@ -1364,6 +1369,12 @@ def cmd_usage(args):
     return orch_usage.main(args, ROOT, now(), agents, account_list())
 
 
+def cmd_new(args):
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import orch_new
+    return orch_new.main(args)
+
+
 def cmd_serve(args):
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     import orch_serve
@@ -1473,6 +1484,23 @@ def main(argv=None):
                            "\"Acct N\"; \"\" resets it)")
     acct.add_argument("--json", action="store_true")
     acct.set_defaults(func=cmd_account)
+
+    nw = sub.add_parser("new", help="start a new orchestrator in a new herdr tab here")
+    nw.add_argument("--cwd", required=True, help="the folder it works in")
+    nw.add_argument("--goal", required=True, help="what the run is for, in the owner's words")
+    nw.add_argument("--until", required=True, help="HH:MM, 'YYYY-MM-DD HH:MM' or +8h")
+    nw.add_argument("--model", help="claude --model (default: Claude Code's)")
+    nw.add_argument("--effort", help="claude --effort")
+    nw.add_argument("--account", default="auto",
+                    help="N as in claude-acc N, or auto (default): the account for new agents")
+    nw.add_argument("--plan-first", action="store_true",
+                    help="propose a roadmap and wait for the owner's Approve before working")
+    nw.add_argument("--rules", action="append", metavar="TEXT",
+                    help="an owner rule, written at the top of its decision log (repeatable)")
+    nw.add_argument("--id", help="the request's id: the same id again starts nothing")
+    nw.add_argument("--dry-run", action="store_true", help="print the steps, change nothing")
+    nw.add_argument("--json", action="store_true")
+    nw.set_defaults(func=cmd_new)
 
     u = sub.add_parser("usage", help="account windows and tokens per agent")
     u.add_argument("action", nargs="?", choices=["capture"],
