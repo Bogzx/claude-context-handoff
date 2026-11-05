@@ -380,7 +380,7 @@ on Python 3.8; the push and relay code (`hooks/orch_push.py`) also needs the `cr
   `/v1/panes/<pane>/screen?lines=15`, `/v1/actions/<id>` and `/v1/folders?q=&limit=50` (see Starts from the app).
 - Writes: `POST /v1/actions`, one JSON action with the app's `id` (a UUID), `time` and `kind`: `prompt`, `answer`,
   `interrupt` (Esc), `park`, `unpark`, `run` (`extend` from the current end, or `stop`), `nudge`, `account` (`now`,
-  `idle`, `handoff`), `default_account`, `spill`, `ack` (decisions seen), `push_token` (a rotated FCM token),
+  `idle`, `handoff`), `default_account`, `spill`, `ack` (decisions seen), `push_token` (a rotated FCM token), `test_push` (the `test` push again, to the phone that asks),
   `dialog` (only a new orchestrator's folder-trust question), or `start`, `start_cancel` and `start_retry` (see
   Starts from the app). An id runs once: a retry with the same body gets the
   first result, and the same id with a different body is refused. Actions older than 10 minutes are refused. The

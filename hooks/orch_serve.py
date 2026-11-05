@@ -1047,6 +1047,20 @@ def act_push_token(gw, body, rec):
     orch_push.save_phones(phones)
 
 
+def act_test_push(gw, body, rec):
+    """The `test` push of pairing again, to the phone that sent this. It goes out after the
+    action lock is released: the send waits on Google, and the push loop takes these two locks
+    the other way round."""
+    if rec.get("phone") not in orch_push.load_phones():
+        raise Reject("this phone is not registered for pushes here: pair it again")
+
+    def send():
+        out = gw.pusher.test(rec["phone"])
+        if not out["sent"]:
+            raise Reject(out.get("error") or "the push was not sent", 502, "failed")
+    return {"wait": send}
+
+
 def act_start(gw, body, rec):
     """A new orchestrator (orch_new): checked here, then run detached; answered once its pane
     exists (or after PANE_WAIT seconds), outside the action lock. The rest arrives as `start`
@@ -1204,7 +1218,7 @@ def act_permission(gw, body, rec, pane, choice):
 ACTIONS = {"prompt": act_prompt, "answer": act_answer, "interrupt": act_interrupt,
            "park": act_park, "unpark": act_park, "run": act_run, "nudge": act_nudge,
            "account": act_account, "default_account": act_default_account, "ack": act_ack,
-           "spill": act_spill, "push_token": act_push_token,
+           "spill": act_spill, "push_token": act_push_token, "test_push": act_test_push,
            "dialog": act_dialog, "start": act_start, "start_cancel": act_start_cancel,
            "start_retry": act_start_retry}
 
