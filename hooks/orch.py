@@ -58,6 +58,8 @@ DANGER = ("none", "deploy", "prod", "destructive")  # what saying yes to an opti
 ANSWERED_SHOWN = 10 * 60  # an answered question stays in status this long (other devices)
 HOOK = Path(__file__).resolve().parent / "context-handoff.py"
 PROJECTS = Path.home() / ".claude" / "projects"  # the transcripts
+STARTS = Path.home() / ".claude" / "orch" / "new"  # orch new: <id>/new.json and <id>/brief.md
+START_SHOWN = 86400  # an unfinished start shows in the fleet this long
 SMALL_CONTEXT = 60_000  # a switching agent with less context is resumed, not handed off
 HANDOFF_WAIT = 30 * 60  # a switch handoff not written by then: resume the agent instead
 SWITCH_BUDGET = 200  # seconds of resumes per watchdog pass (its unit times out at 300)
@@ -416,23 +418,32 @@ def cmd_park(args):
     return 0
 
 
-def ask(pane, text, options=()):
+def ask(pane, text, options=(), kind=None):
     """Log a question for the owner in the pane's run and events.jsonl and push it; returns its
-    id. options: [{"label", "danger"}], the answers the owner's app offers as buttons."""
+    id. options: [{"label", "danger"}], the answers the owner's app offers as buttons. kind
+    "plan": the plan of a new orchestrator (`orch new --plan-first`), drawn from its report."""
     options = [{"label": o["label"], "danger": o.get("danger") or "none"} for o in options]
     qid = "q" + os.urandom(4).hex()
     run, _ = run_of(pane)
     if run:
-        run.setdefault("questions", []).append(
+        for q in run.setdefault("questions", []):  # a revised plan replaces the open one
+            if kind == "plan" and q.get("kind") == "plan" and q.get("pane") == pane \
+                    and not q.get("answered"):
+                q.update(answer=f"(replaced by {qid})", answered=now())
+        run["questions"].append(
             {"id": qid, "time": now(), "pane": pane, "text": text, "options": options,
-             "answer": None, "answered": None})
+             "kind": kind, "answer": None, "answered": None})
         save(run_path(run["orchestrator"]), run)
     body = text
     if options:
         body += "\nOptions: " + " / ".join(
             o["label"] + (f" [{o['danger']}]" if o["danger"] != "none" else "") for o in options)
     emit("ask", f"Question from {pane} on {machine_name()}", body, pane, push=True, id=qid,
-         question=text, options=options)
+         question=text, options=options, question_kind=kind)
+    start = start_of(pane) if kind == "plan" else {}
+    if start.get("plan_first"):
+        start_step(start, "read", "ok")
+        start_step(start, "plan", "doing", f"waiting for the owner's OK ({qid})")
     return qid
 
 
@@ -451,7 +462,7 @@ class OptionAction(argparse.Action):
 
 
 def cmd_ask(args):
-    qid = ask(orchestrator(args), args.text, args.options or [])
+    qid = ask(orchestrator(args), args.text, args.options or [], args.kind)
     print(f"sent to the owner as {qid}; keep the rest of the fleet working while you wait for the "
           "answer")
     return 0
@@ -479,7 +490,8 @@ def find_question(qid):
                 if e.get("kind") == "ask":
                     found = {"id": qid, "time": e.get("time"), "pane": e.get("pane"),
                              "text": e.get("question") or e.get("body"),
-                             "options": e.get("options") or [], "answer": None, "answered": None}
+                             "options": e.get("options") or [], "kind": e.get("question_kind"),
+                             "answer": None, "answered": None}
                 elif e.get("kind") == "answer" and found:
                     found.update(answer=e.get("body"), answered=e.get("time"))
     except OSError:
@@ -504,7 +516,49 @@ def answer(qid, text):
     if run:
         save(run_path(run["orchestrator"]), run)
     emit("answer", f"Answer to {qid}", text, pane, id=qid)
+    start = start_of(pane) if q.get("kind") == "plan" else {}
+    if any(s["step"] == "plan" for s in start.get("steps") or []):
+        start_step(start, "plan", "ok", f"answered: {first_line(text, 160)}")
     return pane
+
+
+# --- starts (orch new) -----------------------------------------------------------------------
+
+def start_of(pane):
+    """The newest `orch new` start whose orchestrator is in the pane, or {}."""
+    found = {}
+    for path in STARTS.glob("*/new.json") if STARTS.is_dir() else ():
+        rec = load(path)
+        if rec.get("pane") == pane and (rec.get("time") or 0) >= (found.get("time") or 0):
+            found = rec
+    return found
+
+
+def start_step(rec, step, status, text="", **extra):
+    """A step of a start (pane, claude, trust, run, read or brief, plan) is doing, ok or failed:
+    kept in its new.json and logged as a `start` event (a failure alerts)."""
+    at, error = now(), text if status == "failed" else None
+    entry = {"step": step, "status": status, "time": at, **({"error": error} if error else {})}
+    steps = rec.setdefault("steps", [])
+    for i, s in enumerate(steps):
+        if s["step"] == step:
+            steps[i] = entry
+            break
+    else:
+        steps.append(entry)
+    rec.update(step=step, status=status, updated=at, **({"error": error} if error else {}))
+    save(STARTS / rec["id"] / "new.json", rec)
+    folder = os.path.basename(rec.get("cwd") or "")
+    emit("start", f"Start of {folder}: {step} {status}", text, rec.get("pane"),
+         push=status == "failed", action=rec["id"], step=step, status=status, error=error,
+         **extra)
+
+
+def start_done(rec):
+    """Whether a start got through its last step: the plan answered with --plan-first, else the
+    brief sent."""
+    last = "plan" if rec.get("plan_first") else "brief"
+    return any(s["step"] == last and s["status"] == "ok" for s in rec.get("steps") or [])
 
 
 def cmd_answer(args):
@@ -665,9 +719,12 @@ def cmd_wait(args):
 
 
 def nudge_reasons(run, ags, at, ws):
-    """Why the run's idle orchestrator should act now (empty when it shouldn't)."""
+    """Why the run's idle orchestrator should act now (empty when it shouldn't, as while its
+    plan waits for the owner's OK: no workers start before it)."""
     orch = run["orchestrator"]
     reasons = {}
+    if any(q.get("kind") == "plan" and not q.get("answered") for q in run.get("questions") or []):
+        return reasons
     first = ws.setdefault("first_seen", {})
     seen_now = set()
     any_free = False
@@ -1422,6 +1479,8 @@ def main(argv=None):
                    help="an answer the owner can pick (repeatable)")
     a.add_argument("--danger", action=OptionAction, dest="options", choices=DANGER,
                    help="what the option before it does when picked (default none)")
+    a.add_argument("--kind", choices=["plan"],
+                   help="plan: a new orchestrator's plan (orch new --plan-first), for approval")
     a.set_defaults(func=cmd_ask)
 
     ans = sub.add_parser("answer", help="record the owner's answer and prompt the asker")
@@ -1486,7 +1545,7 @@ def main(argv=None):
     acct.set_defaults(func=cmd_account)
 
     nw = sub.add_parser("new", help="start a new orchestrator in a new herdr tab here")
-    nw.add_argument("--cwd", required=True, help="the folder it works in")
+    nw.add_argument("--cwd", required=True, help="the folder it works in (or branches from)")
     nw.add_argument("--goal", required=True, help="what the run is for, in the owner's words")
     nw.add_argument("--until", required=True, help="HH:MM, 'YYYY-MM-DD HH:MM' or +8h")
     nw.add_argument("--model", help="claude --model (default: Claude Code's)")
@@ -1497,6 +1556,11 @@ def main(argv=None):
                     help="propose a roadmap and wait for the owner's Approve before working")
     nw.add_argument("--rules", action="append", metavar="TEXT",
                     help="an owner rule, written at the top of its decision log (repeatable)")
+    nw.add_argument("--name", help="the herdr agent's name (and the worktree's)")
+    nw.add_argument("--worktree", action="store_true",
+                    help="work in a new git worktree <cwd>-<name> on branch orch/<name>")
+    nw.add_argument("--worker-model", help="the model its workers start on (in its brief)")
+    nw.add_argument("--max-workers", type=int, help="how many workers at a time (in its brief)")
     nw.add_argument("--id", help="the request's id: the same id again starts nothing")
     nw.add_argument("--dry-run", action="store_true", help="print the steps, change nothing")
     nw.add_argument("--json", action="store_true")

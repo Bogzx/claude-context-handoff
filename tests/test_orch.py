@@ -267,6 +267,21 @@ def test_watchdog_wakes_an_orchestrator_that_nothing_would_wake(world):
     assert "nothing would wake you" in text
 
 
+def test_watchdog_leaves_an_orchestrator_alone_while_its_plan_waits_for_the_owner(world):
+    world.run("run", "start", "--until", "+8h", "--goal", "new run")  # no workers yet
+    world.turn_end(BOSS, ago=2 * 3600)  # idle two hours: past ORCH_SILENT
+    world.run("ask", "--kind", "plan", "--option", "Approve and start workers", "Plan ready")
+
+    world.run("watchdog")
+    assert world.prompts == []
+
+    [q] = json.loads((world.root / "runs" / "w1-p0.json").read_text())["questions"]
+    world.run("answer", q["id"], "Approve and start workers")
+    world.prompts.clear()
+    world.run("watchdog")  # approved: idle with no workers is worth a nudge again
+    assert [p for p, _ in world.prompts] == [BOSS]
+
+
 def test_watchdog_tells_the_owner_when_nudges_are_ignored(world, tmp_path, monkeypatch):
     pushed = push_log(tmp_path, monkeypatch)
     start_run(world)
