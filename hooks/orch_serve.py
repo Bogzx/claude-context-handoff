@@ -42,7 +42,7 @@ import orch_new
 import orch_push
 import orch_usage
 
-VERSION = "1.0.0"  # the gateway's, in the Server header and /v1/health
+VERSION = "1.1.0"  # the gateway's, in the Server header and /v1/health
 PORT = 7433
 CONFIG = orch.CONFIG
 KEEP = 86400  # action results kept for retries
@@ -165,11 +165,12 @@ def gaming():
 
 
 def state_of(v):
-    """The six agent states of the app (as in `orch status`'s table)."""
+    """The seven agent states of the app (as in `orch status`'s table, and `unknown`: the agent
+    is there, but herdr can't say what it's doing)."""
     s = v["state"]
     if s in ("idle", "done"):
         return "parked" if v["park"] else "own-job" if v["bg"] else "idle"
-    return s if s in ("working", "blocked", "missing") else "working"  # herdr "unknown"
+    return s if s in ("working", "blocked", "missing") else "unknown"
 
 
 def report_json(report, role):
@@ -622,8 +623,8 @@ class Gateway:
             activity, since = "done", run.get("ended") or run.get("until")
         elif lead["state"] == "missing":
             activity, since = "offline", None
-        elif lead["state"] in ("working", "blocked"):
-            activity, since = ("working" if lead["state"] == "working" else "waiting"), None
+        elif lead["state"] in ("working", "blocked", "unknown"):  # unknown: no stall to claim
+            activity, since = ("waiting" if lead["state"] == "blocked" else "working"), None
         else:
             reasons = orch.nudge_reasons(run, ags, at, copy.deepcopy(ws)) if run else {}
             activity, since = ("stalled" if reasons else "waiting"), lead["since"]
@@ -747,7 +748,8 @@ class Gateway:
                 ratio[acc] = week["used_percentage"] / week["machine_cost_usd"]
         agents, other = [], {}
         for a in rep["agents"]:
-            account = a["accounts"][-1] if a["accounts"] else None
+            known = [x for x in a["accounts"] if x != "unknown"]  # older sessions may have none
+            account = (known or a["accounts"] or [None])[-1]
             a.update(account=account, model=a["models"][-1] if a["models"] else None,
                      orchestrator=(a["run"] or "").split("@")[0] or None,
                      tokens={k: a[k] for k in ("input", "output", "cache_read", "cache_write")},
@@ -758,9 +760,11 @@ class Gateway:
             if a["role"]:
                 agents.append(a)
                 continue
-            o = other.setdefault(account, {"label": "Other sessions", "account": account,
-                                           "sessions": 0, **{k: 0 for k in periods}})
+            o = other.setdefault(account, {
+                "label": "Other sessions", "account": None if account == "unknown" else account,
+                "sessions": 0, "cost_usd": 0, **{k: 0 for k in periods}})
             o["sessions"] += len(a["sessions"])
+            o["cost_usd"] = round(o["cost_usd"] + a["cost"], 2)
             for k in periods:
                 o[k] = None if a[k] is None or o[k] is None else round(o[k] + a[k], 2)
         for o in other.values():
@@ -768,6 +772,7 @@ class Gateway:
         for run in rep["runs"].values():
             lead = next((a for a in agents if a["pane"] == run["orchestrator"]), None)
             account = (lead or {}).get("account")
+            run["account"] = account
             run["week_points"] = (round(run["cost"] * ratio[account], 2) if account in ratio
                                   else None)
         rep.update(machine=self.machine(), accounts=accounts, agents=agents,

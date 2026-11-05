@@ -126,6 +126,28 @@ def in_a_run(mcp):
     return runs / f"{PANE.replace(':', '-')}.json"
 
 
+def test_ask_owner_takes_evidence_and_a_rule(mcp):
+    chip = {"kind": "tests", "label": "212 passed", "pane": "w1:p1", "tab": "report", "ok": True}
+    [resp] = mcp(call(1, "ask_owner", {"question": "Merge?", "evidence": [chip], "rule": "D27"}))
+    assert resp["result"]["isError"] is False
+    [event] = [json.loads(x) for x in (mcp.root / "events.jsonl").read_text().splitlines()]
+    assert event["evidence"] == [chip] and event["rule"] == "D27"
+
+
+@pytest.mark.parametrize(("args", "why"), [
+    ({"evidence": [{"kind": "chart", "label": "x"}]}, "must be one of"),
+    ({"evidence": [{"kind": "pr"}]}, "evidence[0].label is required"),
+    ({"evidence": [{"kind": "pr", "label": "x", "ok": "yes"}]}, "must be true or false"),
+    ({"evidence": [{"kind": "pr", "label": "x", "tab": "log"}]}, "must be one of"),
+    ({"rule": "be careful"}, "isn't a decision id"),
+])
+def test_ask_owner_says_what_is_wrong_and_stays_up(mcp, args, why):
+    first, second = mcp(call(1, "ask_owner", dict(args, question="Merge?")),
+                        call(2, "ask_owner", {"question": "Merge?"}))
+    assert first["result"]["isError"] is True and why in first["result"]["content"][0]["text"]
+    assert second["result"]["isError"] is False
+
+
 def test_ask_owner_takes_a_default_and_a_time(mcp):
     run = in_a_run(mcp)
 

@@ -217,7 +217,7 @@ def start_run(w):
 # A key ending in "?" may be missing or null. A set is an enum, a list holds items of one shape.
 
 NUM = (int, float)
-STATE = {"working", "blocked", "idle", "own-job", "parked", "missing"}
+STATE = {"working", "blocked", "idle", "own-job", "parked", "missing", "unknown"}
 AGENT = {"pane": str, "label": str, "state": STATE,
          "agent_status?": {"working", "idle", "done", "blocked", "unknown"}, "since?": NUM,
          "session?": str, "account?": str, "model?": str, "context_tokens?": int,
@@ -238,9 +238,11 @@ WORKER_REPORT = {"time": NUM, "summary": str, "status?": {"done", "partial", "bl
                  "tests?": [{"cmd": str, "passed?": int, "failed?": int}],
                  "changed_files?": [{"path": str, "added?": int, "removed?": int}],
                  "needs_live_test?": [str], "issues_for_others?": [str]}
+EVIDENCE = {"kind": {"pr", "branch", "files", "tests"}, "label": str, "pane?": str,
+            "tab?": {"report", "diff"}, "ok?": bool}
 QUESTION = {"id": str, "pane": str, "time": NUM, "text": str,
             "options": [{"label": str, "danger": {"none", "deploy", "prod", "destructive"}}],
-            "evidence": [dict], "rule?": str, "kind?": {"plan"}, "answer?": str,
+            "evidence": [EVIDENCE], "rule?": str, "kind?": {"plan"}, "answer?": str,
             "answered?": NUM, "default?": str, "default_at?": NUM, "by_default": bool}
 DIALOG = {"pane": str, "label": str, "since?": NUM, "change": int, "tool?": str,
           "command?": str, "cwd?": str, "doing?": str, "danger": bool, "text": str,
@@ -287,9 +289,11 @@ USAGE = {"time": NUM, "machine": str, "accounts": dict, "default_account": str,
                      "tokens": {"input": int, "output": int, "cache_read": int,
                                 "cache_write": int},
                      "cost_usd": NUM, "costly?": str}],
-         "other": [{"label": str, "account": str, "points_last_hour?": NUM,
+         "other": [{"label": str, "account?": str, "cost_usd": NUM, "points_last_hour?": NUM,
                     "points_today?": NUM, "points_7d?": NUM, "note": str}],
          "runs": dict}
+RUN_USAGE = {"orchestrator": str, "cost": NUM, "week_points?": NUM, "account?": str, "hours": NUM,
+             "max_workers": int}
 
 
 def conforms(value, spec, where="$"):
@@ -643,10 +647,42 @@ def test_usage_has_the_api_shape_and_points_per_period(world):
     assert other["account"] == "1" and other["points_7d"] == pytest.approx(10.004 * week,
                                                                            abs=0.05)
     assert builder["points_7d"] + other["points_7d"] == pytest.approx(80, abs=0.1)  # never more
+    assert other["cost_usd"] == 10.0  # rounded per agent; $10.004 in all
     assert other["note"].startswith("1 sessions outside a run")
     [run] = out["runs"].values()
+    conforms(run, RUN_USAGE)
     assert run["week_points"] is None  # the orchestrator itself spent nothing here
+    assert run["account"] is None and run["max_workers"] == 2  # builder and tester
+    assert run["hours"] == 96
     assert out["accounts"]["1"]["windows"]["seven_day"]["machine_cost_usd"] == 90.01
+
+
+def test_sessions_from_before_the_account_capture_have_no_account_and_their_cost(world):
+    busy_fleet(world)
+    spend(world, "s-old", assistant(world.t - 600, "m1", 1_000_000))
+    spend(world, "s-older", assistant(world.t - 700, "m2", 2_000_000))
+    out = world.get(world.serve.Gateway(), "/v1/usage?hours=168")[1]
+    conforms(out, USAGE)
+    [other] = out["other"]
+    assert other["account"] is None and other["cost_usd"] == 60.0  # each rounded to cents
+    assert other["note"].startswith("2 sessions outside a run")
+
+
+def test_a_runs_hours_stop_at_its_end_and_max_workers_comes_from_its_settings(world):
+    costly_run(world)
+    change_run(world, settings={"max_workers": 5}, ended=world.t - 2 * 86400)
+    spend(world, f"s-{BOSS}", assistant(world.t - 3 * 86400, "m1", 1_000_000))
+    [run] = world.get(world.serve.Gateway(), "/v1/usage?hours=168")[1]["runs"].values()
+    conforms(run, RUN_USAGE)
+    assert run["hours"] == 48 and run["max_workers"] == 5 and run["account"] == "1"
+    assert run["cost"] == 20.0
+
+
+def test_a_running_runs_hours_count_to_now_not_its_end(world):
+    costly_run(world)
+    world.t += 3600
+    [run] = world.get(world.serve.Gateway(), "/v1/usage?hours=168")[1]["runs"].values()
+    assert run["hours"] == 97 and run["ended"] is None
 
 
 def costly_run(world):
@@ -656,6 +692,20 @@ def costly_run(world):
     spend(world, f"s-{BOSS}", assistant(world.t - 1800, "m1", 1_000_000))
     spend(world, f"s-{W1}", assistant(world.t - 600, "m2", 1_000_000))
     change_run(world, created=world.t - 4 * 86400)
+
+
+def test_an_agent_herdr_cant_read_is_unknown_not_working(world):
+    busy_fleet(world)
+    world.agent(W1, "unknown", change=8)
+    world.agent(BOSS, "unknown", name="Website")
+    status, fleet = world.get(world.serve.Gateway(), "/v1/fleet")
+    assert status == 200
+    conforms(fleet, FLEET)
+    lead = fleet["orchestrators"][0]
+    builder = next(w for w in lead["workers"] if w["pane"] == W1)
+    assert builder["state"] == "unknown" and builder["agent_status"] == "unknown"
+    assert lead["agent"]["state"] == "unknown"
+    assert lead["activity"] == "working" and lead["stall"] is None  # nothing shows it stopped
 
 
 def test_the_fleet_has_the_run_cost_from_the_background_pass_only(world, monkeypatch):
@@ -683,6 +733,35 @@ def test_a_run_whose_lead_spent_long_before_the_default_period_still_has_week_po
     world.serve.warm_usage(gw)
     assert gw.fleet()[1]["orchestrators"][0]["run"]["week_points"] == pytest.approx(80, abs=0.01)
     assert gw.usage(1)["runs"][next(iter(gw.run_costs))]["week_points"] is None  # why: not 1 h
+
+
+def test_a_questions_evidence_and_rule_reach_the_fleet_and_its_push(world, cloud):
+    start_run(world)
+    gw = world.serve.Gateway()
+    pair(world, gw)
+    gw.pusher.cycle()
+    cloud.pushes.clear()
+    chip = {"kind": "pr", "label": "#12 checks 14/14", "pane": W1, "tab": "diff", "ok": True}
+    qid = world.orch.ask(W1, "Merge #12?", [{"label": "Merge"}], evidence=[chip], rule="D27")
+    q = gw.fleet()[1]["orchestrators"][0]["questions"][0]
+    conforms(q, QUESTION)
+    assert q["id"] == qid and q["evidence"] == [chip] and q["rule"] == "D27"
+    gw.pusher.cycle()
+    [push] = [p["message"] for p in cloud.pushes if p["message"]["kind"] == "question"]
+    assert push["body"]["evidence"] == [chip] and push["body"]["rule"] == "D27"
+
+
+def test_an_earlier_session_with_no_account_doesnt_hide_the_agents_account(world):
+    costly_run(world)
+    # the orchestrator's previous generation: known from its lineage folder, not by an account
+    spend(world, "zzzzzzzz-old", assistant(world.t - 7200, "m3", 1_000_000))
+    (world.root / "w1-p0" / "w1-p0-20261105-080000-zzzzzzzz").mkdir(parents=True)
+    out = world.get(world.serve.Gateway(), "/v1/usage?hours=168")[1]
+    [lead] = [a for a in out["agents"] if a["pane"] == BOSS]
+    assert lead["accounts"] == ["1", "unknown"]
+    assert lead["account"] == "1" and lead["points_7d"] is not None
+    [run] = out["runs"].values()
+    assert run["account"] == "1" and run["week_points"] is not None
 
 
 def test_a_state_push_carries_the_run_cost(world, cloud):
@@ -1526,16 +1605,16 @@ def test_health_and_the_server_header(world, cloud):
     try:
         with pytest.raises(urllib.error.HTTPError) as refused:
             urllib.request.urlopen(url, timeout=10)
-        assert refused.value.code == 401 and refused.value.headers["Server"] == "orch/1.0.0"
+        assert refused.value.code == 401 and refused.value.headers["Server"] == "orch/1.1.0"
         req = urllib.request.Request(url, headers={"Authorization": f"Bearer {TOKEN}"})
         with urllib.request.urlopen(req, timeout=10) as r:
-            assert r.headers["Server"] == "orch/1.0.0"
+            assert r.headers["Server"] == "orch/1.1.0"
             health = json.loads(r.read())
     finally:
         server.shutdown()
         server.server_close()
     conforms(health, HEALTH)
-    assert health["version"] == "1.0.0" and health["addr"] == "100.64.0.1"
+    assert health["version"] == "1.1.0" and health["addr"] == "100.64.0.1"
     assert health["accounts"] == {"1": "main", "2": "spare"} and "relay" not in health
     assert health["push"]["registered"] is False and health["push"]["seq"] == 0
 
@@ -1575,9 +1654,9 @@ def test_health_says_how_full_the_machine_is(world, cloud, tmp_path, monkeypatch
                                   "load_avg": [1.23, 0.5, 0.25], "cores": 16}
 
 
-@pytest.mark.parametrize("meminfo", [None, "MemTotal: 31457280 kB\n", "MemTotal: x kB\n"
-                                     "MemAvailable: y kB\n", "MemTotal:\nMemAvailable:\n",
-                                     "no colon here\n"])
+@pytest.mark.parametrize("meminfo", [None, "MemTotal: 31457280 kB\n",
+                                     "MemTotal: x kB\nMemAvailable: y kB\n",
+                                     "MemTotal:\nMemAvailable:\n", "no colon here\n"])
 def test_a_machine_without_a_readable_meminfo_has_no_capacity(world, cloud, tmp_path, monkeypatch,
                                                               meminfo):
     fake_proc(tmp_path, monkeypatch, world.serve, meminfo, {"10": "claude"})

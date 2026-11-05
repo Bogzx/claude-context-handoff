@@ -429,6 +429,16 @@ def runs_of(root):
     return out
 
 
+def max_workers(run):
+    """What the run was started with (orch new), else the workers it has now."""
+    return (run.get("settings") or {}).get("max_workers") or len(run.get("workers") or {})
+
+
+def run_hours(run, at):
+    end = min(at, run.get("ended") or run.get("until") or at)
+    return round((end - (run.get("created") or end)) / 3600, 2)
+
+
 def role_in(run, pane, when):
     end = run.get("ended") or run.get("until") or 0
     if when + BUCKET <= (run.get("created") or 0) or when > end:
@@ -497,6 +507,8 @@ def report(root, projects, agents, at, hours, known=None):
                                                        "created": run.get("created"),
                                                        "until": run.get("until"),
                                                        "ended": run.get("ended"),
+                                                       "hours": run_hours(run, at),
+                                                       "max_workers": max_workers(run),
                                                        "orchestrator_tokens": blank(),
                                                        "worker_tokens": blank(), **blank()})
                     targets += [r, r[f"{role}_tokens"]]
