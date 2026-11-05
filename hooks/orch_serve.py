@@ -142,6 +142,19 @@ def read_events(limit=EVENTS_TAIL):
     return out
 
 
+def capacity():
+    """What the New orchestrator form shows of this machine, or None without /proc: every claude
+    process counts, in a herdr pane or not, because they all share the memory (in GiB)."""
+    try:
+        mem = dict(x.split(":", 1) for x in (orch.PROC / "meminfo").read_text().splitlines())
+        free, total = (int(mem[k].split()[0]) / 2**20 for k in ("MemAvailable", "MemTotal"))
+        return {"agents": sum(1 for _ in orch.claude_processes()),
+                "mem_free_gb": round(free, 1), "mem_total_gb": round(total, 1),
+                "load_avg": [round(x, 2) for x in os.getloadavg()], "cores": os.cpu_count()}
+    except (OSError, KeyError, ValueError, IndexError):
+        return None
+
+
 def state_of(v):
     """The six agent states of the app (as in `orch status`'s table)."""
     s = v["state"]
@@ -488,7 +501,8 @@ class Gateway:
     def health(self, phone):
         out = {"machine": self.machine(), "version": VERSION, "time": orch.now(),
                "addr": tailscale_ip(), "orchestrators": self.orchestrators(),
-               "accounts": self.account_names(), "push": self.pusher.health(phone)}
+               "accounts": self.account_names(), "push": self.pusher.health(phone),
+               "capacity": capacity()}
         why = orch_new.cannot_start(read_env(self.config))
         out.update(can_start=why is None, **({"cannot_start": why} if why else {}),
                    dialogs=["trust", "permission"])

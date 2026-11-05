@@ -59,6 +59,7 @@ DANGER = ("none", "deploy", "prod", "destructive")  # what saying yes to an opti
 ANSWERED_SHOWN = 10 * 60  # an answered question stays in status this long (other devices)
 HOOK = Path(__file__).resolve().parent / "context-handoff.py"
 PROJECTS = Path.home() / ".claude" / "projects"  # the transcripts
+PROC = Path("/proc")
 STARTS = Path.home() / ".claude" / "orch" / "new"  # orch new: <id>/new.json and <id>/brief.md
 START_SHOWN = 86400  # an unfinished start shows in the fleet this long
 SMALL_CONTEXT = 60_000  # a switching agent with less context is resumed, not handed off
@@ -1083,18 +1084,24 @@ def set_name(account, name):
     return account_name(account, names)
 
 
+def claude_processes():
+    """The /proc folder of every claude process on this machine, in a herdr pane or not."""
+    for proc in PROC.iterdir():
+        try:
+            if proc.name.isdigit() and (proc / "comm").read_text().strip() == "claude":
+                yield proc
+        except OSError:
+            continue
+
+
 def pane_claudes():
     """herdr pane -> (pid, account) of the claude processes running in herdr panes, from
     /proc (the account is the process's CLAUDE_CONFIG_DIR, as claude-acc sets it)."""
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     import orch_usage
     out = {}
-    for proc in Path("/proc").iterdir():
-        if not proc.name.isdigit():
-            continue
+    for proc in claude_processes():
         try:
-            if (proc / "comm").read_text().strip() != "claude":
-                continue
             env = dict(x.split("=", 1) for x in
                        (proc / "environ").read_bytes().decode(errors="replace").split("\0")
                        if "=" in x)

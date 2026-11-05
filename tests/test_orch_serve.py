@@ -1386,6 +1386,8 @@ HEALTH = {"machine": str, "version": str, "time": NUM, "addr?": str, "orchestrat
           "can_start": bool, "cannot_start?": str,
           "accounts": dict, "push": {"registered": bool, "seq": int, "last_sent?": NUM,
                                      "last_heartbeat?": NUM, "error?": str},
+          "capacity?": {"agents": int, "mem_free_gb": NUM, "mem_total_gb": NUM,
+                        "load_avg": [NUM], "cores": int},
           "relay?": {"last_poll?": NUM, "error?": str}}
 PAIRED = {"machine": str, "version": str, "orchestrators": [str], "accounts": dict,
           "test_push": {"seq": int, "sent": NUM, "error?": str}}
@@ -1477,6 +1479,52 @@ def test_health_and_the_server_header(world, cloud):
     assert health["version"] == "1.0.0" and health["addr"] == "100.64.0.1"
     assert health["accounts"] == {"1": "main", "2": "spare"} and "relay" not in health
     assert health["push"]["registered"] is False and health["push"]["seq"] == 0
+
+
+def fake_proc(tmp_path, monkeypatch, serve, meminfo, comms):
+    proc = tmp_path / "proc"
+    proc.mkdir()
+    if meminfo is not None:
+        (proc / "meminfo").write_text(meminfo)
+    for pid, comm in comms.items():
+        (proc / pid).mkdir()
+        if comm:
+            (proc / pid / "comm").write_text(comm + "\n")
+    (proc / "sys").mkdir()  # no pid: never counted
+    (proc / "sys" / "comm").write_text("claude\n")
+    monkeypatch.setattr(serve.orch, "PROC", proc)
+    monkeypatch.setattr(serve.os, "getloadavg", lambda: (1.234, 0.5, 0.25))
+    monkeypatch.setattr(serve.os, "cpu_count", lambda: 16)
+
+
+MEMINFO = """MemTotal:       31457280 kB
+MemFree:         1048576 kB
+MemAvailable:    9961472 kB
+HugePages_Total:       0
+"""
+
+
+def test_health_says_how_full_the_machine_is(world, cloud, tmp_path, monkeypatch):
+    # 1048576 kB is 1 GiB. MemAvailable, not MemFree: the page cache can be given back.
+    fake_proc(tmp_path, monkeypatch, world.serve, MEMINFO,
+              {"10": "claude", "11": "claude", "12": "bash", "13": ""})
+    gw = world.serve.Gateway()
+    status, health = world.get(gw, "/v1/health")
+    assert status == 200
+    conforms(health, HEALTH)
+    assert health["capacity"] == {"agents": 2, "mem_free_gb": 9.5, "mem_total_gb": 30.0,
+                                  "load_avg": [1.23, 0.5, 0.25], "cores": 16}
+
+
+@pytest.mark.parametrize("meminfo", [None, "MemTotal: 31457280 kB\n", "MemTotal: x kB\n"
+                                     "MemAvailable: y kB\n", "MemTotal:\nMemAvailable:\n",
+                                     "no colon here\n"])
+def test_a_machine_without_a_readable_meminfo_has_no_capacity(world, cloud, tmp_path, monkeypatch,
+                                                              meminfo):
+    fake_proc(tmp_path, monkeypatch, world.serve, meminfo, {"10": "claude"})
+    status, health = world.get(world.serve.Gateway(), "/v1/health")
+    assert status == 200 and health["capacity"] is None
+    conforms(health, HEALTH)
 
 
 def test_pairing_stores_the_token_and_sends_a_test_push(world, cloud):
