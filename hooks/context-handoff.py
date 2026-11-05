@@ -71,6 +71,7 @@ ROOT = Path.home() / ".claude" / "handoffs"
 SEALED = ".decisions.sealed"  # the log as of the last handoff, for the append-only check
 POLICY = "Context handoff policy (configured by the user in ~/.claude/settings.json)"
 IN_HERDR = os.environ.get("HERDR_ENV") == "1" and bool(os.environ.get("HERDR_PANE_ID"))
+AGENTS_VIEW = re.compile(r"(?:^|· )claude agents$")  # the terminal title of Claude's agents view
 
 TEMPLATE = """\
 The handoff is a Markdown file that lets an agent with no memory of this session continue \
@@ -493,8 +494,18 @@ def takeover_notes(pane, goal):
     return notes
 
 
+def background():
+    """Whether this is a background session of Claude Code's agents view. It inherits the pane's
+    HERDR_PANE_ID, but the pane doesn't run it: what is typed there doesn't reach it."""
+    return os.environ.get("CLAUDE_CODE_SESSION_KIND") == "bg"
+
+
 def claude_pid():
-    """PID of the claude process that runs this hook (the nearest claude ancestor)."""
+    """PID of the claude process that runs this hook (the nearest claude ancestor). None in a
+    background session: its nearest claude is the daemon that hosts them all, and on 2026-11-05
+    a takeover's SIGTERM stopped that daemon."""
+    if background():
+        return None
     pid = os.getppid()
     while pid > 1:
         try:
@@ -529,12 +540,17 @@ def relaunch_args(argv, model, effort):
 
 
 def start_respawn(data, lineage, model):
+    pane = os.environ["HERDR_PANE_ID"]
+    if background():
+        emit("respawn-failed", "Handoff respawn failed",
+             f"{pane}: this agent runs in the background, not in the pane, so nothing can take "
+             f"over from it; its handoff is in {lineage}", pane, push=True)
+        return False
     pid = claude_pid()
     if not pid:
         return False
     argv = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")[1:]
     effort = (data.get("effort") or {}).get("level") or os.environ.get("CLAUDE_EFFORT")
-    pane = os.environ["HERDR_PANE_ID"]
     env = {k: os.environ[k] for k in ("CLAUDE_CONFIG_DIR",) if os.environ.get(k)}
     accounts = load(ROOT / "accounts.json")
     switch = (accounts.get("switch") or {}).get(pane)
@@ -621,11 +637,20 @@ def respawn(job):
         return herdr("agent", "wait", pane, "--until", "working", "--timeout", "30000",
                      timeout=60).returncode == 0
 
+    def in_agents_view():
+        """Whether the pane shows Claude Code's agents view, not a conversation: its input box
+        starts a new session with what is typed there. On 2026-11-05 a takeover's shell line
+        and both its prompts each started one, and four orchestrators ran."""
+        return bool(AGENTS_VIEW.search((pane_agent() or {}).get("terminal_title") or ""))
+
     def at_dialog():
         """Whether the screen ends with one of Claude Code's dialogs ("Enter to confirm · Esc
-        to cancel", "Esc to cancel · Tab to amend"). herdr can call a new agent idle while it
-        shows the folder-trust question of another account, and typing there answers it: on
-        2026-11-05 a takeover prompt's Enter picked "No, exit" and Claude quit."""
+        to cancel", "Esc to cancel · Tab to amend"), or is its agents view. herdr can call a
+        new agent idle while it shows the folder-trust question of another account, and typing
+        there answers it: on 2026-11-05 a takeover prompt's Enter picked "No, exit" and Claude
+        quit."""
+        if in_agents_view():
+            return True
         out = herdr("agent", "read", pane, "--source", "visible", "--lines", "40", "--format",
                     "text", timeout=20)
         words = (out.stdout or "").split() if out.returncode == 0 else []
@@ -653,6 +678,8 @@ def respawn(job):
                 return postpone("the agent was still working 30 minutes after its handoff")
         if status() == "blocked":
             return postpone("the agent is waiting at an approval or question dialog")
+        if in_agents_view():
+            return postpone("the pane shows Claude's agents view: nothing is typed there")
         last = load(status_path(pane))
         if (last.get("session") == job.get("session") and last.get("background_tasks")
                 and (last.get("time") or 0) >= (job.get("created") or 0)):
@@ -674,6 +701,9 @@ def respawn(job):
             if not pane_agent():
                 break
             time.sleep(1)
+        else:  # the shell didn't come back: whatever runs there would read the command as text
+            return fail("the pane still has an agent after /exit, so nothing typed there"
+                        + (f"; handoff in {job['dir']}" if job.get("dir") else ""))
         time.sleep(1)
         if resume:
             # claude-acc adds --dangerously-skip-permissions itself and sets the account's
