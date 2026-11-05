@@ -52,6 +52,7 @@ MAX_BODY = 64 * 1024
 WHOIS_TTL = 60
 EVENTS_TAIL = 8 << 20  # bytes of events.jsonl read for history, the last nudge and plan
 PANE_WAIT = 20  # seconds the start action waits for the new orchestrator's pane
+PANES_EVERY = 30  # seconds between reads of the panes herdr lists no agent in
 NOT_PAIRED = 3  # serve's exit status without a token; the unit counts it as a clean stop
 
 
@@ -165,9 +166,11 @@ def gaming():
 
 
 def state_of(v):
-    """The seven agent states of the app (as in `orch status`'s table, and `unknown`: the agent
-    is there, but herdr can't say what it's doing)."""
-    s = v["state"]
+    """The agent states of the app (as in `orch status`'s table, and `unknown`: the agent is
+    there, but herdr can't say what it's doing)."""
+    s = orch.stopped_state(v) or v["state"]
+    if s in orch.STOPPED:
+        return s
     if s in ("idle", "done"):
         return "parked" if v["park"] else "own-job" if v["bg"] else "idle"
     return s if s in ("working", "blocked", "missing") else "unknown"
@@ -192,6 +195,8 @@ def agent_json(v, agent, role, first_seen):
     since = v["since"] if v["state"] in ("idle", "done") else None
     if since is None:  # the watchdog's first sight of this state (it looks every 5 min)
         since = first_seen.get(f"{v['pane']}:{v['state']}:{v['session']}:{v['seq']}")
+    if v["limit"]:
+        since = v["limit"]["since"]
     park = v["park"]
     return {
         "pane": v["pane"], "label": v["label"], "state": state,
@@ -199,6 +204,7 @@ def agent_json(v, agent, role, first_seen):
         "since": since, "session": v["session"], "account": v["account"],
         "context_tokens": v.get("context_tokens"), "spill": v.get("spill"),
         "background_tasks": v["bg"], "last": v["last"],
+        "pane_view": v["pane_view"], "limit": v["limit"],
         "park": {"reason": park.get("reason"), "since": park.get("since"),
                  "until": park.get("until")} if park else None,
         "switch": v["switch"], "report": report_json(v["report"], role),
@@ -457,6 +463,7 @@ class Gateway:
         self.self_names = (me or {}).get("names", set())
         self.pusher = orch_push.Pusher(self)
         self.run_costs = {}  # run id -> {cost_usd, week_points}, from warm_usage
+        self.panes = 0, []  # when other_panes last read them, and what it found
 
     # auth
 
@@ -643,8 +650,14 @@ class Gateway:
                               for p, r in leads],
             "accounts": self.accounts(at), "default_account": self.default_account(),
             "spill": orch.spill_summary(orch.load(orch.ROOT / "accounts.json")),
-            "actions": self.recent_actions(at, ags),
+            "actions": self.recent_actions(at, ags), "panes": self.other_panes(ags, at),
         }
+
+    def other_panes(self, ags, at):
+        """orch.other_panes, at most every PANES_EVERY seconds: it reads each pane's screen."""
+        if at - self.panes[0] >= PANES_EVERY:
+            self.panes = at, orch.other_panes(ags)
+        return self.panes[1]
 
     @staticmethod
     def starts(at):
@@ -672,6 +685,8 @@ class Gateway:
             activity, since = "done", run.get("ended") or run.get("until")
         elif lead["state"] == "missing":
             activity, since = "offline", None
+        elif lead["state"] in orch.STOPPED:
+            activity, since = lead["state"], lead["since"]
         elif lead["state"] in ("working", "blocked", "unknown"):  # unknown: no stall to claim
             activity, since = ("waiting" if lead["state"] == "blocked" else "working"), None
         else:
@@ -680,7 +695,7 @@ class Gateway:
             if reasons:
                 stall = stall_json(reasons, workers, v["report"], nudges.get(pane))
         dialogs = [dialog_json(a, ags.get(a["pane"])) for a in [lead, *workers]
-                   if a["state"] == "blocked"]
+                   if a["state"] == "blocked" or a["pane_view"] == "trust"]
         name = lead_name(pane, run, agent, (start or {}).get("cwd"))
         if start:  # a new orchestrator: its start's steps until the brief or the plan's OK
             activity, since, stall = "starting", start.get("time"), None
@@ -993,16 +1008,19 @@ def target(pane):
 def typable(pane):
     """Refuse typed input to a new orchestrator's pane until Claude runs there and its
     folder-trust question is answered: before that a shell reads the text, and during the
-    dialog the keys and Enter could answer it without the app's hold."""
+    dialog the keys and Enter could answer it without the app's hold. Refuse it to any pane
+    that orch.not_typable says shows no conversation."""
     start = orch.start_of(pane)
-    if not start or orch.start_cancelled(start):
-        return
-    steps = {s["step"]: s["status"] for s in start.get("steps") or []}
-    if steps.get("trust") == "doing":
-        raise Reject(f"{pane} is a new orchestrator at Claude's folder-trust question: "
-                     "answer that first")
-    if steps.get("claude") != "ok" or start.get("restart"):
-        raise Reject(f"{pane} is a new orchestrator whose Claude isn't running yet")
+    if start and not orch.start_cancelled(start):
+        steps = {s["step"]: s["status"] for s in start.get("steps") or []}
+        if steps.get("trust") == "doing":
+            raise Reject(f"{pane} is a new orchestrator at Claude's folder-trust question: "
+                         "answer that first")
+        if steps.get("claude") != "ok" or start.get("restart"):
+            raise Reject(f"{pane} is a new orchestrator whose Claude isn't running yet")
+    why = orch.not_typable(pane)
+    if why:
+        raise Reject(why)
 
 
 def act_prompt(gw, body, rec):

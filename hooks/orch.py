@@ -62,6 +62,13 @@ EVIDENCE_TABS = ("report", "diff")  # where a chip with a pane opens that agent
 ANSWERED_SHOWN = 10 * 60  # an answered question stays in status this long (other devices)
 HOOK = Path(__file__).resolve().parent / "context-handoff.py"
 PROJECTS = Path.home() / ".claude" / "projects"  # the transcripts
+LIMITS = {}  # transcript -> ((size, mtime), what limit_stop found in it)
+LIMIT_TAIL = 1 << 16  # bytes of a transcript read for its last turn's end
+AGENTS_VIEW = re.compile(r"(?:^|· )claude agents$")  # the terminal title of Claude's agents view
+VIEW_STATE = {"agents": "agents_view", "trust": "trust"}
+STOPPED = {"limit": "stopped at its usage limit",
+           "agents_view": "its pane shows Claude's agents view: typing there starts a new session",
+           "trust": "its pane is at Claude's folder-trust question: Enter there quits Claude"}
 PROC = Path("/proc")
 STARTS = Path.home() / ".claude" / "orch" / "new"  # orch new: <id>/new.json and <id>/brief.md
 START_SHOWN = 86400  # an unfinished start shows in the fleet this long
@@ -139,14 +146,63 @@ def agents():
 
 
 def prompt(pane, text):
+    if not_typable(pane):
+        return False
     result = herdr("agent", "prompt", pane, text)
     return result.returncode == 0
 
 
-def screen_lines(pane, lines, source="recent"):
-    """The pane's last `lines` lines of terminal text, or None when herdr can't read it."""
+def not_typable(pane):
+    """Why nothing may be typed into the pane now, or None. In Claude Code's agents view the
+    text starts a new session; at its folder-trust question Enter picks "No, exit"."""
+    agent = (agents() or {}).get(pane)
+    shown = pane_view(pane, agent) if agent else None
+    if shown == "agents":
+        return (f"{pane} shows Claude's agents view, not a conversation: what is typed there "
+                "starts a new session. Open a session or leave the view in the pane first")
+    if shown == "trust":
+        return f"{pane} is at Claude's folder-trust question: answer it in the pane first"
+    return None
+
+
+def pane_view(pane, info, listed=True):
+    """What the pane shows in place of a conversation: "agents", "trust" or None. `info` is its
+    entry in `herdr agent list`, or `pane list` with listed=False. herdr calls an agent at the
+    trust question blocked, so only such a one needs its screen read."""
+    if AGENTS_VIEW.search((info or {}).get("terminal_title") or ""):
+        return "agents"
+    if listed and (info or {}).get("agent_status") != "blocked":
+        return None
+    return "trust" if at_trust_question(screen_lines(pane, 40, "visible", "pane")) else None
+
+
+def at_trust_question(lines):
+    """Whether Claude's folder-trust question ends the screen. Its words alone don't say so: a
+    pane keeps them above the shell prompt long after Claude quit."""
+    words = " ".join(lines or []).split()
+    return "Esc to cancel" in " ".join(words[-8:]) and "trust this folder" in " ".join(words)
+
+
+def other_panes(ags):
+    """The panes herdr lists no agent for that show the agents view or the trust question."""
     try:
-        r = herdr("agent", "read", pane, "--source", source, "--lines", str(lines),
+        panes = json.loads(herdr("pane", "list").stdout)["result"]["panes"]
+    except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError):
+        return []
+    out = []
+    for p in panes:
+        if p["pane_id"] not in ags:
+            shown = pane_view(p["pane_id"], p, listed=False)
+            if shown:
+                out.append({"pane": p["pane_id"], "state": VIEW_STATE[shown], "cwd": p.get("cwd")})
+    return out
+
+
+def screen_lines(pane, lines, source="recent", kind="agent"):
+    """The pane's last `lines` lines of terminal text, or None when herdr can't read it. kind
+    "pane" reads a pane herdr lists no agent in too."""
+    try:
+        r = herdr(kind, "read", pane, "--source", source, "--lines", str(lines),
                   "--format", "text", timeout=20)
     except (OSError, subprocess.SubprocessError):
         return None
@@ -180,6 +236,35 @@ def tail_records(path, size):
         if isinstance(record, dict):
             out.append(record)
     return out
+
+
+def limit_stop(session):
+    """{"text", "since"} when Claude's limit message ended the session's last turn, else None.
+    Only the transcript says so: no Stop hook runs for such a turn, and the agent reads as idle."""
+    path = transcript_path(session)
+    if path is None:
+        return None
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    key = (stat.st_size, stat.st_mtime_ns)
+    if LIMITS.get(path, (None,))[0] != key:
+        LIMITS[path] = key, last_limit(tail_records(path, LIMIT_TAIL))
+    return LIMITS[path][1]
+
+
+def last_limit(records):
+    for record in reversed(records):
+        if record.get("type") == "user":
+            return None  # a turn began after it
+        if record.get("type") == "assistant":
+            if record.get("error") != "rate_limit":
+                return None
+            content = (record.get("message") or {}).get("content") or []
+            when = datetime.fromisoformat(record["timestamp"].replace("Z", "+00:00"))
+            return {"text": " ".join(b.get("text", "") for b in content), "since": when.timestamp()}
+    return None
 
 
 # --- this machine ------------------------------------------------------------------------
@@ -352,12 +437,20 @@ def view(pane, agent, run, at):
         "last": fresh.get("last") or "",
         "park": park,
         "report": st.get("report"),  # the latest, whichever session wrote it (it has its time)
+        "pane_view": pane_view(pane, agent) if agent else None,
+        # the status's session: the agents view keeps herdr on a session that ended
+        "limit": limit_stop(st.get("session") or session) if agent else None,
         "account": fresh.get("account"),
         "context_tokens": (live.get("context_tokens") if session and live.get("session") == session
                            else fresh.get("context_tokens")),
         "switch": (accounts.get("switch") or {}).get(pane),  # pending
         "spill": spill_state(pane, agent, fresh, accounts),
     }
+
+
+def stopped_state(v):
+    """limit, agents_view or trust for an agent that can't go on by itself, else None."""
+    return "limit" if v["limit"] else VIEW_STATE.get(v["pane_view"])
 
 
 def first_line(text, width=90):
@@ -368,7 +461,7 @@ def first_line(text, width=90):
 def table(views, at):
     rows = []
     for v in views:
-        state = v["state"]
+        state = stopped_state(v) or v["state"]
         if state in ("idle", "done") and v["park"]:
             state = "parked"
         elif state in ("idle", "done") and v["bg"]:
@@ -376,6 +469,8 @@ def table(views, at):
         since = ago(at - v["since"]) if v["since"] and state != "working" else "-"
         note = (f"parked: {v['park'].get('reason', '')}" if state == "parked"
                 else f"waits on: {v['bg'][0].get('what', '')}" if state == "own-job"
+                else v["limit"]["text"] if state == "limit"
+                else STOPPED[state] if state in STOPPED
                 else first_line(v["last"]) if state not in ("working", "missing") else "")
         rows.append(f"  {v['pane']:<9} {v['label'][:16]:<16} {state:<8} {since:>6}  "
                     f"{first_line(note, 100)}")
@@ -810,6 +905,9 @@ def classify(v, at, started, long_wait):
     """(key, line) for something about this worker that needs the orchestrator, else None.
     The key stays the same while the situation does, so a later wait doesn't repeat it."""
     s, label = v["state"], f"{v['pane']} {v['label']}".strip()
+    stopped = stopped_state(v)
+    if stopped:
+        return f"{stopped}:{v['session']}:{v['change']}", f"{stopped} {label}: {STOPPED[stopped]}"
     if s == "blocked":
         return (f"blocked:{v['session']}:{v['change']}",
                 (f"blocked {label}: at an approval or question dialog (read it with herdr "
@@ -910,6 +1008,10 @@ def nudge_reasons(run, ags, at, ws):
         key = f"{pane}:{v['state']}:{v['session']}:{v['seq']}"
         seen_now.add(key)
         since = v["since"] or first.setdefault(key, at)
+        stopped = stopped_state(v)
+        if stopped:
+            reasons[f"{pane}:{stopped}"] = f"{label}: {STOPPED[stopped]}"
+            continue
         if v["state"] == "missing":
             if at - first.setdefault(key, at) >= MISSING_GRACE:
                 reasons[f"{pane}:missing"] = f"{label} has no agent in its pane"
@@ -985,6 +1087,8 @@ def cmd_watchdog(args):
             ws.pop(key, None)
         if status not in ("idle", "done"):
             continue  # working: it will see the fleet at its turn end
+        if pane_view(orch, agent):
+            continue  # nothing can be typed there; the fleet says what the pane shows
         reasons = nudge_reasons(run, ags, at, ws)
         if not reasons:
             ws.pop("ignored", None)
@@ -1434,7 +1538,9 @@ def spill_state(pane, agent, st, acc):
     sw = (acc.get("switch") or {}).get(pane) or {}
     if sw.get("reason") in ("spill", "limit"):
         status = (agent or {}).get("agent_status")
+        view = AGENTS_VIEW.search((agent or {}).get("terminal_title") or "")
         reason = ("no agent in the pane" if not agent else "at a dialog" if status == "blocked"
+                  else "the pane shows the agents view" if view
                   else "working" if status == "working"
                   else "own job running" if st.get("background_tasks")
                   else "writing its handoff" if sw.get("handoff") else "the next watchdog pass")

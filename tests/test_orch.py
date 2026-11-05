@@ -61,6 +61,7 @@ def world(tmp_path, monkeypatch):
     spec.loader.exec_module(orch)
     w = World(orch, tmp_path / "handoffs")
     monkeypatch.setattr(orch, "ROOT", w.root)
+    monkeypatch.setattr(orch, "PROJECTS", tmp_path / "projects")
     monkeypatch.setattr(orch, "now", lambda: w.t)
     monkeypatch.setattr(orch, "sleep", w.sleep)
     monkeypatch.setattr(orch, "agents", lambda: dict(w.agents))
@@ -236,6 +237,97 @@ def test_watchdog_nudges_an_idle_orchestrator_about_an_idle_worker(world):
     world.sleep(5 * 60)
     world.run("watchdog")  # rate limited
     assert len(world.prompts) == 1
+
+
+AGENTS_VIEW = "1 awaiting input · claude agents"
+
+
+def real_prompt(world, monkeypatch, tmp_path):
+    """orch.prompt as installed: the world fakes it, and its herdr records what is typed."""
+    spec = importlib.util.spec_from_file_location("orch_real", ORCH)
+    real = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(real)
+    typed = []
+
+    def herdr(*args, **kw):
+        typed.append(args)
+        return SimpleNamespace(returncode=0, stdout=world.screen, stderr="")
+    monkeypatch.setattr(real, "herdr", herdr)
+    monkeypatch.setattr(real, "agents", lambda: dict(world.agents))
+    return real, typed
+
+
+def test_prompt_types_nothing_into_the_agents_view(world, monkeypatch, tmp_path):
+    world.screen = ""
+    real, typed = real_prompt(world, monkeypatch, tmp_path)
+    world.agent(W1, "idle")
+    world.agents[W1]["terminal_title"] = "✳ Fix the board"
+    assert real.prompt(W1, "go on") is True
+    assert ("agent", "prompt", W1, "go on") in typed
+
+    del typed[:]
+    for title in (AGENTS_VIEW, "claude agents"):
+        world.agents[W1]["terminal_title"] = title
+        assert real.prompt(W1, "go on") is False
+    assert not [c for c in typed if c[:2] == ("agent", "prompt")]
+
+
+def test_prompt_types_nothing_into_a_trust_question(world, monkeypatch, tmp_path):
+    world.screen = " ❯ No, exit\n   Yes, I trust this folder\n\n Enter to confirm · Esc to cancel\n"
+    real, typed = real_prompt(world, monkeypatch, tmp_path)
+    world.agent(W1, "blocked")
+
+    assert real.prompt(W1, "go on") is False
+
+    assert not [c for c in typed if c[:2] == ("agent", "prompt")]
+
+
+def test_watchdog_types_no_nudge_into_the_agents_view(world):
+    start_run(world)
+    world.turn_end(BOSS, bg=["orch wait"])
+    world.agents[BOSS]["terminal_title"] = AGENTS_VIEW
+    world.agent(W1, "idle")
+    world.turn_end(W1, ago=11 * 60)
+    world.agent(W2, "working")
+
+    world.run("watchdog")
+
+    assert world.prompts == []
+    assert [e for e in world.events() if e["kind"] == "nudge"] == []
+
+
+def test_watchdog_tells_the_orchestrator_not_to_type_into_a_workers_agents_view(world):
+    start_run(world)
+    world.turn_end(BOSS, bg=["orch wait"])
+    world.agent(W1, "idle")
+    world.agents[W1]["terminal_title"] = AGENTS_VIEW
+    world.turn_end(W1, ago=11 * 60)
+    world.agent(W2, "working")
+
+    world.run("watchdog")
+
+    [(pane, text)] = world.prompts
+    assert pane == BOSS and "agents view" in text and "idle 11m" not in text
+
+
+def test_wait_reports_a_worker_in_the_agents_view_once(world, capsys):
+    start_run(world)
+    world.agent(W1, "idle")
+    world.agents[W1]["terminal_title"] = AGENTS_VIEW
+    world.agent(W2, "working")
+
+    assert world.run("wait") == 0
+
+    out = capsys.readouterr().out
+    assert "EVENT agents_view w1:p1 builder: its pane shows Claude's agents view" in out
+    assert "EVENT idle" not in out
+
+
+def test_spill_says_why_a_pane_in_the_agents_view_waits(world):
+    agent = {"agent_status": "idle", "terminal_title": AGENTS_VIEW}
+    acc = {"switch": {W1: {"account": "2", "reason": "spill", "time": 1.0, "handoff": 2.0}}}
+
+    assert world.orch.spill_state(W1, agent, {}, acc)["reason"] == "the pane shows the agents view"
 
 
 def test_watchdog_leaves_a_working_orchestrator_and_parked_workers_alone(world):

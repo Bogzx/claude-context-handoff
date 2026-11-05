@@ -68,6 +68,19 @@ Every takeover is logged in `~/.claude/handoffs/respawn.log` and `events.jsonl`.
 raises a herdr notification and goes to the owner's notify command (see [Alerts](#alerts)). A postponed takeover is
 logged as `postponed: <why>`.
 
+### Claude Code's agents view
+
+The left arrow on an empty prompt moves the conversation to a background session and turns the pane into Claude
+Code's agents view. The terminal title then ends in `claude agents`. What is typed in that view starts a new session,
+so a takeover never types there: it is postponed before `/exit`, and a new agent in the view is treated like one at a
+dialog. The shell line is only sent to a pane that herdr has released. If an agent stays in the pane after `/exit`, the
+takeover fails and nothing is typed.
+
+A background session (`CLAUDE_CODE_SESSION_KIND=bg`) inherits the pane's `HERDR_PANE_ID`, but the pane doesn't run it,
+and its nearest `claude` process is the daemon that hosts all of them. It gets no takeover: its turn end raises a
+`respawn-failed` alert instead. A session opened from the view looks like any conversation in the pane, so a prompt
+sent to the pane reaches that session.
+
 ### Background tasks
 
 `/exit` would kill background tasks, so the takeover waits until none are running. The handoff notice asks the agent
@@ -441,6 +454,9 @@ Not in the gateway yet: the diff view, the activity lanes and the per-agent mode
   still work. A file prompt's `command` is the file's name, which the question gives in full.
 - `prompt`, `nudge`, `interrupt` and `answer` are refused (409) for a start's pane until Claude runs there and its
   folder-trust question is answered. Before that, a shell would read the text, or its keys could answer the dialog.
+  They are refused (409) the same way for any pane in Claude Code's agents view, where the text would start a new
+  session, or at its folder-trust question. `orch.prompt` itself types nothing into those two, so the watchdog,
+  `orch answer` and the account switch don't either.
 - `/v1/health` has `can_start` and, when false, `cannot_start`: ORCH_START_ROOTS not set, herdr not running, or
   claude-acc missing; and `dialogs: ["trust", "permission"]`, the dialog kinds the `dialog` action answers.
 - `/v1/health` also has `capacity`, for the form's machine line: `{agents, mem_free_gb, mem_total_gb, load_avg: [1, 5
@@ -452,6 +468,15 @@ Not in the gateway yet: the diff view, the activity lanes and the per-agent mode
   agent's dialog during the `trust` step has `kind: "trust"` and the folder as `cwd`. A tool permission prompt
   has `kind: "permission"` with `tool` and `command` when the screen shows them. Questions carry `kind`
   (`"plan"`), runs started this way `run.settings`, and a `start` action's status its `pane`.
+- An agent that can't go on by itself has a `state` of its own, and an orchestrator in one has the same `activity`:
+  `limit` (Claude's usage limit ended its last turn; `limit` holds the message as `text` and its time as `since`),
+  `agents_view` (the pane shows Claude Code's agents view; its conversation may still run in the background) or `trust`
+  (the pane is at the folder-trust question). `limit` wins over the other two. `pane_view` is `agents`, `trust` or null,
+  whatever `state` says: it tells whether typing is refused. No Stop hook runs for a turn the limit ended, so the gateway
+  reads the end of the transcript of the session in the pane's status file.
+- `/v1/fleet`'s `panes` lists the panes herdr has no agent in that show the view or the question, as
+  `{pane, state, cwd}`, read at most every 30 s. Words left on a screen don't count: the question must end the screen,
+  because a pane keeps them above the shell prompt after Claude quit.
 - An agent's `state` is `unknown` when herdr has it but can't say what it's doing. An orchestrator in that state keeps
   activity `working`, because nothing shows it stopped.
 - `run.cost_usd` and `run.week_points` in `/v1/fleet` and `state` pushes come from the background usage pass, every 5
