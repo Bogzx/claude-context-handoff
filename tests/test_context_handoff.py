@@ -3,6 +3,7 @@ import importlib.util
 import io
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -29,9 +30,10 @@ st = json.loads(path.read_text()) if path.exists() else {"phase": "old", "new": 
 def agent():
     if st["phase"] == "old":
         return {"pane_id": "w1:p1", "name": "w1", "agent_status": cfg.get("old", "idle"),
-                "agent_session": {"value": "s1"}}
+                "agent_session": {"value": "s1"}, "terminal_title": cfg.get("title", "* w1")}
     if st["phase"] == "new":
-        return {"pane_id": "w1:p1", "agent_status": st["new"], "agent_session": {"value": "s2"}}
+        return {"pane_id": "w1:p1", "agent_status": st["new"], "agent_session": {"value": "s2"},
+                "terminal_title": cfg.get("new_title", "* w1")}
     return None
 rc = 0
 if args[:2] == ["agent", "get"]:
@@ -42,7 +44,7 @@ elif st.get("dialog") and args[:2] in (["agent", "prompt"], ["agent", "send-keys
     st["phase"] = "gone"  # its Enter picked "No, exit" at the trust question: Claude quit
 elif args[:2] == ["agent", "prompt"]:
     if args[3] == "/exit":
-        st["phase"] = "gone"
+        st["phase"] = "old" if cfg.get("stays") else "gone"  # stays: Claude's view keeps running
     elif st["phase"] == "new" and cfg.get("prompt_starts", True):
         st["new"] = "working"
 elif args[:2] == ["agent", "send-keys"]:
@@ -939,6 +941,111 @@ def test_a_takeover_prompts_once_the_trust_question_is_answered(hook, takeover, 
     assert len(prompts(calls)) == 1
     events = [json.loads(x) for x in (hook.ROOT / "events.jsonl").read_text().splitlines()]
     assert [e["kind"] for e in events] == ["respawn-dialog", "respawn"]
+
+
+AGENTS_VIEW = "1 awaiting input · claude agents"  # the title of Claude Code 2.1.318's view
+
+
+def typed(calls):
+    return [c for c in calls() if c[:2] in (["agent", "prompt"], ["agent", "send-keys"],
+                                            ["pane", "run"])]
+
+
+@pytest.mark.parametrize("title", [AGENTS_VIEW, "claude agents"])
+def test_a_takeover_leaves_a_pane_in_the_agents_view_alone(hook, takeover, herdr_stub, title):
+    calls, configure = herdr_stub
+    configure(title=title)
+
+    assert hook.respawn(takeover.job) is False
+
+    assert typed(calls) == []  # /exit, the shell line and the prompt would each start a session
+    lineage = Path(takeover.job["dir"])
+    assert (lineage / "handoff.md").exists() and not (lineage / "gen-01.md").exists()
+    assert "respawned" not in json.loads(takeover.state.read_text())  # the next turn end retries
+    assert "agents view" in (hook.ROOT / "respawn.log").read_text()
+
+
+def test_a_session_named_after_the_view_is_still_a_conversation(hook, takeover, herdr_stub):
+    calls, configure = herdr_stub
+    configure(title="* Review the claude agents")
+
+    assert hook.respawn(takeover.job) is True
+
+    assert [c for c in calls() if c[:2] == ["pane", "run"]]
+
+
+def test_an_account_switch_leaves_a_pane_in_the_agents_view_alone(hook, switch, herdr_stub,
+                                                                  capsys):
+    job, _ = switch
+    calls, configure = herdr_stub
+    configure(title=AGENTS_VIEW)
+
+    assert hook.respawn(job) is False
+
+    assert typed(calls) == [] and "agents view" in capsys.readouterr().err
+
+
+def test_a_takeover_types_no_shell_line_into_a_pane_that_keeps_its_agent(hook, takeover,
+                                                                         herdr_stub):
+    calls, configure = herdr_stub
+    configure(stays=True)  # 2026-11-05: Claude's view stayed up, and took the line for a task
+
+    assert hook.respawn(takeover.job) is False
+
+    assert [c[:2] for c in typed(calls)] == [["agent", "prompt"]]  # only /exit
+    assert (Path(takeover.job["dir"]) / "handoff.md").exists()  # not consumed: nothing started
+    events = [json.loads(x) for x in (hook.ROOT / "events.jsonl").read_text().splitlines()]
+    assert [e["kind"] for e in events] == ["respawn-failed"]
+    assert "nothing typed" in events[0]["body"]
+
+
+def test_a_takeover_holds_its_prompt_while_the_new_agent_shows_the_agents_view(
+        hook, takeover, herdr_stub, monkeypatch):
+    calls, configure = herdr_stub
+    configure(new="idle", new_title=AGENTS_VIEW)
+    clock = iter(range(0, 10 ** 6, 5))
+    monkeypatch.setattr(hook.time, "time", lambda: float(next(clock)))
+
+    assert hook.respawn(takeover.job) is False
+
+    assert prompts(calls) == [] and not [c for c in calls() if c[:2] == ["agent", "send-keys"]]
+    events = [json.loads(x) for x in (hook.ROOT / "events.jsonl").read_text().splitlines()]
+    assert [e["kind"] for e in events] == ["respawn-dialog", "respawn-failed"]
+
+
+@pytest.fixture
+def named_claude(tmp_path):
+    """A running process whose comm is "claude", as the daemon's is; it is stopped afterwards."""
+    binary = tmp_path / "claude"
+    shutil.copy(shutil.which("sleep"), binary)
+    process = subprocess.Popen([str(binary), "60"])
+    yield process.pid
+    process.kill()
+    process.wait()
+
+
+def test_a_background_session_never_takes_the_daemon_for_its_agent(hook, monkeypatch,
+                                                                   named_claude):
+    monkeypatch.setattr(hook.os, "getppid", lambda: named_claude)
+    monkeypatch.delenv("CLAUDE_CODE_SESSION_KIND", raising=False)
+    assert hook.claude_pid() == named_claude  # a pane's own Claude
+
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_KIND", "bg")
+    assert hook.claude_pid() is None
+
+
+def test_a_background_session_starts_no_takeover_and_says_so(hook, monkeypatch, named_claude):
+    monkeypatch.setattr(hook.os, "getppid", lambda: named_claude)
+    monkeypatch.setenv("HERDR_PANE_ID", PANE)
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_KIND", "bg")
+    monkeypatch.setattr(hook.subprocess, "Popen", lambda *a, **k: pytest.fail("a takeover ran"))
+    lineage = hook.new_lineage(hook.ROOT / "work-proj", "s1")
+
+    assert hook.start_respawn({"session_id": "s1"}, lineage, "claude-opus-5-5") is False
+
+    [event] = [json.loads(x) for x in (hook.ROOT / "events.jsonl").read_text().splitlines()]
+    assert event["kind"] == "respawn-failed" and event["pane"] == PANE
+    assert "background" in event["body"] and str(lineage) in event["body"]
 
 
 def test_account_switch_now_reports_a_dialog_in_the_new_agent(hook, switch, herdr_stub, capsys):

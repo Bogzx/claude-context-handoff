@@ -63,6 +63,69 @@ BASH_3 = """\
 
  Esc to cancel
 """
+# The same prompt for a 78-line command, from the real binary in a 155 x 44 terminal against a
+# fake API (2026-11-05): only its end is on screen, and a long command keeps its left bar.
+LONG_BASH = """\
+ │
+ │     line 41 of a long heredoc, indented on purpose
+ │     line 42 of a long heredoc, indented on purpose
+ │     line 43 of a long heredoc, indented on purpose
+ │     line 44 of a long heredoc, indented on purpose
+ │     line 45 of a long heredoc, indented on purpose
+ │     line 46 of a long heredoc, indented on purpose
+ │     line 47 of a long heredoc, indented on purpose
+ │     line 48 of a long heredoc, indented on purpose
+ │     line 49 of a long heredoc, indented on purpose
+ │     line 50 of a long heredoc, indented on purpose
+ │     line 51 of a long heredoc, indented on purpose
+ │     line 52 of a long heredoc, indented on purpose
+ │     line 53 of a long heredoc, indented on purpose
+ │     line 54 of a long heredoc, indented on purpose
+ │     line 55 of a long heredoc, indented on purpose
+ │     line 56 of a long heredoc, indented on purpose
+ │     line 57 of a long heredoc, indented on purpose
+ │     line 58 of a long heredoc, indented on purpose
+ │     line 59 of a long heredoc, indented on purpose
+ │     line 60 of a long heredoc, indented on purpose
+ │
+ │     line 61 of a long heredoc, indented on purpose
+ │     line 62 of a long heredoc, indented on purpose
+ │     line 63 of a long heredoc, indented on purpose
+ │     line 64 of a long heredoc, indented on purpose
+ │     line 65 of a long heredoc, indented on purpose
+ │     line 66 of a long heredoc, indented on purpose
+ │     line 67 of a long heredoc, indented on purpose
+ │     line 68 of a long heredoc, indented on purpose
+ │     line 69 of a long heredoc, indented on purpose
+ │     line 70 of a long heredoc, indented on purpose
+ │ EOF
+ │ echo
+ │ xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+ │ xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ Do you want to proceed?
+ ❯ 1. Yes
+   2. Yes, and always allow access to /tmp from this project
+   3. Yes, and switch to auto mode · auto mode handles these prompts for you
+   4. No
+
+ Esc to cancel · Tab to amend
+"""
+SHORT_BASH = """\
+ Write the lab notes
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ │ rm -rf build
+ │
+ │ ls
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ Do you want to proceed?
+ ❯ 1. Yes
+   2. Yes, and always allow access to tmp/ from this project
+   3. Yes, and switch to auto mode · auto mode handles these prompts for you
+   4. No
+
+ Esc to cancel · Tab to amend
+"""
 WRITE = """\
  hello.txt
 ╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
@@ -99,6 +162,7 @@ class World:
         self.tab_ok = True  # whether `herdr tab create` opens NEW
         self.tab_cwd = None
         self.tab_alive = False  # whether the tab outlives its pane (someone split it)
+        self.others = {}  # pane -> screen, for panes herdr lists no agent in
         self.screen = "Bash command\n  rm saves/tmp/x.lsv\nDo you want to proceed?\n"
         self.whois = {"127.0.0.1": {"Node": {"StableID": "nPHONE", "ComputedName": "phone",
                                              "Name": "phone.tail.ts.net."}},
@@ -123,6 +187,13 @@ class World:
         if args[:2] == ("agent", "read"):
             return SimpleNamespace(returncode=0 if args[2] in self.agents else 1,
                                    stdout=self.screen, stderr="")
+        if args[:2] == ("pane", "read"):
+            return SimpleNamespace(returncode=0, stdout=self.others.get(args[2], self.screen),
+                                   stderr="")
+        if args[:2] == ("pane", "list"):
+            panes = [{"pane_id": p, "cwd": "/work/other"} for p in self.others]
+            return SimpleNamespace(returncode=0, stderr="", stdout=json.dumps(
+                {"result": {"panes": list(self.agents.values()) + panes}}))
         if args[:2] == ("tab", "create"):
             if not self.tab_ok:
                 return SimpleNamespace(returncode=1, stdout="", stderr="no such workspace")
@@ -208,6 +279,34 @@ def world(tmp_path, monkeypatch):
     return w
 
 
+def long_command():
+    """The command LONG_BASH shows the end of: its first line is off the screen."""
+    body = ["cat > /tmp/lab-notes.txt <<'EOF'"]
+    for i in range(1, 71):
+        body.append(f"    line {i:02d} of a long heredoc, indented on purpose")
+        if i % 20 == 0:
+            body.append("")
+    return "\n".join(body + ["EOF", "echo " + "x" * 300])
+
+
+def transcript(world, session, *records):
+    path = world.orch.PROJECTS / "-work-proj" / f"{session}.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "a") as f:
+        f.writelines(json.dumps(record) + "\n" for record in records)
+
+
+def tool_call(command, tool_id="toolu_1", description="Write the lab notes"):
+    return {"type": "assistant", "message": {"content": [
+        {"type": "tool_use", "id": tool_id, "name": "Bash",
+         "input": {"command": command, "description": description}}]}}
+
+
+def tool_result(tool_id="toolu_1"):
+    return {"type": "user", "message": {"content": [
+        {"type": "tool_result", "tool_use_id": tool_id, "content": "ok"}]}}
+
+
 def start_run(w):
     w.orch.main(["--orch", BOSS, "run", "start", "--until", "+8h", "--goal", "ship the fixes",
                  "--workers", f"{W1}=builder,{W2}=tester"])
@@ -217,12 +316,14 @@ def start_run(w):
 # A key ending in "?" may be missing or null. A set is an enum, a list holds items of one shape.
 
 NUM = (int, float)
-STATE = {"working", "blocked", "idle", "own-job", "parked", "missing", "unknown"}
+STATE = {"working", "blocked", "idle", "own-job", "parked", "missing", "unknown", "limit",
+         "agents_view", "trust"}
 AGENT = {"pane": str, "label": str, "state": STATE,
          "agent_status?": {"working", "idle", "done", "blocked", "unknown"}, "since?": NUM,
          "session?": str, "account?": str, "model?": str, "context_tokens?": int,
          "background_tasks": [{"type?": str, "id?": str, "what": str, "since?": NUM}],
          "last": str, "park?": {"reason": str, "since": NUM, "until?": NUM},
+         "pane_view?": {"agents", "trust"}, "limit?": {"text": str, "since": NUM},
          "switch?": {"account": str, "when": {"handoff", "idle"}, "time": NUM,
                      "reason?": {"spill", "limit"}, "why?": str, "handoff?": NUM},
          "report?": dict}
@@ -245,7 +346,8 @@ QUESTION = {"id": str, "pane": str, "time": NUM, "text": str,
             "evidence": [EVIDENCE], "rule?": str, "kind?": {"plan"}, "answer?": str,
             "answered?": NUM, "default?": str, "default_at?": NUM, "by_default": bool}
 DIALOG = {"pane": str, "label": str, "since?": NUM, "change": int, "tool?": str,
-          "command?": str, "cwd?": str, "doing?": str, "danger": bool, "text": str,
+          "command?": str, "command_cut?": bool, "cwd?": str, "doing?": str, "danger": bool,
+          "text": str,
           "kind?": {"trust"}}
 STALL = {"nudged_at?": NUM, "reasons": [{"key": str, "kind": str, "pane?": str, "text": str,
                                          "fix?": str, "message?": str, "picked": bool}]}
@@ -258,7 +360,8 @@ ACCOUNT = {"id": str, "name": str, "login?": str, "config_dir": str, "logged_in"
 ACTION_STATUS = {"id": str, "status": {"delivered", "picked", "rejected", "failed"},
                  "delivered_at?": NUM, "picked_at?": NUM, "error?": str, "pane?": str}
 ORCHESTRATOR = {"pane": str, "name": str, "machine": str, "cwd?": str,
-                "activity": {"working", "waiting", "stalled", "done", "offline", "starting"},
+                "activity": {"working", "waiting", "stalled", "done", "offline", "starting", "limit",
+                             "agents_view", "trust"},
                 "activity_since?": NUM, "agent": AGENT,
                 "run?": {"goal": str, "created": NUM, "until": NUM, "ended?": NUM,
                          "settings?": dict, "cost_usd?": NUM, "week_points?": NUM},
@@ -274,7 +377,8 @@ SPILL = {"from": str, "at": NUM, "to": str, "time": NUM,
                      "resets_at?": NUM}}
 FLEET = {"version": int, "machine": str, "time": NUM, "gaming": bool,
          "orchestrators": [ORCHESTRATOR],
-         "accounts": dict, "default_account": str, "actions": [ACTION_STATUS], "spill?": SPILL}
+         "accounts": dict, "default_account": str, "actions": [ACTION_STATUS], "spill?": SPILL,
+         "panes": [{"pane": str, "state": {"agents_view", "trust"}, "cwd?": str}]}
 DECISIONS = {"pane": str, "log": str, "decisions": [
     {"id": str, "generation": int, "line": int, "time?": str, "by": str, "who": {"user", "agent"},
      "quote?": str, "what": str, "why": str, "superseded_by?": str}]}
@@ -1436,13 +1540,328 @@ def test_permission_prompts_parse_from_captured_screens(world):
         assert serve.permission(other.split("\n")) is None
 
 
+# A pane keeps the words of a question Claude left: this one has been a plain shell for a day,
+# with "No, exit" still drawn above its prompt (2026-11-05, names changed).
+STALE_TRUST = """\
+ Accessing workspace:
+
+ /work/proj
+
+ Quick safety check: Is this a project you created or one you trust? (Like your own code, a
+ well-known open source project, or work from your team). If not, take a moment to review what's
+ in this folder first.
+
+ Claude Code'll be able to read, edit, and execute files here.
+
+ Security guide
+
+ ❯ No, exit
+   Yes, I trust this folder
+
+ Enter to confirm · Esc to cancel
+
+me in box in proj on main took 4h0m2s
+❯ claude --dangerously-skip-permissions --model opus
+
+Resume this session with:
+claude --dangerously-skip-permissions --model opus --resume 55a9c92f
+
+me in box in proj on main took 1h34m11s
+❯
+"""
+LIVE_TRUST = STALE_TRUST[:STALE_TRUST.index("me in box")]
+AGENTS_VIEW = "1 awaiting input · claude agents"  # the title of Claude Code 2.1.318's view
+LIMIT_TEXT = "You've hit your weekly limit · resets 6am (Europe/Bucharest)"
+
+
+def in_agents_view(world, pane):
+    world.agents[pane]["terminal_title"] = AGENTS_VIEW
+
+
+def limit_record(when="2026-11-05T16:57:06.367Z"):
+    """The record Claude Code 2.1.318 wrote for a turn the limit stopped: no Stop hook runs."""
+    return {"type": "assistant", "timestamp": when, "isApiErrorMessage": True,
+            "error": "rate_limit", "apiError": "usage_limit_reached",
+            "message": {"model": "<synthetic>", "role": "assistant",
+                        "content": [{"type": "text", "text": LIMIT_TEXT}]}}
+
+
+def test_nothing_typed_from_the_app_reaches_the_agents_view(world):
+    gw = world.serve.Gateway()
+    start_run(world)
+    world.agent(W1, "idle")
+    in_agents_view(world, BOSS)
+    in_agents_view(world, W1)
+    qid = world.orch.ask(W1, "Merge?")
+    sent = len(world.prompts)
+
+    for action in ({"kind": "prompt", "pane": W1, "text": "go on"},
+                   {"kind": "interrupt", "pane": W1},
+                   {"kind": "nudge", "orchestrator": BOSS, "text": "next"},
+                   {"kind": "answer", "question": qid, "text": "yes"}):
+        status, out = world.post(gw, **action)
+        assert status == 409, action
+        assert "agents view" in out["error"] and "new session" in out["error"]
+
+    assert len(world.prompts) == sent
+    assert not [c for c in world.herdr_calls if c[:2] == ("pane", "send-keys")]
+    assert world.orch.find_question(qid)[1].get("answered") is None
+
+
+def test_a_prompt_to_a_trust_question_outside_a_start_is_refused(world):
+    gw = world.serve.Gateway()
+    world.agent(W1, "blocked")
+    world.screen = LIVE_TRUST
+
+    status, out = world.post(gw, kind="prompt", pane=W1, text="go on")
+
+    assert status == 409 and "folder-trust question" in out["error"]
+    assert world.prompts == []
+
+
+def test_a_session_named_after_the_view_takes_typed_input(world):
+    gw = world.serve.Gateway()
+    world.agent(W1, "idle")
+    world.agents[W1]["terminal_title"] = "✳ Review the claude agents"
+
+    assert world.post(gw, kind="prompt", pane=W1, text="go on")[0] == 202
+
+
+def test_the_fleet_says_a_pane_is_in_the_agents_view(world):
+    gw = world.serve.Gateway()
+    start_run(world)
+    world.agent(W1, "idle")
+    world.agent(W2, "working")
+    in_agents_view(world, BOSS)
+    in_agents_view(world, W1)
+
+    lead = lead_of(world, gw, BOSS)
+
+    assert lead["activity"] == "agents_view"
+    assert (lead["agent"]["state"], lead["agent"]["pane_view"]) == ("agents_view", "agents")
+    assert [(w["state"], w["pane_view"]) for w in lead["workers"]] == [("agents_view", "agents"),
+                                                                       ("working", None)]
+    conforms(world.get(gw, "/v1/fleet")[1], FLEET)
+
+
+def test_the_fleet_says_an_orchestrator_stopped_at_its_limit(world):
+    gw = world.serve.Gateway()
+    start_run(world)
+    world.turn_end(BOSS)
+    transcript(world, f"s-{BOSS}", tool_result(), limit_record())
+
+    lead = lead_of(world, gw, BOSS)
+
+    assert lead["activity"] == "limit" and lead["agent"]["state"] == "limit"
+    assert lead["agent"]["limit"]["text"] == LIMIT_TEXT
+    assert lead["agent"]["limit"]["since"] == datetime(2026, 11, 5, 16, 57, 6, 367000,
+                                                       tzinfo=timezone.utc).timestamp()
+    assert lead["activity_since"] == lead["agent"]["limit"]["since"]
+    conforms(world.get(gw, "/v1/fleet")[1], FLEET)
+
+    transcript(world, f"s-{BOSS}", {"type": "user", "message": {"content": "go on"}})
+    assert lead_of(world, gw, BOSS)["agent"]["limit"] is None  # a new turn began
+
+
+def test_the_limit_of_a_session_herdr_has_lost_track_of_is_seen(world):
+    """The agents view keeps herdr on a session that ended; the status names the running one."""
+    gw = world.serve.Gateway()
+    start_run(world)
+    in_agents_view(world, BOSS)
+    world.turn_end(BOSS)
+    world.agents[BOSS]["agent_session"] = {"value": "s-ended"}
+    transcript(world, f"s-{BOSS}", limit_record())
+
+    lead = lead_of(world, gw, BOSS)
+
+    assert lead["activity"] == "limit"  # what stopped it, and the pane still says what it shows
+    assert lead["agent"]["pane_view"] == "agents"
+
+
+def test_an_earlier_limit_the_session_got_past_is_forgotten(world):
+    gw = world.serve.Gateway()
+    world.turn_end(BOSS)
+    transcript(world, f"s-{BOSS}", limit_record(),
+               {"type": "assistant", "message": {"content": [{"type": "text", "text": "back"}]}})
+
+    assert lead_of(world, gw, BOSS)["agent"]["state"] == "idle"
+
+
+def test_an_agent_at_the_trust_question_has_its_state_and_keeps_its_dialog(world):
+    gw = world.serve.Gateway()
+    start_run(world)
+    world.agent(W1, "blocked", change=7)
+    world.screen = LIVE_TRUST
+
+    lead = lead_of(world, gw, BOSS)
+
+    assert (lead["workers"][0]["state"], lead["workers"][0]["pane_view"]) == ("trust", "trust")
+    assert [d["pane"] for d in lead["dialogs"]] == [W1]
+
+
+def test_words_left_on_a_screen_are_not_a_question(world):
+    world.agent(W1, "blocked")
+    for screen, shown in ((LIVE_TRUST, "trust"), (TRUST, "trust"), (STALE_TRUST, None)):
+        world.screen = screen
+        assert world.orch.pane_view(W1, world.agents[W1]) == shown
+
+
+def test_the_fleet_lists_panes_herdr_has_no_agent_for(world):
+    gw = world.serve.Gateway()
+    world.others = {"w9:p1": LIVE_TRUST, "w9:p2": STALE_TRUST, "w9:p3": "me in box\n❯ \n"}
+
+    panes = world.get(gw, "/v1/fleet")[1]["panes"]
+
+    assert panes == [{"pane": "w9:p1", "state": "trust", "cwd": "/work/other"}]
+    conforms(world.get(gw, "/v1/fleet")[1], FLEET)
+
+
+def test_panes_without_an_agent_are_read_only_every_so_often(world):
+    gw = world.serve.Gateway()
+    world.others = {"w9:p1": LIVE_TRUST}
+
+    def reads():
+        return len([c for c in world.herdr_calls if c[:2] == ("pane", "read")])
+
+    world.get(gw, "/v1/fleet")
+    world.t += world.serve.PANES_EVERY - 1
+    assert world.get(gw, "/v1/fleet")[1]["panes"] != [] and reads() == 1
+    world.t += 1
+    world.get(gw, "/v1/fleet")
+    assert reads() == 2
+
+
+def test_the_new_agent_states_show_in_orch_status(world, capsys):
+    start_run(world)
+    world.agent(W1, "idle")
+    in_agents_view(world, W1)
+    world.turn_end(W2)
+    world.agent(W2, "idle")
+    transcript(world, f"s-{W2}", limit_record())
+
+    world.orch.main(["--orch", BOSS, "status"])
+
+    out = capsys.readouterr().out
+    assert re.search(r"w1:p1\s+builder\s+agents_view", out)
+    assert re.search(r"w1:p2\s+tester\s+limit", out) and LIMIT_TEXT[:30] in out
+
+
+def test_a_dialog_sends_the_whole_command_from_the_transcript(world):
+    gw = world.serve.Gateway()
+    start_run(world)
+    world.agent(W1, "blocked", change=7)
+    world.screen = LONG_BASH
+    whole = long_command()
+    transcript(world, f"s-{W1}", tool_result("toolu_0"), tool_call(whole))
+
+    [dialog] = lead_of(world, gw, BOSS)["dialogs"]
+
+    assert dialog["command"] == whole  # its top, its indentation and its blank lines
+    assert dialog["command"].startswith("cat > /tmp/lab-notes.txt")
+    assert (dialog["tool"], dialog["command_cut"]) == ("Bash", False)
+    assert "cat > /tmp/lab-notes.txt" not in dialog["text"]  # the screen never showed it
+
+
+def test_a_short_command_loses_its_bar_and_its_description(world):
+    gw = world.serve.Gateway()
+    start_run(world)
+    world.agent(W1, "blocked", change=7)
+    world.screen = SHORT_BASH
+    transcript(world, f"s-{W1}", tool_call("rm -rf build\n\nls"))
+
+    [dialog] = lead_of(world, gw, BOSS)["dialogs"]
+
+    assert (dialog["command"], dialog["command_cut"]) == ("rm -rf build\n\nls", False)
+
+
+@pytest.mark.parametrize("records", [
+    [],  # no transcript to read
+    [tool_call("rm -rf /somewhere/else")],  # another call than the dialog's
+    [tool_call("    line 60 of a long heredoc, indented on purpose")],  # holds one line, not all
+    [tool_call(long_command()), tool_result()],  # finished: the dialog is about another one
+    [tool_call(long_command(), "toolu_1"), tool_call(long_command(), "toolu_2")],  # which one?
+], ids=["none", "other", "partly", "finished", "two"])
+def test_a_command_the_transcript_does_not_confirm_is_marked_cut(world, records):
+    gw = world.serve.Gateway()
+    start_run(world)
+    world.agent(W1, "blocked", change=7)
+    world.screen = LONG_BASH
+    transcript(world, f"s-{W1}", *records)
+
+    [dialog] = lead_of(world, gw, BOSS)["dialogs"]
+
+    assert dialog["command_cut"] is True
+    assert "line 60" in dialog["command"] and "│" not in dialog["command"]  # what the screen has
+    assert "line 01" not in dialog["command"]
+
+
+def test_a_file_dialog_names_its_file_whole(world):
+    gw = world.serve.Gateway()
+    start_run(world)
+    world.agent(W1, "blocked", change=7)
+    world.screen = WRITE
+
+    [dialog] = lead_of(world, gw, BOSS)["dialogs"]
+
+    assert (dialog["tool"], dialog["command"], dialog["command_cut"]) == ("Write", "hello.txt",
+                                                                         False)
+
+
+def test_allow_is_refused_on_a_cut_command_and_deny_and_delegate_still_work(world):
+    gw = world.serve.Gateway()
+    start_run(world)
+    world.agent(W1, "blocked", change=7)
+    world.screen = LONG_BASH
+
+    refused = from_phone(world, gw, kind="dialog", pane=W1, change=7, choice="allow")
+
+    assert refused[0] == 409 and "answer it in the pane" in refused[1]["error"]
+    assert not [c for c in world.herdr_calls if c[:2] == ("agent", "send-keys")]
+    assert from_phone(world, gw, kind="dialog", pane=W1, change=7, choice="delegate")[0] == 202
+    assert "only the end of it is on screen" in world.prompts[-1][1]
+    assert from_phone(world, gw, kind="dialog", pane=W1, change=7, choice="deny")[0] == 202
+
+
+def test_allow_on_a_whole_command_logs_it_short_and_tells_the_orchestrator_all_of_it(world):
+    gw = world.serve.Gateway()
+    start_run(world)
+    world.agent(W1, "blocked", change=7)
+    world.screen = LONG_BASH
+    whole = long_command()
+    transcript(world, f"s-{W1}", tool_call(whole))
+
+    assert from_phone(world, gw, kind="dialog", pane=W1, change=7, choice="delegate")[0] == 202
+    assert whole in world.prompts[-1][1]
+    assert from_phone(world, gw, kind="dialog", pane=W1, change=7, choice="allow")[0] == 202
+
+    allowed = [e for e in world.events() if e["kind"] == "permission"][-1]
+    assert len(allowed["command"]) == 500 and len(allowed["body"]) < 600
+
+
+def test_a_long_command_is_never_cut_on_its_way_to_the_phone(world):
+    gw = world.serve.Gateway()
+    start_run(world)
+    world.agent(W1, "blocked", change=7)
+    world.screen = SHORT_BASH
+    noise = "".join(format(i * 2654435761 % 2 ** 32, "08x") for i in range(3000))  # no compressing
+    whole = "rm -rf build\n\nls\n" + noise
+    transcript(world, f"s-{W1}", tool_call(whole))
+    [dialog] = lead_of(world, gw, BOSS)["dialogs"]
+    assert dialog["command"] == whole
+
+    message = world.serve.orch_push.fit("box1", {"kind": "dialog", "seq": 1, "body": dialog})
+
+    assert message["body"] is None and message["trimmed"] == ["all"]  # the app refreshes
+
+
 def test_the_app_answers_a_permission_prompt_of_an_agent_in_a_run(world):
     gw = world.serve.Gateway()
     start_run(world)
     world.agent(W1, "blocked", change=7)
     world.screen = BASH
+    transcript(world, f"s-{W1}", tool_call("rm notes.txt", description="Remove notes.txt"))
     [dialog] = lead_of(world, gw, BOSS)["dialogs"]
-    assert (dialog["kind"], dialog["tool"], dialog["command"]) == ("permission", None,
+    assert (dialog["kind"], dialog["tool"], dialog["command"]) == ("permission", "Bash",
                                                                     "rm notes.txt")
     assert gw.route("GET", "/v1/health", {}, None, "127.0.0.1")[1]["dialogs"] == [
         "trust", "permission"]
