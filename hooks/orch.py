@@ -54,6 +54,7 @@ NUDGE_EVERY = 15 * 60
 NUDGE_BACKOFF = 60 * 60  # after IGNORED nudges in a row on the same problem
 IGNORED = 3
 DANGER = ("none", "deploy", "prod", "destructive")  # what saying yes to an option does
+ANSWERED_SHOWN = 10 * 60  # an answered question stays in status this long (other devices)
 HOOK = Path(__file__).resolve().parent / "context-handoff.py"
 PROJECTS = Path.home() / ".claude" / "projects"  # the transcripts
 SMALL_CONTEXT = 60_000  # a switching agent with less context is resumed, not handed off
@@ -136,7 +137,7 @@ def prompt(pane, text):
 
 # --- this machine ------------------------------------------------------------------------
 
-CONFIG = Path.home() / ".config" / "orch" / ".env"  # the gateway's: token, key, allow-list, names
+CONFIG = Path.home() / ".config" / "orch" / ".env"  # the gateway's: token, key, allow-list
 
 
 def read_env(path=None):
@@ -284,6 +285,7 @@ def view(pane, agent, run, at):
     st = status_of(pane)
     session = ((agent or {}).get("agent_session") or {}).get("value")
     fresh = st if st and session and st.get("session") == session else {}
+    live = load(ROOT / "agents" / "context" / f"{slug(pane)}.json")  # the hook, mid-turn
     park = ((run or {}).get("parked") or {}).get(pane)
     accounts = load(ROOT / "accounts.json")
     seq = (agent or {}).get("completion_seq")
@@ -304,7 +306,8 @@ def view(pane, agent, run, at):
         "park": park,
         "report": st.get("report"),  # the latest, whichever session wrote it (it has its time)
         "account": fresh.get("account"),
-        "context_tokens": fresh.get("context_tokens"),
+        "context_tokens": (live.get("context_tokens") if session and live.get("session") == session
+                           else fresh.get("context_tokens")),
         "switch": (accounts.get("switch") or {}).get(pane),  # pending
         "spill": spill_state(pane, agent, fresh, accounts),
     }
@@ -528,6 +531,13 @@ def cmd_last(args):
     return 0
 
 
+def shown_questions(run, at):
+    """The run's open questions, and those answered in the last ANSWERED_SHOWN seconds (with
+    `answer` and `answered`), so another device sees the answer."""
+    return [q for q in (run or {}).get("questions") or []
+            if not q.get("answered") or q["answered"] >= at - ANSWERED_SHOWN]
+
+
 def fleet(orch, run, workers, at):
     ags = agents()
     if ags is None:
@@ -549,8 +559,8 @@ def cmd_status(args):
                           "report": lead["report"], "account": lead["account"],
                           "switch": lead["switch"],
                           "spill": spill_summary(load(ROOT / "accounts.json")),
-                          "questions": [q for q in (run or {}).get("questions") or []
-                                        if not q.get("answered")]},
+                          "account_names": {k: a["name"] for k, a in account_list().items()},
+                          "questions": shown_questions(run, at)},
                          indent=1))
         return 0
     if run:
@@ -890,13 +900,36 @@ def cmd_decisions(args):
 # --- account switching -----------------------------------------------------------------------
 
 def account_list():
-    """Account number -> {dir, logged_in}: ~/.claude, then ~/.claude-2, ... while they exist."""
+    """Account number -> {dir, logged_in, name}: ~/.claude, then ~/.claude-2, ... while they
+    exist."""
+    names = load(ROOT / "accounts.json").get("names") or {}
     n, accounts = 1, {}
     while account_dir(n).exists():
         accounts[str(n)] = {"dir": str(account_dir(n)),
-                            "logged_in": (account_dir(n) / ".credentials.json").exists()}
+                            "logged_in": (account_dir(n) / ".credentials.json").exists(),
+                            "name": account_name(str(n), names)}
         n += 1
     return accounts
+
+
+def account_name(account, names):
+    """The name `orch account --name` gave the account, else "Acct N"."""
+    return names.get(account) or f"Acct {account}"
+
+
+def set_name(account, name):
+    """`orch account --name N NAME`; an empty NAME goes back to "Acct N"."""
+    if not re.fullmatch(r"\d+", account):
+        die(f"accounts are numbers (claude-acc N), not {account!r}")
+    path = ROOT / "accounts.json"
+    acc = load(path)
+    names = acc.setdefault("names", {})
+    if name.strip():
+        names[account] = name.strip()
+    else:
+        names.pop(account, None)
+    save(path, acc)
+    return account_name(account, names)
 
 
 def pane_claudes():
@@ -1265,6 +1298,9 @@ def cmd_account(args):
     if args.for_new:
         print(account_for_new(acc))
         return 0
+    if args.name:
+        print(f"account {args.name[0]} is named {set_name(*args.name)}")
+        return 0
     if not args.pane:
         accounts = account_list()
         out = {"accounts": accounts, "default": acc.get("default") or "1",
@@ -1274,7 +1310,8 @@ def cmd_account(args):
             print(json.dumps(out, indent=1))
             return 0
         for k, a in accounts.items():
-            print(f"account {k}: {a['dir']}" + ("" if a["logged_in"] else " (not logged in)")
+            print(f"account {k} ({a['name']}): {a['dir']}"
+                  + ("" if a["logged_in"] else " (not logged in)")
                   + (" (default)" if k == out["default"] else ""))
         if out["spill"]:
             sp = out["spill"]
@@ -1324,7 +1361,7 @@ def queue_switch(pane, account, when):
 def cmd_usage(args):
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     import orch_usage
-    return orch_usage.main(args, ROOT, now(), agents)
+    return orch_usage.main(args, ROOT, now(), agents, account_list())
 
 
 def cmd_serve(args):
@@ -1431,6 +1468,9 @@ def main(argv=None):
     acct.add_argument("--for-new", action="store_true",
                       help="print the account a new agent should start on (claude-acc N): the "
                            "spill target while the rule is active, else the default")
+    acct.add_argument("--name", nargs=2, metavar=("N", "NAME"),
+                      help="a short name for account N in status and the phone app (default "
+                           "\"Acct N\"; \"\" resets it)")
     acct.add_argument("--json", action="store_true")
     acct.set_defaults(func=cmd_account)
 

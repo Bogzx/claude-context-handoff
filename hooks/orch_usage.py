@@ -407,11 +407,18 @@ def blank():
     return {k: 0 for k in FIELDS}
 
 
-def report(root, projects, agents, at, hours):
+def report(root, projects, agents, at, hours, known=None):
+    """known: orch's accounts (number -> {name, ...}); one with no reading yet is listed with
+    no windows. Each window's agents get their share of its points: the week so far
+    (estimated_points), the last hour and today (the window's points per USD x their cost)."""
     cache = scan(root, projects, at, agents)
     runs = runs_of(root)
-    accounts = windows_report(root, at)
+    readings, known = windows_report(root, at), known or {}
+    accounts = {acc: {"id": acc, "name": (known.get(acc) or {}).get("name") or f"Acct {acc}",
+                      **(readings.get(acc) or {"updated": None, "stale": True, "windows": {}})}
+                for acc in sorted({*readings, *known}, key=lambda a: (len(a), a))}
     since = at - hours * 3600
+    midnight = time.mktime(time.localtime(at)[:3] + (0, 0, 0, 0, 0, -1))
     window_start = {(a, w): (info["resets_at"] or at) - WINDOWS[w]
                     for a, acc in accounts.items() for w, info in acc["windows"].items()
                     if w in WINDOWS}
@@ -458,19 +465,25 @@ def report(root, projects, agents, at, hours):
                 for t in targets:
                     for k in FIELDS:
                         t[k] = t.get(k, 0) + b.get(k, 0)
+                cost = b.get("cost", 0)
                 for (acc, w), start in window_start.items():
                     if acc == account and when + BUCKET > start:
-                        per = in_window.setdefault((acc, w), {})
                         k = pane or f"session:{sid[:8]}"
-                        per[k] = per.get(k, 0) + b.get("cost", 0)
+                        # cost in the window, in its last hour, today
+                        per = in_window.setdefault((acc, w), {}).setdefault(k, [0, 0, 0])
+                        per[0] += cost
+                        per[1] += cost if when >= at - 3600 else 0
+                        per[2] += cost if when >= midnight else 0
     for (acc, w), per in in_window.items():
-        total = sum(per.values()) or 1
+        total = sum(c[0] for c in per.values())
         win = accounts[acc]["windows"][w]
-        win["machine_cost_usd"] = round(sum(per.values()), 2)
-        win["agents"] = {k: {"share": round(v / total, 3),
-                             "estimated_points": round(v / total * (win["used_percentage"] or 0),
-                                                       1)}
-                         for k, v in sorted(per.items(), key=lambda kv: -kv[1])}
+        points = (win["used_percentage"] or 0) / (total or 1)  # per USD of this machine's cost
+        win["machine_cost_usd"] = round(total, 2)
+        win["agents"] = {k: {"share": round(c[0] / (total or 1), 3),
+                             "estimated_points": round(c[0] * points, 1),
+                             "points_last_hour": round(c[1] * points, 2),
+                             "points_today": round(c[2] * points, 2)}
+                         for k, c in sorted(per.items(), key=lambda kv: -kv[1][0])}
     for v in [machine, *per_agent.values(), *per_day.values(), *per_account.values()] + [
             t for r in per_run.values() for t in (r, r["orchestrator_tokens"], r["worker_tokens"])]:
         v["cost"] = round(v["cost"], 2)
@@ -488,8 +501,10 @@ def report(root, projects, agents, at, hours):
 def human(rep):
     lines = []
     for account, acc in rep["accounts"].items():
+        if not acc["windows"]:
+            lines.append(f"account {account} ({acc['name']}): no reading yet")
         for name, w in acc["windows"].items():
-            line = f"account {account} {name}: {w['used_percentage']}%"
+            line = f"account {account} ({acc['name']}) {name}: {w['used_percentage']}%"
             if w["resets_at"]:
                 line += f", resets {time.strftime('%a %H:%M', time.localtime(w['resets_at']))}"
             if w["burn_per_hour"] is not None:
@@ -506,14 +521,15 @@ def human(rep):
     return "\n".join(lines)
 
 
-def main(args, root, at, agents):
-    """`orch usage`; agents() is orch's pane -> herdr agent lookup (None without herdr)."""
+def main(args, root, at, agents, known=None):
+    """`orch usage`; agents() is orch's pane -> herdr agent lookup (None without herdr), known
+    orch's accounts."""
     if args.action == "capture":
         try:
             capture(sys.stdin.read(), os.environ, root, at)
         except Exception:  # noqa: BLE001, S110 the statusline must never show an error
             pass
         return 0
-    rep = report(root, Path.home() / ".claude" / "projects", agents(), at, args.hours)
+    rep = report(root, Path.home() / ".claude" / "projects", agents(), at, args.hours, known)
     print(json.dumps(rep, indent=1) if args.json else human(rep))
     return 0

@@ -88,11 +88,6 @@ def items(text):
     return [x.strip() for x in (text or "").split(",") if x.strip()]
 
 
-def account_names(env):
-    """ORCH_ACCOUNT_NAMES="1=work,2=personal" -> {"1": "work", "2": "personal"}"""
-    return dict(x.split("=", 1) for x in items(env.get("ORCH_ACCOUNT_NAMES")) if "=" in x)
-
-
 # --- tailscale ---------------------------------------------------------------------------------
 
 def tailscale(*args):
@@ -185,7 +180,8 @@ def agent_json(v, agent, role, first_seen):
 def question_json(q):
     return {"id": q.get("id"), "pane": q.get("pane"), "time": q.get("time"),
             "text": q.get("text") or "", "options": q.get("options") or [],
-            "evidence": q.get("evidence") or [], "rule": q.get("rule")}
+            "evidence": q.get("evidence") or [], "rule": q.get("rule"),
+            "answer": q.get("answer"), "answered": q.get("answered")}
 
 
 def screen_lines(pane, lines, source="recent"):
@@ -363,9 +359,9 @@ class Gateway:
         """This machine's name in the API, pushes and the relay (orch.machine_name)."""
         return orch.machine_name(read_env(self.config))
 
-    def account_names(self):
-        names = account_names(read_env(self.config))
-        return {a: names.get(a) or f"account {a}" for a in sorted(orch.account_list())}
+    @staticmethod
+    def account_names():
+        return {a: info["name"] for a, info in orch.account_list().items()}
 
     @staticmethod
     def orchestrators():
@@ -474,15 +470,16 @@ class Gateway:
             activity, since = ("stalled" if reasons else "waiting"), lead["since"]
             if reasons:
                 stall = stall_json(reasons, workers, v["report"], nudges.get(pane))
-        name = (agent or {}).get("name") or orch.first_line((run or {}).get("goal") or "", 60)
+        cwd = (run or {}).get("cwd") or (agent or {}).get("cwd") or ""
+        folder = os.path.basename(cwd.rstrip("/"))  # the run's folder names an unnamed one
         return {
-            "pane": pane, "name": name or pane, "machine": self.machine(),
+            "pane": pane, "name": (agent or {}).get("name") or folder or pane,
+            "machine": self.machine(),
             "cwd": (agent or {}).get("cwd") or (run or {}).get("cwd"),
             "activity": activity, "activity_since": since, "agent": lead,
             "run": {k: run.get(k) for k in ("goal", "created", "until", "ended")} if run else None,
             "report": lead["report"],
-            "questions": [question_json(q) for q in (run or {}).get("questions") or []
-                          if not q.get("answered")],
+            "questions": [question_json(q) for q in orch.shown_questions(run, at)],
             "dialogs": [dialog_json(a, ags.get(a["pane"])) for a in [lead, *workers]
                         if a["state"] == "blocked"],
             "stall": stall, "workers": workers,
@@ -493,8 +490,8 @@ class Gateway:
 
     def accounts(self, at):
         """Account id -> the API's Account: windows from usage.json with today's samples."""
-        names = account_names(read_env(self.config))
         known = orch.account_list()
+        names = orch.load(orch.ROOT / "accounts.json").get("names") or {}
         windows = orch_usage.windows_report(orch.ROOT, at)
         history = orch_usage.history(orch.ROOT, at - 86400)
         out = {}
@@ -507,7 +504,7 @@ class Gateway:
                     and isinstance((h.get("windows") or {}).get(name), dict)
                     and abs((h["windows"][name].get("resets_at") or 0)
                             - (win.get("resets_at") or 0)) < 120]
-            out[acc] = {"id": acc, "name": names.get(acc) or f"account {acc}",
+            out[acc] = {"id": acc, "name": orch.account_name(acc, names),
                         "config_dir": "~/.claude" if acc == "1" else f"~/.claude-{acc}",
                         "logged_in": (known.get(acc) or {}).get("logged_in", False),
                         "updated": w["updated"], "stale": w["stale"], "windows": w["windows"]}
@@ -516,16 +513,12 @@ class Gateway:
     def usage(self, hours):
         """`orch usage --json` for the period, with the API's per-agent numbers: tokens, cost and
         the points of the agent's account's week: its share of the current week window
-        (points_7d), and its cost in the last hour and today at the window's points per USD."""
+        (points_7d), and of its last hour and today (orch_usage's window agents)."""
         at = orch.now()
-        ags = orch.agents()
-        projects = Path.home() / ".claude" / "projects"
-        rep = orch_usage.report(orch.ROOT, projects, ags, at, hours)
-        midnight = time.mktime(time.localtime(at)[:3] + (0, 0, 0, 0, 0, -1))
-        periods = {"points_last_hour": 1.0, "points_today": (at - midnight) / 3600}
-        costs = {k: {self.key(a): a["cost"] for a in
-                     orch_usage.report(orch.ROOT, projects, ags, at, h)["agents"]}
-                 for k, h in periods.items()}
+        rep = orch_usage.report(orch.ROOT, Path.home() / ".claude" / "projects", orch.agents(),
+                                at, hours)
+        periods = {"points_last_hour": "points_last_hour", "points_today": "points_today",
+                   "points_7d": "estimated_points"}
         shares = {acc: ((info.get("windows") or {}).get("seven_day") or {}).get("agents") or {}
                   for acc, info in rep["accounts"].items()}
         accounts = self.accounts(at)
@@ -544,18 +537,16 @@ class Gateway:
                      orchestrator=(a["run"] or "").split("@")[0] or None,
                      tokens={k: a[k] for k in ("input", "output", "cache_read", "cache_write")},
                      cost_usd=a["cost"])
-            for k in periods:
-                cost = costs[k].get(self.key(a), 0)
-                a[k] = round(cost * ratio[account], 2) if account in ratio else None
-            a["points_7d"] = ((shares[account].get(self.key(a)) or {}).get("estimated_points", 0)
-                              if account in ratio else None)
+            for k, field in periods.items():
+                a[k] = ((shares[account].get(self.key(a)) or {}).get(field, 0)
+                        if account in ratio else None)
             if a["role"]:
                 agents.append(a)
                 continue
             o = other.setdefault(account, {"label": "Other sessions", "account": account,
-                                           "sessions": 0, "points_7d": 0, **{k: 0 for k in periods}})
+                                           "sessions": 0, **{k: 0 for k in periods}})
             o["sessions"] += len(a["sessions"])
-            for k in (*periods, "points_7d"):
+            for k in periods:
                 o[k] = None if a[k] is None or o[k] is None else round(o[k] + a[k], 2)
         for o in other.values():
             o["note"] = f"{o.pop('sessions')} sessions outside a run on {self.machine()}"
@@ -960,6 +951,6 @@ def pair(args):
     print(f"pushes: Firebase project {project}" if project else
           f"pushes: off until the service account key is at {orch_push.SA_FILE}")
     print(f"allowed tailnet nodes: {env.get('ORCH_ALLOW') or 'none yet (orch pair --allow NODE)'}")
-    print(f"config: {CONFIG} (ORCH_ACCOUNT_NAMES=1=work,2=personal names the accounts)")
+    print(f"config: {CONFIG}")
     print("start the gateway: systemctl --user start orch-serve")
     return 0

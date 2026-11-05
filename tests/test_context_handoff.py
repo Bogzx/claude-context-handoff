@@ -716,6 +716,26 @@ def test_the_status_file_keeps_the_report_and_records_the_account(hook, run, mon
     assert status["relaunch"][-4:-2] == ["--model", "claude-opus-5-5"]
 
 
+def test_context_tokens_are_recorded_at_session_start_and_during_the_turn(hook, run, monkeypatch):
+    monkeypatch.setattr(hook, "IN_HERDR", True)
+    monkeypatch.setenv("HERDR_PANE_ID", PANE)
+    monkeypatch.setattr(hook, "claude_pid", lambda: None)
+    live = hook.ROOT / "agents" / "context" / "w1-p1.json"
+
+    run("SessionStart", tokens=120_000, source="resume")  # a resumed session: its last call
+    assert json.loads(hook.status_path(PANE).read_text())["context_tokens"] == 120_000
+    assert json.loads(live.read_text())["context_tokens"] == 120_000
+    run("PostToolUse", tokens=124_000)  # less than CONTEXT_STEP: not rewritten
+    assert json.loads(live.read_text())["context_tokens"] == 120_000
+    run("PostToolUse", tokens=126_000)
+    assert json.loads(live.read_text())["context_tokens"] == 126_000
+    run("PostToolUse", session="s2", tokens=127_000)  # another session: always
+    assert {k: v for k, v in json.loads(live.read_text()).items() if k != "time"} == {
+        "session": "s2", "context_tokens": 127_000}
+    # mid-turn the status file (and the report the MCP server may be writing) is left alone
+    assert json.loads(hook.status_path(PANE).read_text())["context_tokens"] == 120_000
+
+
 @pytest.mark.parametrize("config_dir, account", [
     (None, "1"), ("~/.claude", "1"), ("~/.claude-2", "2"), ("~/.claude-2/", "2"),
     ("/opt/other", "/opt/other")])

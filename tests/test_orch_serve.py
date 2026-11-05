@@ -104,8 +104,9 @@ def world(tmp_path, monkeypatch):
     monkeypatch.setattr(orch, "_TAILNET_NAME", ["box1"])  # `tailscale status`'s Self.HostName
     monkeypatch.setattr(serve.orch_push, "PHONES", tmp_path / "config" / "phones.json")
     monkeypatch.setattr(serve.orch_push, "SA_FILE", tmp_path / "config" / "firebase-sa.json")
-    serve.write_env({"ORCH_TOKEN": TOKEN, "ORCH_ALLOW": "phone",
-                     "ORCH_ACCOUNT_NAMES": "1=main,2=spare"})
+    serve.write_env({"ORCH_TOKEN": TOKEN, "ORCH_ALLOW": "phone"})
+    orch.set_name("1", "main")  # `orch account --name`
+    orch.set_name("2", "spare")
     w.agent(BOSS, "idle", name="Website")
     return w
 
@@ -142,7 +143,7 @@ WORKER_REPORT = {"time": NUM, "summary": str, "status?": {"done", "partial", "bl
                  "needs_live_test?": [str], "issues_for_others?": [str]}
 QUESTION = {"id": str, "pane": str, "time": NUM, "text": str,
             "options": [{"label": str, "danger": {"none", "deploy", "prod", "destructive"}}],
-            "evidence": [dict], "rule?": str}
+            "evidence": [dict], "rule?": str, "answer?": str, "answered?": NUM}
 DIALOG = {"pane": str, "label": str, "since?": NUM, "change": int, "tool?": str,
           "command?": str, "cwd?": str, "doing?": str, "danger": bool, "text": str}
 STALL = {"nudged_at?": NUM, "reasons": [{"key": str, "kind": str, "pane?": str, "text": str,
@@ -388,6 +389,20 @@ def test_fleet_has_the_api_shape_and_the_stalled_run(world):
     assert fleet["default_account"] == "1"
 
 
+def test_an_unnamed_orchestrator_is_named_by_its_runs_folder_not_its_goal(world, tmp_path,
+                                                                          monkeypatch):
+    gw = world.serve.Gateway()
+    (tmp_path / "orch-app").mkdir()
+    monkeypatch.chdir(tmp_path / "orch-app")
+    start_run(world)  # the run's cwd
+    world.agent(BOSS, "idle")  # no herdr name
+    world.agent(LOOSE, "working")  # no run: its own cwd /work/proj
+    run, loose = world.get(gw, "/v1/fleet")[1]["orchestrators"]
+    assert run["name"] == "orch-app" and loose["name"] == "proj"
+    world.agents[LOOSE]["cwd"] = None
+    assert world.get(gw, "/v1/fleet")[1]["orchestrators"][1]["name"] == LOOSE
+
+
 def test_activity_follows_the_orchestrator(world):
     gw = world.serve.Gateway()
     start_run(world)
@@ -574,6 +589,20 @@ def test_actions_are_refused_with_a_reason(world):
     assert again[0] == 409 and "already answered" in again[1]["error"]
     rejected = [e for e in world.events() if e["kind"] == "action" and e["status"] != "delivered"]
     assert len(rejected) == 11 and all(e["source"] == "app" for e in rejected)
+
+
+def test_an_answered_question_stays_in_the_fleet_for_10_minutes(world):
+    gw = world.serve.Gateway()
+    start_run(world)
+    world.agent(W2, "idle")
+    qid = world.orch.ask(W2, "Merge #12?", [{"label": "Merge"}])
+    assert world.post(gw, kind="answer", question=qid, text="Merge")[0] == 202
+    world.t += 10 * 60
+    [q] = world.get(gw, "/v1/fleet")[1]["orchestrators"][0]["questions"]
+    conforms(q, QUESTION)
+    assert q["id"] == qid and q["answer"] == "Merge" and q["answered"] == world.t - 600
+    world.t += 1
+    assert world.get(gw, "/v1/fleet")[1]["orchestrators"][0]["questions"] == []
 
 
 def test_each_action_kind_does_its_job(world):

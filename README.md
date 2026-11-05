@@ -131,8 +131,8 @@ the whole fleet overnight (11.8 h), and "today's work is done" with three worker
 | `orch ask "<question>" [--option "Deploy" --danger deploy --option "Not yet"]` | Logs a question for the owner in the run and pushes it, with an id and the options the owner's app shows as buttons. `--danger` (`none`, `deploy`, `prod`, `destructive`) applies to the option before it. |
 | `orch answer <id> "<text>"` | Records the owner's answer and prompts the agent that asked. An answered question can't be answered again. |
 | `orch status [--json]`, `orch last <pane>` | The fleet, and a worker's last message and background tasks. `--json` also has the open questions, each agent's latest report and account, and pending account switches. |
-| `orch decisions [--pane P] [--json]` | The pane's newest decision log, parsed: id, time, who (user or agent), the user's quote, what (first sentence), why, and `superseded_by` when a later entry says "replaces D7", "instead of D7" or "supersedes D7". The user's decisions come first. |
-| `orch account [<pane> <N>] [--now \| --when-idle \| --at-handoff]`, `orch account --default N` | Which Claude account (`claude-acc N`) an agent runs on, and moving it to another one (see Accounts). |
+| `orch decisions [--pane P] [--json]` | The pane's newest decision log, parsed: id, time, who (user or agent), the user's quote, what, why (only from an explicit "Why:" or "because"; everything else stays in what), and `superseded_by` when a later entry says "replaces D7", "instead of D7" or "supersedes D7". In log order. |
+| `orch account [<pane> <N>] [--now \| --when-idle \| --at-handoff]`, `orch account --default N`, `orch account --name N NAME` | Which Claude account (`claude-acc N`) an agent runs on, and moving it to another one (see Accounts). |
 | `orch usage [--json] [--hours 24]`, `orch usage capture` | Account limits and tokens per agent (see Usage). |
 | `orch watchdog [--dry-run]` | One watchdog pass. A systemd user timer runs it every 5 minutes. |
 | `orch serve`, `orch pair [--allow NODE] [--new]` | The HTTP gateway for the owner's phone app, and its pairing token (see Gateway). |
@@ -156,10 +156,33 @@ minutes or has been at a dialog for 10. When the run's end time passes, it marks
 
 ### Alerts
 
-Everything goes to `~/.claude/handoffs/events.jsonl`, one JSON object per line (`time`, `host`, `kind`, `pane`,
-`title`, `body`, plus fields of the kind: `id` and `options` for `ask`, `report` for `report`, `account` and `when`
-for `account`). Alerts for the owner (a failed takeover or account switch, an `orch ask`, an orchestrator gone,
-blocked or not acting, a run that ended) also raise a herdr notification and run the notify command, if there is one:
+Everything goes to `~/.claude/handoffs/events.jsonl`, one JSON object per line: `time`, `host` (the hostname; the
+gateway's history shows the machine name instead), `kind`, `pane` (null when no agent is concerned), `title`, `body`,
+plus the fields of its kind:
+
+| Kind | Written when | `pane` | Extra fields | Alert |
+| --- | --- | --- | --- | --- |
+| `run-start`, `run-set`, `run-stop` | `orch run` changes a run | orchestrator | | |
+| `run-ended` | the watchdog finds the run past its end | orchestrator | | yes |
+| `orch-missing`, `orch-blocked` | the orchestrator pane has no agent, or sits at a dialog | orchestrator | | yes |
+| `nudge` | the watchdog prompts an idle orchestrator | orchestrator | | |
+| `orch-not-acting` | the same problem after several nudges, or the nudge could not be sent | orchestrator | | yes |
+| `ask` | `orch ask` or the MCP `ask_owner` | the agent that asks | `id`, `question`, `options` (`label`, `danger`) | yes |
+| `answer` | `orch answer` or the app answers | the agent that asked | `id` | |
+| `report` | the MCP `report` tool | the agent | `report` | |
+| `account` | a switch is queued, asked, resumed or done, or the default changes | the agent; null for the default | `account`; `when` (`handoff`, `idle`, `now`); `how` (`handoff`, `resume`) when a switch starts; `reason` (`spill`, `limit`) when the spill rule queued it; `session` after a resume | |
+| `account-failed`, `respawn-failed` | a switch or takeover failed | the agent | | yes |
+| `respawn` | a takeover started its fresh agent | the agent | | |
+| `respawn-dialog` | a takeover's new agent waits at a dialog | the agent | | yes |
+| `spill` | the spill rule is set, turned off, fires or clears | null | when it fires: `window`, `used`, `since` | when it fires |
+| `test` | `orch notify` | null | | yes |
+| `pair` | a phone pairs or unpairs with the gateway | null | | |
+| `action` | the gateway handles an app action | its agent or orchestrator, else null | `action` (its kind), `id`, `status` (`delivered`, `rejected`, `failed`), `error`, `source` (`app`, `relay`), `fields` (the action's other fields) | |
+| `push-failed` | a push could not be sent | the orchestrator, or null | | |
+| `push-token` | FCM refused a phone's token | null | | |
+| `relay-rejected` | a relay message does not open with this machine's key | null | | |
+
+The alerts for the owner also raise a herdr notification and run the notify command, if there is one:
 `$ORCH_NOTIFY_CMD`, else an executable `~/.claude/handoffs/notify`. It is called as `<command> <title> <body>` with
 `ORCH_EVENT_KIND` set and the whole event as JSON in `ORCH_EVENT`. That is where a phone push plugs in.
 `orch notify <title> <body>` sends a test.
@@ -218,7 +241,9 @@ Pending switches are kept in `accounts.json` and shown by `orch status --json`. 
 `account`; a failed one is pushed. When the new account hasn't trusted the folder yet, the new agent stops at Claude
 Code's trust question, and the question has to be answered in the pane. A `--now` switch reports that at once. A
 takeover pushes a `respawn-dialog` alert and waits up to 15 minutes for the answer, then sends its prompt.
-`orch account --default N` records the account for new agents.
+`orch account --default N` records the account for new agents. `orch account --name N NAME` gives account N a short
+name (default "Acct N"; `""` resets it), shown by `orch account`, `orch status --json` (`account_names`), `orch usage`
+and the gateway.
 
 `orch account --spill 1:98:2` uses account 1 until it is nearly full, then moves its agents to account 2. When
 account 1's week or 5-hour window reaches 98%, every agent on account 1 gets a pending `--when-idle` switch to
@@ -256,7 +281,10 @@ at most every 5 minutes per account. It prints nothing and ignores input it can'
 `orch usage --json` reports, per account and window, the percentage used, the reset time, the burn rate over the last
 1-2 hours of history, the projected time to 100% and whether that comes before the reset. It also counts tokens
 (input, output, cache read, cache write) and an API-equivalent cost per agent, orchestrator and worker, run, day,
-account and machine, plus each agent's share of the window, from the transcripts in `~/.claude/projects`. Sessions are
+account and machine, from the transcripts in `~/.claude/projects`. Each window lists the agents that spent in it
+(`agents`): their share of this machine's cost there, the points that share stands for (`estimated_points`), and their
+points in the last hour and today (`points_last_hour`, `points_today`: their cost then times the window's points per
+dollar). Every account orch knows is listed, with `windows: {}` until a statusline has run on it. Sessions are
 matched to panes through the status files, herdr and the lineage folders, and to accounts through the status files
 and the statusline. The cost is an estimate from list prices (`PRICES` in `hooks/orch_usage.py`), not a bill, and the
 shares only count this machine. Transcripts are read incrementally (`usage-cache.json` keeps the offsets and 10-minute
@@ -278,9 +306,8 @@ on Python 3.8; the push and relay code (`hooks/orch_push.py`) also needs the `cr
   directory 700) and prints the token and a pairing string for a QR code
   (`orch://pair?machine=...&addr=...&port=7433&token=...&key=...&project=...`). `key` is the AES-256 key of pushes and
   relay messages; `project` is the Firebase project, printed once the service account key is installed. Run it again to
-  change the list; `--new` replaces the token and the key. The same file can name the accounts:
-  `ORCH_ACCOUNT_NAMES=1=work,2=personal`. The gateway reads the file on every request, so changes take effect without a
-  restart.
+  change the list; `--new` replaces the token and the key. The gateway reads the file on every request, so changes take
+  effect without a restart.
 - The machine's name in the API, pushes and the relay is `ORCH_MACHINE` from that file, else its Tailscale device
   name (`tailscale status --json`, `Self.HostName`), else its hostname.
 - `orch serve --allow-self` also admits the machine's own node. It is off by default and meant for a local test.
@@ -400,7 +427,7 @@ All under `~/.claude/handoffs/`:
   relaunch flags) and its latest `report`.
 - `runs/<orchestrator pane>.json`: an `orch` run (end time, goal, workers, parked workers, questions with their ids,
   options and answers), and `runs/<pane>.seen.json`, the events its waits already reported.
-- `accounts.json`: pending account switches and the default account.
+- `accounts.json`: pending account switches, the default account, the spill rule and the account names.
 - `gateway-actions.json`: the gateway's actions of the last 24 h by id (result, status), and `decisions-seen.json`,
   the decisions the app marked as seen.
 - `usage.json` (latest limits per account, and each session's account), `usage-history.jsonl`, `usage-cache.json`.

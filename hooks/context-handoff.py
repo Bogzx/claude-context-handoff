@@ -137,6 +137,7 @@ NEXT_PROMPT = (
     "complete or the next step needs the user's decision, summarize where things stand and "
     "wait.{extra}")
 AGENTS = "agents"  # ROOT/agents/<pane>.json: each herdr agent's latest turn end, read by orch
+CONTEXT_STEP = 5_000  # agents/context/<pane>.json is rewritten mid-turn after this much change
 REPORT_TOOL = "mcp__orch__report"  # the orch MCP server's report tool (hooks/orch_mcp.py)
 SMALL_CONTEXT = 60_000  # below this, orch resumes a switching agent instead (orch.SMALL_CONTEXT)
 DIALOG_WAIT = 15 * 60  # a takeover whose new agent sits at a dialog waits this long for an answer
@@ -384,12 +385,15 @@ def write_status(data, event):
                    "what": (t.get("description") or t.get("command") or "")[:200]}
                   for t in tasks],
               "account": account_of(os.environ.get("CLAUDE_CONFIG_DIR"))}
-    tokens, model = last_call(data.get("transcript_path") or "") if event == "Stop" else (0, "")
+    tokens, model = last_call(data.get("transcript_path") or "")
+    status["context_tokens"] = tokens
+    write_context(status["session"], tokens, 0)
     if event == "Stop":
         last = data.get("last_assistant_message")
         status["last"] = (last if isinstance(last, str) and last.strip()
                           else last_text(data.get("transcript_path") or ""))[:4000]
-        status["context_tokens"] = tokens
+    else:
+        model = ""  # SessionStart: relaunch with the --model it runs with, not the transcript's
     pid = claude_pid()
     if pid:
         try:
@@ -407,6 +411,21 @@ def write_status(data, event):
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f".{path.name}.{os.getpid()}")
     tmp.write_text(json.dumps(status))
+    os.replace(tmp, path)
+
+
+def write_context(session, tokens, step):
+    """The agent's context size while it works, for orch: agents/context/<pane>.json, rewritten
+    when the session changes or the size moved by `step` tokens. Not in the status file: the
+    orch MCP server writes reports into that one mid-turn, and a rewrite here could drop one."""
+    path = ROOT / AGENTS / "context" / status_path(os.environ["HERDR_PANE_ID"]).name
+    old = load(path)
+    if (step and old.get("session") == session
+            and abs(tokens - (old.get("context_tokens") or 0)) < step):
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}")
+    tmp.write_text(json.dumps({"session": session, "context_tokens": tokens, "time": time.time()}))
     os.replace(tmp, path)
 
 
@@ -737,6 +756,8 @@ def respawn(job):
 
 def threshold(event, data, base, state_path):
     tokens, model = last_call(data.get("transcript_path") or "")
+    if IN_HERDR and event == "PostToolUse":
+        write_context(data.get("session_id"), tokens, CONTEXT_STEP)
     state = load(state_path)
     if "path" in state:  # from the flat layout before lineages: notify again with the new paths
         state = {}

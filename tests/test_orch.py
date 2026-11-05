@@ -455,12 +455,17 @@ def test_status_json_shows_open_questions_reports_and_accounts(world, capsys):
     world.run("status", "--json")
 
     data = json.loads(capsys.readouterr().out)
-    assert [q["text"] for q in data["questions"]] == ["Second?"]
+    answered, second = data["questions"]  # answered: shown for 10 minutes, with the answer
+    assert answered["text"] == "First?" and answered["answer"] == "ok"
+    assert answered["answered"] == world.t and second["answered"] is None
     assert data["report"]["progress"] == {"done": 3, "total": 5}
     w1 = data["workers"][0]
     assert w1["report"]["summary"] == "fixed #12" and w1["account"] == "2"
     assert w1["last"] == "all green"  # the report kept the Stop hook's fields
     assert [e["kind"] for e in world.events()].count("report") == 2
+    world.t += 10 * 60 + 1
+    world.run("status", "--json")
+    assert [q["text"] for q in json.loads(capsys.readouterr().out)["questions"]] == ["Second?"]
 
 
 # --- decisions --------------------------------------------------------------------------------
@@ -682,6 +687,44 @@ def test_account_default_and_listing(world, accounts, capsys):
 
     data = json.loads(capsys.readouterr().out)
     assert data["default"] == "2" and data["switch"][W2]["account"] == "1"
+
+
+def test_status_shows_the_context_size_the_hook_keeps_during_the_turn(world, capsys):
+    start_run(world)
+    world.agent(W1, "working")
+    world.turn_end(W1)
+    path = world.root / "agents" / "w1-p1.json"
+    path.write_text(json.dumps(dict(json.loads(path.read_text()), context_tokens=50_000)))
+    live = world.root / "agents" / "context" / "w1-p1.json"
+    live.parent.mkdir()
+    live.write_text(json.dumps({"session": "s-old", "context_tokens": 300_000}))
+    capsys.readouterr()
+
+    world.run("status", "--json")
+    assert json.loads(capsys.readouterr().out)["workers"][0]["context_tokens"] == 50_000
+    live.write_text(json.dumps({"session": f"s-{W1}", "context_tokens": 80_000}))
+    world.run("status", "--json")
+    assert json.loads(capsys.readouterr().out)["workers"][0]["context_tokens"] == 80_000
+
+
+def test_accounts_are_named_in_account_status_and_usage(world, accounts, capsys, tmp_path,
+                                                        monkeypatch):
+    world.run("account", "--name", "2", "spare")
+    world.run("account", "--name", "1", "main")
+    world.run("account", "--name", "1", "")  # back to the default
+    with pytest.raises(SystemExit):
+        world.run("account", "--name", "two", "x")
+    capsys.readouterr()
+
+    world.run("account", "--json")
+    names = {k: a["name"] for k, a in json.loads(capsys.readouterr().out)["accounts"].items()}
+    assert names == {"1": "Acct 1", "2": "spare", "3": "Acct 3"}
+    world.run("status", "--json")
+    assert json.loads(capsys.readouterr().out)["account_names"] == names
+    monkeypatch.setenv("HOME", str(tmp_path))  # no transcripts
+    world.run("usage", "--json")  # no reading for any account yet: each one is still listed
+    assert json.loads(capsys.readouterr().out)["accounts"]["2"] == {
+        "id": "2", "name": "spare", "updated": None, "stale": True, "windows": {}}
 
 
 def test_account_switch_when_idle_resumes_a_small_context(world, accounts, capsys):
