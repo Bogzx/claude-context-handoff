@@ -205,16 +205,29 @@ which shares everything with `~/.claude` except the login and `.claude.json`. Ea
 
 - `--at-handoff` (the default): the next takeover starts under account N. It costs nothing extra but may be hours
   away.
-- `--when-idle`: the watchdog does a `--now` switch the next time the agent is idle with no background tasks, one
-  switch per pass.
+- `--when-idle`: at the agent's next turn end (the Stop hook) or, if it is already idle, at the next watchdog pass.
+  An agent with 60K tokens of context or more is asked for its handoff, and the takeover starts the fresh agent on
+  account N, which reads the handoff instead of re-reading the whole conversation there. A smaller context, an agent
+  that hit its usage limit, or a handoff still unwritten 30 minutes after the request gets a `--now` switch instead
+  (the watchdog spends up to 200 s per pass on those). Each choice is logged with its reason.
 - `--now`: only for an idle agent with no background tasks. The agent exits, `claude-acc N --resume <session>` starts
   in the same pane with the same flags, model and effort, and orch checks that it came up. The first turn after it
   re-reads the whole context uncached on the new account.
 
 Pending switches are kept in `accounts.json` and shown by `orch status --json`. Every switch is logged as kind
-`account`; a failed one is pushed. When the new account hasn't trusted the folder yet, the restarted agent stops at
-Claude Code's trust question; orch reports that at once and the question has to be answered in the pane.
+`account`; a failed one is pushed. When the new account hasn't trusted the folder yet, the new agent stops at Claude
+Code's trust question, and the question has to be answered in the pane. A `--now` switch reports that at once. A
+takeover pushes a `respawn-dialog` alert and waits up to 15 minutes for the answer, then sends its prompt.
 `orch account --default N` records the account for new agents.
+
+`orch account --spill 1:98:2` uses account 1 until it is nearly full, then moves its agents to account 2. When
+account 1's week or 5-hour window reaches 98%, every agent on account 1 gets a pending `--when-idle` switch to
+account 2. Only fresh data counts: a stale `usage.json` or a window that has already reset is treated as unknown.
+The trigger is pushed once (kind `spill`). An agent on account 1 whose last turn ended with Claude Code's limit
+message ("You've hit your weekly limit · resets ...", an API error `rate_limit` in the transcript) is resumed on
+account 2 at the next pass. The account of each agent is read from its claude process (`CLAUDE_CONFIG_DIR`).
+`--spill off` turns the rule off and drops the switches it queued. The rule and whether it has fired show in
+`orch account --json`, `orch status --json` and the gateway's fleet.
 
 ### Usage
 

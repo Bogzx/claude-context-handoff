@@ -55,6 +55,10 @@ NUDGE_BACKOFF = 60 * 60  # after IGNORED nudges in a row on the same problem
 IGNORED = 3
 DANGER = ("none", "deploy", "prod", "destructive")  # what saying yes to an option does
 HOOK = Path(__file__).resolve().parent / "context-handoff.py"
+PROJECTS = Path.home() / ".claude" / "projects"  # the transcripts
+SMALL_CONTEXT = 60_000  # a switching agent with less context is resumed, not handed off
+HANDOFF_WAIT = 30 * 60  # a switch handoff not written by then: resume the agent instead
+SWITCH_BUDGET = 200  # seconds of resumes per watchdog pass (its unit times out at 300)
 
 
 def now():
@@ -257,6 +261,7 @@ def view(pane, agent, run, at):
         "park": park,
         "report": st.get("report"),  # the latest, whichever session wrote it (it has its time)
         "account": fresh.get("account"),
+        "context_tokens": fresh.get("context_tokens"),
         "switch": (load(ROOT / "accounts.json").get("switch") or {}).get(pane),  # pending
     }
 
@@ -499,6 +504,7 @@ def cmd_status(args):
         print(json.dumps({"run": run, "orchestrator": ags.get(orch), "workers": views,
                           "report": lead["report"], "account": lead["account"],
                           "switch": lead["switch"],
+                          "spill": load(ROOT / "accounts.json").get("spill"),
                           "questions": [q for q in (run or {}).get("questions") or []
                                         if not q.get("answered")]},
                          indent=1))
@@ -650,7 +656,9 @@ def cmd_watchdog(args):
     ags = agents()
     if ags is None:
         return 0  # herdr is down; there is nothing to prompt
-    idle_switches(ags, args.dry_run)
+    claudes = pane_claudes()
+    spill_pass(ags, claudes, args.dry_run)
+    idle_switches(ags, claudes, args.dry_run)
     state_path = ROOT / "watchdog.json"
     state = load(state_path)
     at = now()
@@ -815,6 +823,64 @@ def account_list():
     return accounts
 
 
+def pane_claudes():
+    """herdr pane -> (pid, account) of the claude processes running in herdr panes, from
+    /proc (the account is the process's CLAUDE_CONFIG_DIR, as claude-acc sets it)."""
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import orch_usage
+    out = {}
+    for proc in Path("/proc").iterdir():
+        if not proc.name.isdigit():
+            continue
+        try:
+            if (proc / "comm").read_text().strip() != "claude":
+                continue
+            env = dict(x.split("=", 1) for x in
+                       (proc / "environ").read_bytes().decode(errors="replace").split("\0")
+                       if "=" in x)
+        except OSError:
+            continue
+        if env.get("HERDR_PANE_ID"):
+            out[env["HERDR_PANE_ID"]] = (int(proc.name),
+                                         orch_usage.account_of(env.get("CLAUDE_CONFIG_DIR")))
+    return out
+
+
+def limit_hit(session):
+    """The usage-limit message ("You've hit your weekly limit · resets ...") the session's last
+    turn ended with, else None. Claude Code writes it to the transcript as an API error."""
+    paths = list(PROJECTS.glob(f"*/{session}.jsonl")) if session else []
+    if not paths:
+        return None
+    try:
+        with open(paths[0], "rb") as f:
+            f.seek(max(0, f.seek(0, os.SEEK_END) - (256 << 10)))
+            lines = f.read().splitlines()
+    except OSError:
+        return None
+    for line in reversed(lines):
+        try:
+            e = json.loads(line)
+        except ValueError:
+            continue
+        if e.get("type") not in ("user", "assistant") or e.get("isSidechain") or e.get("isMeta"):
+            continue
+        if e["type"] == "user":
+            content = (e.get("message") or {}).get("content")
+            if isinstance(content, list) and any(isinstance(c, dict) and c.get("type") ==
+                                                 "tool_result" for c in content):
+                return None  # a tool ran after it
+            continue  # a prompt sent after the limit runs into it again
+        content = (e.get("message") or {}).get("content")
+        text = content if isinstance(content, str) else " ".join(
+            c.get("text", "") for c in content or [] if isinstance(c, dict))
+        if e.get("isApiErrorMessage") and (e.get("error") == "rate_limit"
+                                           or re.match(r"You've hit your \w+ limit", text)):
+            return text
+        return None
+    return None
+
+
 def check_account(account):
     if not re.fullmatch(r"\d+", account):
         die(f"accounts are numbers (claude-acc N), not {account!r}")
@@ -880,31 +946,172 @@ def switch_now(pane, account):
     return 0
 
 
-def idle_switches(ags, dry_run):
-    """Watchdog: carry out one pending --when-idle switch whose agent is idle now (a switch can
-    take two minutes, so one per pass). A switch that fails is dropped: the failure was pushed."""
+def idle_switches(ags, claudes, dry_run):
+    """Watchdog: carry out the pending --when-idle switches (by hand or the spill rule) of idle
+    agents. A large context goes through a handoff: the agent is asked for it, and its takeover
+    starts the fresh agent on the new account. An agent that hit its usage limit, a small
+    context, or a handoff still unwritten after HANDOFF_WAIT is resumed on the new account
+    instead, for up to SWITCH_BUDGET seconds per pass. A resume that fails is dropped (the
+    failure was pushed). Every choice is logged with its reason."""
     path = ROOT / "accounts.json"
-    acc = load(path)
-    for pane, sw in sorted((acc.get("switch") or {}).items()):
-        if sw.get("when") != "idle":
+    started, at = time.monotonic(), now()
+    for pane, sw in sorted((load(path).get("switch") or {}).items()):
+        agent = ags.get(pane)
+        if sw.get("when") != "idle" or (agent or {}).get("agent_status") not in ("idle", "done"):
             continue
-        job, why = switch_job(pane, sw["account"], ags.get(pane))
-        if not job:
-            if why.endswith(f"already runs on account {sw['account']}"):
-                acc["switch"].pop(pane)
-                save(path, acc)
+        if (claudes.get(pane) or (None, None))[1] == str(sw["account"]):
+            drop_switch(pane)  # already there
             continue
+        session = (agent.get("agent_session") or {}).get("value")
+        st = status_of(pane)
+        fresh = st if session and st.get("session") == session else {}
+        if fresh.get("background_tasks"):
+            continue
+        tokens = fresh.get("context_tokens")
+        how, why = "handoff", "a fresh agent there reads the handoff, not the whole conversation"
+        if sw.get("reason") == "limit":
+            how, why = "resume", "it hit its usage limit, so it can't write a handoff first"
+        elif tokens is not None and tokens < SMALL_CONTEXT:
+            how, why = "resume", (f"its context is {tokens // 1000}K tokens, cheaper to re-read "
+                                  "than a handoff")
+        elif sw.get("handoff"):
+            if at - sw["handoff"] < HANDOFF_WAIT:
+                continue  # its takeover follows the handoff it was asked for
+            how, why = "resume", f"no handoff {HANDOFF_WAIT // 60} min after asking for one"
         if dry_run:
-            print(f"would switch {pane} to account {sw['account']}")
-            return
+            print(f"would switch {pane} to account {sw['account']} by {how}: {why}")
+            continue
+        if how == "handoff":
+            message = request_handoff(pane, session, fresh.get("cwd") or agent.get("cwd"), sw)
+            if not message:
+                continue  # a handoff is already underway; its takeover applies the switch
+            if prompt(pane, message):
+                mark_switch(pane, handoff=at)
+                emit("account", f"Account switch: handoff asked of {pane}",
+                     f"to account {sw['account']}: {why}", pane, account=sw["account"],
+                     when="idle", how="handoff")
+                continue
+            how, why = "resume", "the handoff request could not be sent"
+        if time.monotonic() - started > SWITCH_BUDGET:
+            continue  # the next pass
+        job, _ = switch_job(pane, sw["account"], agent)
+        if not job:
+            continue
+        emit("account", f"Account switch: resuming {pane}", f"on account {sw['account']}: {why}",
+             pane, account=sw["account"], when="idle", how="resume")
         error = apply_switch(dict(job, when="idle"))
         if error:
-            acc = load(path)
-            (acc.get("switch") or {}).pop(pane, None)
-            save(path, acc)
+            drop_switch(pane)
             emit("account", f"Account switch dropped: {pane}", error, pane,
                  account=sw["account"], when="idle")
+
+
+def request_handoff(pane, session, cwd, sw):
+    """The handoff hook's request for the agent (its lineage set up to take over on the
+    switch), or None while a handoff is already underway."""
+    job = {"pane": pane, "session": session, "cwd": cwd or "", "account": sw["account"],
+           "why": sw.get("why") or "queued by orch account --when-idle"}
+    result = subprocess.run([sys.executable, str(HOOK), "--request-handoff", json.dumps(job)],
+                            capture_output=True, text=True, timeout=60, check=False)
+    return result.stdout.strip() if result.returncode == 0 else None
+
+
+def mark_switch(pane, **fields):
+    path = ROOT / "accounts.json"
+    acc = load(path)
+    if pane in (acc.get("switch") or {}):
+        acc["switch"][pane].update(fields)
+        save(path, acc)
+
+
+def drop_switch(pane):
+    path = ROOT / "accounts.json"
+    acc = load(path)
+    if (acc.get("switch") or {}).pop(pane, None):
+        save(path, acc)
+
+
+def spill_pass(ags, claudes, dry_run):
+    """Watchdog: the spill rule (`orch account --spill FROM:PCT:TO`). Once account FROM's week
+    or 5-hour window is at PCT% or more (fresh capture only; stale data counts as unknown),
+    every agent on FROM gets a pending when-idle switch to TO. An agent on FROM whose last turn
+    ended at the usage limit gets one marked "limit", which is resumed at once."""
+    path = ROOT / "accounts.json"
+    acc = load(path)
+    rule = acc.get("spill")
+    if not rule:
         return
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import orch_usage
+    at = now()
+    usage = orch_usage.windows_report(ROOT, at).get(rule["from"])
+    if usage and not usage["stale"]:
+        hot = next(({"window": name, "used": w["used_percentage"], "since": at}
+                    for name, w in sorted(usage["windows"].items(), reverse=True)
+                    if not w["reset"] and w["used_percentage"] is not None
+                    and w["used_percentage"] >= rule["at"]), None)
+        if hot and not rule.get("active"):
+            rule["active"] = hot
+            emit("spill", f"Account {rule['from']} at {hot['used']}%: moving to {rule['to']}",
+                 f"its {hot['window']} window reached {rule['at']}%; its agents move to account "
+                 f"{rule['to']} at their next turn end or when idle", None, push=True, **hot)
+        elif not hot and rule.get("active"):
+            rule["active"] = None
+            emit("spill", f"Account {rule['from']} is under {rule['at']}% again",
+                 "new agents on it stay there", None)
+    switches = acc.setdefault("switch", {})
+    for pane, agent in sorted(ags.items()):
+        if (claudes.get(pane) or (None, None))[1] != rule["from"]:
+            continue
+        sw = switches.get(pane)
+        limit = (agent.get("agent_status") in ("idle", "done")
+                 and limit_hit((agent.get("agent_session") or {}).get("value")))
+        if limit and (sw or {}).get("reason") != "limit":
+            switches[pane] = {"account": rule["to"], "time": at, "when": "idle",
+                              "reason": "limit", "why": f"it hit the usage limit ({limit})"}
+        elif rule.get("active") and not sw:
+            switches[pane] = {"account": rule["to"], "time": at, "when": "idle",
+                              "reason": "spill",
+                              "why": (f"account {rule['from']} is at {rule['active']['used']}% "
+                                      f"of its {rule['active']['window']} window")}
+        else:
+            continue
+        emit("account", f"Account switch queued: {pane}",
+             f"moves to account {rule['to']} when idle: {switches[pane]['why']}", pane,
+             account=rule["to"], when="idle", reason=switches[pane]["reason"])
+    if dry_run:
+        print(f"spill {rule['from']}:{rule['at']}:{rule['to']} active={rule.get('active')}; "
+              f"pending: {sorted(switches)}")
+        return
+    save(path, acc)
+
+
+def set_spill(text):
+    """`orch account --spill FROM:PCT:TO` or `--spill off` (which also drops the pending
+    switches the rule queued)."""
+    path = ROOT / "accounts.json"
+    acc = load(path)
+    if text == "off":
+        acc.pop("spill", None)
+        for pane in [p for p, sw in (acc.get("switch") or {}).items()
+                     if sw.get("reason") in ("spill", "limit")]:
+            acc["switch"].pop(pane)
+        save(path, acc)
+        emit("spill", "Spill rule off", "pending spill switches dropped", None)
+        return "spill rule off"
+    m = re.fullmatch(r"(\d+):(\d+(?:\.\d+)?):(\d+)", text)
+    if not m or m.group(1) == m.group(3):
+        die(f"--spill takes FROM:PCT:TO (e.g. 1:98:2) or off, not {text!r}")
+    check_account(m.group(3))
+    pct = float(m.group(2))
+    acc["spill"] = {"from": m.group(1), "at": int(pct) if pct.is_integer() else pct,
+                    "to": m.group(3), "time": now(), "active": None}
+    save(path, acc)
+    rule = f"{m.group(1)}:{acc['spill']['at']}:{m.group(3)}"
+    emit("spill", f"Spill rule on: {rule}", f"account {m.group(1)} at {acc['spill']['at']}% moves "
+         f"its agents to account {m.group(3)}", None)
+    return (f"spill rule on: when account {m.group(1)}'s week or 5-hour window reaches "
+            f"{acc['spill']['at']}%, its agents move to account {m.group(3)} (by the watchdog)")
 
 
 def run_switch(job):
@@ -918,19 +1125,28 @@ def cmd_account(args):
         set_default(args.default)
         print(f"default account for new agents: {args.default}")
         return 0
+    if args.spill:
+        print(set_spill(args.spill))
+        return 0
     if not args.pane:
         accounts = account_list()
         out = {"accounts": accounts, "default": acc.get("default") or "1",
-               "switch": acc.get("switch") or {}}
+               "switch": acc.get("switch") or {}, "spill": acc.get("spill")}
         if args.json:
             print(json.dumps(out, indent=1))
             return 0
         for k, a in accounts.items():
             print(f"account {k}: {a['dir']}" + ("" if a["logged_in"] else " (not logged in)")
                   + (" (default)" if k == out["default"] else ""))
+        if out["spill"]:
+            sp = out["spill"]
+            print(f"spill {sp['from']}:{sp['at']}:{sp['to']}" + (
+                f" (active since {clock(sp['active']['since'])}: {sp['active']['window']} at "
+                f"{sp['active']['used']}%)" if sp.get("active") else " (not reached)"))
         for pane, sw in out["switch"].items():
             print(f"  {pane} moves to account {sw['account']} "
-                  + ("when idle" if sw.get("when") == "idle" else "at its next handoff"))
+                  + ("when idle" if sw.get("when") == "idle" else "at its next handoff")
+                  + (f" ({sw['why']})" if sw.get("why") else ""))
         return 0
     if not args.account:
         die("usage: orch account PANE N [--now | --at-handoff]")
@@ -957,8 +1173,9 @@ def queue_switch(pane, account, when):
     check_account(account)
     path = ROOT / "accounts.json"
     acc = load(path)
-    text = ("when it is next idle with no background tasks (the watchdog restarts it and resumes "
-            "the session)" if when == "idle" else "at its next handoff (no extra tokens)")
+    text = ("at its next turn end or when idle, through a handoff and a fresh agent there (a "
+            "small context or an agent at its usage limit is resumed instead)" if when == "idle"
+            else "at its next handoff (no extra tokens)")
     acc.setdefault("switch", {})[pane] = {"account": account, "time": now(), "when": when}
     save(path, acc)
     emit("account", f"Account switch queued: {pane}", f"moves to account {account} {text}", pane,
@@ -1065,11 +1282,14 @@ def main(argv=None):
                       help="restart the idle agent now and resume its session (re-reads its "
                            "context uncached on the new account)")
     when.add_argument("--when-idle", action="store_true",
-                      help="like --now, the next time it is idle with no background tasks "
-                           "(the watchdog does it)")
+                      help="at its next turn end or when idle: a handoff and a fresh agent on "
+                           "the new account, or a resume for a small context")
     when.add_argument("--at-handoff", action="store_true",
                       help="at its next context handoff (default; costs nothing extra)")
     acct.add_argument("--default", metavar="N", help="the account for new agents")
+    acct.add_argument("--spill", metavar="FROM:PCT:TO",
+                      help="move every agent on account FROM to account TO once FROM's week or "
+                           "5-hour window reaches PCT%% (e.g. 1:98:2), or 'off'")
     acct.add_argument("--json", action="store_true")
     acct.set_defaults(func=cmd_account)
 

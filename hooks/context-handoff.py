@@ -115,13 +115,14 @@ out, and why.
 ## Generation 1
 """
 
+AFTER_HERDR = ("After writing it, the agent ends its turn. A fresh agent with the same settings "
+               "then takes over this herdr pane automatically and continues from the handoff. "
+               "The takeover starts only once no background tasks are running, so before ending "
+               "that turn the agent stops the background tasks and monitors it started, after "
+               "recording in the handoff any the next agent should restart (exact command or "
+               "condition). Background work still producing results it needs can finish first.")
 if IN_HERDR:
-    AFTER = ("After writing it, the agent ends its turn. A fresh agent with the same settings "
-             "then takes over this herdr pane automatically and continues from the handoff. "
-             "The takeover starts only once no background tasks are running, so before ending "
-             "that turn the agent stops the background tasks and monitors it started, after "
-             "recording in the handoff any the next agent should restart (exact command or "
-             "condition). Background work still producing results it needs can finish first.")
+    AFTER = AFTER_HERDR
 else:
     AFTER = ("Once it is written, the user is told it is ready and that /clear starts a fresh "
              "context seeded with it; the file is updated at later stopping points if work "
@@ -137,6 +138,8 @@ NEXT_PROMPT = (
     "wait.{extra}")
 AGENTS = "agents"  # ROOT/agents/<pane>.json: each herdr agent's latest turn end, read by orch
 REPORT_TOOL = "mcp__orch__report"  # the orch MCP server's report tool (hooks/orch_mcp.py)
+SMALL_CONTEXT = 60_000  # below this, orch resumes a switching agent instead (orch.SMALL_CONTEXT)
+DIALOG_WAIT = 15 * 60  # a takeover whose new agent sits at a dialog waits this long for an answer
 GOAL_OFF = {"", "clear", "off", "stop", "cancel", "none", "reset"}
 
 # claude flags dropped when relaunching: session identity, the old initial prompt, and the
@@ -231,9 +234,10 @@ def slot():
     return os.environ["HERDR_PANE_ID"].replace(":", "-") if IN_HERDR else "local"
 
 
-def new_lineage(base, session):
+def new_lineage(base, session, pane=None):
     # The session that starts it makes the name unique (a session starts at most one).
-    lineage = base / f"{slot()}-{time.strftime('%Y%m%d-%H%M%S')}-{session[:8]}"
+    where = pane.replace(":", "-") if pane else slot()
+    lineage = base / f"{where}-{time.strftime('%Y%m%d-%H%M%S')}-{session[:8]}"
     lineage.mkdir(parents=True, exist_ok=True)
     (lineage / "decisions.md").write_text(
         LOG_HEADER.format(started=time.strftime("%Y-%m-%d %H:%M")))
@@ -380,10 +384,12 @@ def write_status(data, event):
                    "what": (t.get("description") or t.get("command") or "")[:200]}
                   for t in tasks],
               "account": account_of(os.environ.get("CLAUDE_CONFIG_DIR"))}
+    tokens, model = last_call(data.get("transcript_path") or "") if event == "Stop" else (0, "")
     if event == "Stop":
         last = data.get("last_assistant_message")
         status["last"] = (last if isinstance(last, str) and last.strip()
                           else last_text(data.get("transcript_path") or ""))[:4000]
+        status["context_tokens"] = tokens
     pid = claude_pid()
     if pid:
         try:
@@ -392,7 +398,6 @@ def write_status(data, event):
         except OSError:
             argv = None
         if argv is not None:
-            model = last_call(data.get("transcript_path") or "")[1] if event == "Stop" else ""
             effort = (data.get("effort") or {}).get("level") or os.environ.get("CLAUDE_EFFORT")
             status.update(pid=pid, relaunch=relaunch_args(argv, model, effort))
     path = status_path(status["pane"])
@@ -649,16 +654,24 @@ def respawn(job):
             command = prefix + " ".join(shlex.quote(a) for a in ["claude", *job["args"]])
         herdr("pane", "run", pane, command)
         blocked = 0
-        for _ in range(90):
+        deadline = time.time() + 90
+        while time.time() < deadline:
             agent = pane_agent()
             state = (agent or {}).get("agent_status")
             if state in ("idle", "done"):
                 break
             blocked = blocked + 1 if state == "blocked" else 0
-            if blocked >= 3:  # a dialog will not go away by waiting
-                return fail("the new agent is at a dialog in the pane (on another account: "
-                            "folder trust or permissions?), answer it there; ran " + command
-                            + (f"; handoff at {saved}" if saved else ""))
+            dialog = ("the new agent is at a dialog in the pane (on another account: folder "
+                      "trust or permissions?), answer it there; ran " + command)
+            if blocked >= 3 and resume:  # orch is waiting on this switch: say so now
+                return fail(dialog)
+            if blocked == 3:  # a takeover: its prompt follows once someone answers the dialog
+                say(f"waiting up to {DIALOG_WAIT // 60} min: {dialog}")
+                herdr("notification", "show", "Takeover waits at a dialog", "--body",
+                      f"{pane}: {dialog}")
+                emit("respawn-dialog", "Takeover waits at a dialog", f"{pane}: {dialog}", pane,
+                     push=True)
+                deadline = time.time() + DIALOG_WAIT
             time.sleep(1)
         else:
             return fail(f"no ready agent after running {command}"
@@ -910,6 +923,74 @@ def report_due(data, state_path):
         f"once (summary and the {role} fields), then end the turn.")}
 
 
+def switch_message(lineage, account, why):
+    return (f"{POLICY}: orch is moving this agent to Claude account {account} ({why}). The cheap "
+            "way is a handoff: a fresh agent on that account reads it instead of re-reading this "
+            f"whole conversation there. It is written now to {lineage / 'handoff.md'}, replacing "
+            f"any older version. {AFTER_HERDR}\n\n{structure(lineage)}")
+
+
+def prepare_switch(state_path, base, session, pane, account, why):
+    """Set the session up so that its next Stop after a written handoff starts the takeover
+    (which applies the pending switch): its lineage (a new one if it has none) and "soft" set
+    to now. Returns the request for the agent, or None while a handoff is already underway."""
+    state = load(state_path)
+    if handoff_underway(state):
+        return None
+    lineage = Path(state["dir"]) if state.get("dir") else None
+    if lineage is None or not (lineage / "decisions.md").exists():
+        lineage = new_lineage(base, session or "unknown", pane)
+        state["dir"] = str(lineage)
+    state["soft"] = time.time()
+    state["stop_soft"] = True  # this is the turn-end request; no "requested at 400K" reminder
+    state.pop("stop_log", None)
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path.write_text(json.dumps(state))
+    return switch_message(lineage, account, why)
+
+
+def switch_due(data, state_path, base):
+    """At a turn end, ask for the handoff that carries out the pane's pending when-idle account
+    switch (queued by `orch account --when-idle` or the spill rule), once. Small contexts and
+    agents that hit their limit are left to orch, which resumes them on the new account."""
+    if data.get("stop_hook_active") or data.get("background_tasks"):
+        return None
+    pane = os.environ["HERDR_PANE_ID"]
+    path = ROOT / "accounts.json"
+    accounts = load(path)
+    switch = (accounts.get("switch") or {}).get(pane)
+    if (not switch or switch.get("when") != "idle" or switch.get("handoff")
+            or switch.get("reason") == "limit"
+            or str(switch["account"]) == account_of(os.environ.get("CLAUDE_CONFIG_DIR"))):
+        return None
+    if last_call(data.get("transcript_path") or "")[0] < SMALL_CONTEXT:
+        return None
+    why = switch.get("why") or "queued by orch account --when-idle"
+    message = prepare_switch(state_path, base, data.get("session_id"), pane, switch["account"],
+                             why)
+    if not message:
+        return None
+    switch["handoff"] = time.time()
+    path.write_text(json.dumps(accounts, indent=1))
+    emit("account", f"Account switch: handoff asked of {pane}",
+         f"at its turn end; a fresh agent takes over on account {switch['account']} ({why})", pane,
+         account=switch["account"], when="idle", how="handoff")
+    return {"decision": "block", "reason": message,
+            "systemMessage": f"Account switch to {switch['account']}: handoff requested"}
+
+
+def request_handoff(job):
+    """`orch` (watchdog) asks an idle agent for the handoff of a pending switch: prints the
+    prompt to send it, or exits 1 while a handoff is already underway."""
+    base = ROOT / (job.get("cwd") or "unknown").strip("/").replace("/", "-").replace(":", "-")
+    message = prepare_switch(ROOT / "state" / f"{job['session']}.json", base, job["session"],
+                             job["pane"], job["account"], job["why"])
+    if not message:
+        return 1
+    print(message)
+    return 0
+
+
 def session_start(source, base, state_path):
     for old in (ROOT / "state").glob("*.json"):
         if old.stat().st_mtime < time.time() - 7 * 86400:
@@ -961,6 +1042,8 @@ def session_start(source, base, state_path):
 def main():
     if sys.argv[1:2] == ["--respawn"]:
         return 0 if respawn(json.loads(sys.argv[2])) else 1
+    if sys.argv[1:2] == ["--request-handoff"]:
+        return request_handoff(json.loads(sys.argv[2]))
     data = json.load(sys.stdin)
     if data.get("agent_id"):  # subagents have their own context; this tracks the main one
         return
@@ -975,7 +1058,7 @@ def main():
     else:
         out = threshold(event, data, base, state_path)
         if out is None and event == "Stop" and IN_HERDR:
-            out = report_due(data, state_path)
+            out = switch_due(data, state_path, base) or report_due(data, state_path)
     if out:
         print(json.dumps(out))
 

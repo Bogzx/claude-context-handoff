@@ -10,7 +10,7 @@ for a QR code. `orch serve --allow-self` also admits this machine's own node: fo
 Reads: GET /v1/fleet, /v1/usage, /v1/orchestrators/<pane>/decisions,
 /v1/orchestrators/<pane>/history, /v1/panes/<pane>/screen, /v1/actions/<id>.
 Writes: POST /v1/actions, one action per request (prompt, answer, interrupt, park, unpark, run,
-nudge, account, default_account, ack). An action id runs once: a retry gets the first result.
+nudge, account, default_account, spill, ack). An action id runs once: a retry gets the first result.
 Every action is logged to events.jsonl (kind "action", source "app"). Standard library only,
 Python 3.8 compatible (ob1).
 """
@@ -170,6 +170,7 @@ def agent_json(v, agent, role, first_seen):
         "pane": v["pane"], "label": v["label"], "state": state,
         "agent_status": (agent or {}).get("agent_status") if agent else None,
         "since": since, "session": v["session"], "account": v["account"],
+        "context_tokens": v.get("context_tokens"),
         "background_tasks": v["bg"], "last": v["last"],
         "park": {"reason": park.get("reason"), "since": park.get("since"),
                  "until": park.get("until")} if park else None,
@@ -349,6 +350,7 @@ class Gateway:
             "orchestrators": [self.orchestrator(p, r, ags, at, watchdog.get(p) or {}, nudges)
                               for p, r in leads],
             "accounts": self.accounts(at), "default_account": self.default_account(),
+            "spill": orch.load(orch.ROOT / "accounts.json").get("spill"),
             "actions": self.recent_actions(at, ags),
         }
 
@@ -687,6 +689,10 @@ def act_default_account(gw, body, rec):
     orch.set_default(need(body, "account"))
 
 
+def act_spill(gw, body, rec):
+    orch.set_spill(need(body, "rule"))
+
+
 def act_ack(gw, body, rec):
     lead, ids = need(body, "orchestrator"), need(body, "decisions", list)
     path = orch.ROOT / "decisions-seen.json"
@@ -706,6 +712,7 @@ def act_dialog(gw, body, rec):
 ACTIONS = {"prompt": act_prompt, "answer": act_answer, "interrupt": act_interrupt,
            "park": act_park, "unpark": act_park, "run": act_run, "nudge": act_nudge,
            "account": act_account, "default_account": act_default_account, "ack": act_ack,
+           "spill": act_spill,
            "dialog": act_dialog}
 
 

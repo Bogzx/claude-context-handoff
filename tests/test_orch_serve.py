@@ -120,7 +120,8 @@ AGENT = {"pane": str, "label": str, "state": STATE,
          "session?": str, "account?": str, "model?": str, "context_tokens?": int,
          "background_tasks": [{"type?": str, "id?": str, "what": str, "since?": NUM}],
          "last": str, "park?": {"reason": str, "since": NUM, "until?": NUM},
-         "switch?": {"account": str, "when": {"handoff", "idle"}, "time": NUM},
+         "switch?": {"account": str, "when": {"handoff", "idle"}, "time": NUM,
+                     "reason?": {"spill", "limit"}, "why?": str, "handoff?": NUM},
          "report?": dict}
 ORCH_REPORT = {"time": NUM, "summary": str,
                "state?": {"working", "waiting_on_workers", "waiting_on_owner", "done"},
@@ -154,8 +155,10 @@ ORCHESTRATOR = {"pane": str, "name": str, "machine": str, "cwd?": str,
                 "run?": {"goal": str, "created": NUM, "until": NUM, "ended?": NUM},
                 "report?": ORCH_REPORT, "questions": [QUESTION], "dialogs": [DIALOG],
                 "stall?": STALL, "workers": [AGENT], "lanes?": dict}
+SPILL = {"from": str, "at": NUM, "to": str, "time": NUM,
+         "active?": {"window": {"seven_day", "five_hour"}, "used": NUM, "since": NUM}}
 FLEET = {"version": int, "machine": str, "time": NUM, "orchestrators": [ORCHESTRATOR],
-         "accounts": dict, "default_account": str, "actions": [ACTION_STATUS]}
+         "accounts": dict, "default_account": str, "actions": [ACTION_STATUS], "spill?": SPILL}
 DECISIONS = {"pane": str, "log": str, "decisions": [
     {"id": str, "generation": int, "line": int, "time?": str, "by": str, "who": {"user", "agent"},
      "quote?": str, "what": str, "why": str, "superseded_by?": str}]}
@@ -347,6 +350,7 @@ def test_fleet_has_the_api_shape_and_the_stalled_run(world):
     assert loose["activity"] == "working" and loose["workers"] == []
     builder, tester = run["workers"]
     assert builder["state"] == "idle" and builder["since"] == world.t - 20 * 60
+    assert builder["context_tokens"] is None  # not in this status file
     assert builder["switch"]["account"] == "2" and builder["account"] == "1"
     assert builder["report"]["changed_files"] == [{"path": "site/a.py"}]
     conforms(builder["report"], WORKER_REPORT)
@@ -592,12 +596,21 @@ def test_each_action_kind_does_its_job(world):
     assert world.post(gw, kind="account", pane=W2, account="2", when="handoff")[0] == 202
     switches = json.loads((world.root / "accounts.json").read_text())["switch"]
     assert {p: s["when"] for p, s in switches.items()} == {W1: "idle", W2: "handoff"}
+    assert world.post(gw, kind="spill", rule="1:98:2")[0] == 202
+    status, fleet = world.get(gw, "/v1/fleet")
+    assert status == 200
+    conforms(fleet, FLEET)
+    assert fleet["spill"]["at"] == 98 and fleet["spill"]["active"] is None
+    assert world.post(gw, kind="spill", rule="1:2")[0] == 409
+    assert world.post(gw, kind="spill", rule="off")[0] == 202
+    assert world.get(gw, "/v1/fleet")[1]["spill"] is None
     assert world.post(gw, kind="default_account", account="2")[0] == 202
     assert json.loads((world.root / "accounts.json").read_text())["default"] == "2"
     assert world.get(gw, "/v1/fleet")[1]["default_account"] == "2"
     kinds = [e["action"] for e in world.events() if e["kind"] == "action"]
     assert kinds == ["answer", "park", "unpark", "run", "run", "run", "run", "nudge",
-                     "interrupt", "account", "account", "default_account"]
+                     "interrupt", "account", "account", "spill", "spill", "spill",
+                     "default_account"]
 
 
 def test_an_account_switch_now_runs_in_the_background(world, monkeypatch):

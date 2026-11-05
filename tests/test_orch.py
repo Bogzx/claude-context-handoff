@@ -545,17 +545,35 @@ def accounts(world, tmp_path, monkeypatch):
         (account_dir(n) / ".credentials.json").write_text("{}")
     monkeypatch.setattr(world.orch, "account_dir", account_dir)
     monkeypatch.setattr(world.orch, "is_claude", lambda pid: pid == 4242)
-    jobs = []
+    jobs = Jobs()
     monkeypatch.setattr(world.orch, "run_switch", lambda job: jobs.append(job) or
                         type("R", (), {"returncode": 0, "stderr": ""})())
+
+    def claudes():  # pane -> (pid, account) of its claude process, here from its status file
+        out = {}
+        for path in (world.root / "agents").glob("*.json"):
+            st = json.loads(path.read_text())
+            out[st["pane"]] = (st.get("pid"), st.get("account", "1"))
+        return out
+    monkeypatch.setattr(world.orch, "pane_claudes", claudes)
+    jobs.handoffs = []
+
+    def request_handoff(pane, session, cwd, sw):
+        jobs.handoffs.append((pane, session, cwd, sw["account"], sw.get("why")))
+        return f"write your handoff for account {sw['account']}"
+    monkeypatch.setattr(world.orch, "request_handoff", request_handoff)
     return jobs
+
+
+class Jobs(list):
+    pass
 
 
 def idle_with_status(world, pane, **extra):
     world.agent(pane, "idle", session="s-new")
     world.turn_end(pane, session="s-new")
     path = world.root / "agents" / f"{pane.replace(':', '-')}.json"
-    st = dict(json.loads(path.read_text()), pid=4242, account="1",
+    st = dict(json.loads(path.read_text()), pid=4242, account="1", context_tokens=20_000,
               relaunch=["--dangerously-skip-permissions", "--model", "claude-haiku-5-5"])
     path.write_text(json.dumps(dict(st, **extra)))
 
@@ -612,7 +630,7 @@ def test_account_default_and_listing(world, accounts, capsys):
     assert data["default"] == "2" and data["switch"][W2]["account"] == "1"
 
 
-def test_account_switch_when_idle_is_done_by_the_watchdog(world, accounts, capsys):
+def test_account_switch_when_idle_resumes_a_small_context(world, accounts, capsys):
     start_run(world)
     world.agent(W1, "working")
     world.run("account", W1, "2", "--when-idle")
@@ -628,15 +646,64 @@ def test_account_switch_when_idle_is_done_by_the_watchdog(world, accounts, capsy
     world.run("watchdog")  # idle, but waiting on its own job
     assert accounts == []
 
-    idle_with_status(world, W1)
+    idle_with_status(world, W1)  # 20K tokens of context
     world.run("watchdog")
 
     [job] = accounts
     assert job["pane"] == W1 and job["account"] == "2" and job["resume"] == "s-new"
-    assert job["when"] == "idle"
+    assert job["when"] == "idle" and accounts.handoffs == []
     assert json.loads((world.root / "accounts.json").read_text())["switch"] == {}
+    why = [e for e in world.events() if e["title"] == f"Account switch: resuming {W1}"]
+    assert "20K tokens" in why[0]["body"]
     world.run("watchdog")
     assert len(accounts) == 1
+
+
+def test_a_large_context_switches_through_a_handoff(world, accounts):
+    world.run("account", W1, "2", "--when-idle")
+    idle_with_status(world, W1, context_tokens=300_000, cwd="/work/proj")
+
+    world.run("watchdog")
+
+    assert accounts == [] and accounts.handoffs == [
+        (W1, "s-new", "/work/proj", "2", None)]
+    assert world.prompts == [(W1, "write your handoff for account 2")]
+    sw = json.loads((world.root / "accounts.json").read_text())["switch"][W1]
+    assert sw["handoff"] == T0
+    asked = world.events()[-1]
+    assert asked["how"] == "handoff" and "reads the handoff" in asked["body"]
+    world.t += 29 * 60
+    world.run("watchdog")  # the takeover follows the handoff; nothing more to do
+    assert accounts == [] and len(accounts.handoffs) == 1
+    world.t += 2 * 60
+    world.run("watchdog")  # still idle with no handoff 31 min later: resume instead
+    [job] = accounts
+    assert job["resume"] == "s-new"
+    assert any("no handoff 30 min after" in e["body"] for e in world.events())
+
+
+def test_an_agent_at_its_usage_limit_is_resumed_whatever_its_context(world, accounts):
+    idle_with_status(world, W1, context_tokens=300_000)
+    acc = {"switch": {W1: {"account": "2", "time": T0, "when": "idle", "reason": "limit"}}}
+    (world.root / "accounts.json").write_text(json.dumps(acc))
+
+    world.run("watchdog")
+
+    assert [j["pane"] for j in accounts] == [W1] and accounts.handoffs == []
+
+
+def test_the_watchdog_resumes_several_agents_within_its_budget(world, accounts, monkeypatch):
+    world.run("account", W1, "2", "--when-idle")
+    world.run("account", W2, "2", "--when-idle")
+    idle_with_status(world, W1)
+    idle_with_status(world, W2)
+    monkeypatch.setattr(world.orch, "SWITCH_BUDGET", -1)  # spent: the next pass does them
+
+    world.run("watchdog")
+    assert accounts == []
+    monkeypatch.setattr(world.orch, "SWITCH_BUDGET", 200)
+    world.run("watchdog")
+    assert [j["pane"] for j in accounts] == [W1, W2]
 
 
 def test_status_json_shows_the_orchestrators_pending_switch(world, accounts, capsys):
@@ -647,18 +714,6 @@ def test_status_json_shows_the_orchestrators_pending_switch(world, accounts, cap
     capsys.readouterr()
     world.run("status", "--json")
     assert json.loads(capsys.readouterr().out)["switch"]["when"] == "handoff"
-
-
-def test_the_watchdog_switches_one_agent_per_pass(world, accounts):
-    world.run("account", W1, "2", "--when-idle")
-    world.run("account", W2, "2", "--when-idle")
-    idle_with_status(world, W1)
-    idle_with_status(world, W2)
-
-    world.run("watchdog")
-    assert [j["pane"] for j in accounts] == [W1]
-    world.run("watchdog")
-    assert [j["pane"] for j in accounts] == [W1, W2]
 
 
 def test_a_failed_idle_switch_is_dropped(world, accounts, monkeypatch):
@@ -692,6 +747,114 @@ def test_a_switch_now_clears_a_pending_one(world, accounts):
 
     assert len(accounts) == 1
     assert json.loads((world.root / "accounts.json").read_text())["switch"] == {}
+
+
+def usage_at(world, pct, window="seven_day", age=30, resets_in=86400):
+    (world.root / "usage.json").write_text(json.dumps({"accounts": {"1": {
+        "time": world.t - age, "windows": {window: {"used_percentage": pct,
+                                                    "resets_at": world.t + resets_in}}}}}))
+
+
+def test_spill_moves_account_one_agents_once_it_reaches_the_threshold(world, accounts, capsys):
+    world.agent(BOSS, "working")
+    world.agent(W1, "working")
+    idle_with_status(world, W1)
+    idle_with_status(world, W2, account="2", context_tokens=300_000)
+    world.agent(W1, "working")
+    world.run("account", "--spill", "1:98:2")
+    capsys.readouterr()
+    world.run("account", "--json")
+    assert json.loads(capsys.readouterr().out)["spill"] == {
+        "from": "1", "at": 98, "to": "2", "time": T0, "active": None}
+
+    usage_at(world, 97)
+    world.run("watchdog")
+    assert "switch" not in json.loads((world.root / "accounts.json").read_text()) or not json.loads(
+        (world.root / "accounts.json").read_text())["switch"]
+    usage_at(world, 99, age=20 * 60)  # stale: unknown, not reached
+    world.run("watchdog")
+    assert not json.loads((world.root / "accounts.json").read_text()).get("spill")["active"]
+    usage_at(world, 98, resets_in=-60)  # that window already reset
+    world.run("watchdog")
+    assert not json.loads((world.root / "accounts.json").read_text()).get("spill")["active"]
+
+    usage_at(world, 98)
+    world.run("watchdog")
+
+    acc = json.loads((world.root / "accounts.json").read_text())
+    assert acc["spill"]["active"] == {"window": "seven_day", "used": 98, "since": world.t}
+    assert set(acc["switch"]) == {W1}  # on account 1; W2 is on 2, BOSS has no claude here
+    assert acc["switch"][W1]["reason"] == "spill" and acc["switch"][W1]["when"] == "idle"
+    assert "98% of its seven_day window" in acc["switch"][W1]["why"]
+    [spill] = [e for e in world.events() if e["kind"] == "spill" and "moving" in e["title"]]
+    assert spill["title"] == "Account 1 at 98%: moving to 2" and world.herdr_calls  # pushed
+    world.run("watchdog")  # once
+    assert len([e for e in world.events() if e["kind"] == "spill" and "moving" in e["title"]]) == 1
+    capsys.readouterr()
+    world.run("status", "--json")
+    assert json.loads(capsys.readouterr().out)["spill"]["active"]["used"] == 98
+
+    usage_at(world, 3, resets_in=7 * 86400)  # the week reset
+    world.run("watchdog")
+    assert json.loads((world.root / "accounts.json").read_text())["spill"]["active"] is None
+
+
+def test_spill_off_drops_its_pending_switches_and_bad_rules_are_refused(world, accounts, capsys):
+    world.run("account", "--spill", "1:98.5:2")
+    world.run("account", W2, "2", "--when-idle")  # by hand: kept
+    acc = json.loads((world.root / "accounts.json").read_text())
+    assert acc["spill"]["at"] == 98.5
+    acc["switch"][W1] = {"account": "2", "time": T0, "when": "idle", "reason": "spill"}
+    (world.root / "accounts.json").write_text(json.dumps(acc))
+    world.run("account", "--spill", "off")
+    acc = json.loads((world.root / "accounts.json").read_text())
+    assert "spill" not in acc and set(acc["switch"]) == {W2}
+    for bad in ("1:98", "1:98:1", "2:98:3", "pibo1:98:pibo2"):
+        with pytest.raises(SystemExit):
+            world.run("account", "--spill", bad)
+
+
+def transcript(world, session, *entries):
+    path = world.orch.PROJECTS / "-work-proj" / f"{session}.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("".join(json.dumps(e) + "\n" for e in entries))
+
+
+LIMIT = {"type": "assistant", "isApiErrorMessage": True, "error": "rate_limit",
+         "message": {"model": "<synthetic>", "content": [
+             {"type": "text", "text": "You've hit your weekly limit · resets 7am (Europe/Bucharest)"}]}}
+PROMPT = {"type": "user", "message": {"content": "fix #12"}}
+REPLY = {"type": "assistant", "message": {"content": [{"type": "text", "text": "done"}]}}
+
+
+def test_limit_hit_reads_the_last_turn_of_the_transcript(world, tmp_path, monkeypatch):
+    monkeypatch.setattr(world.orch, "PROJECTS", tmp_path / "projects")
+    transcript(world, "s1", PROMPT, LIMIT)
+    assert world.orch.limit_hit("s1").startswith("You've hit your weekly limit")
+    transcript(world, "s1", PROMPT, LIMIT, PROMPT)  # a prompt sent since runs into it again
+    assert world.orch.limit_hit("s1")
+    transcript(world, "s1", PROMPT, LIMIT, PROMPT, REPLY)  # the limit is over
+    assert world.orch.limit_hit("s1") is None
+    other = dict(LIMIT, error="server_error", message={"content": "API Error: Connection lost"})
+    transcript(world, "s1", PROMPT, other)
+    assert world.orch.limit_hit("s1") is None
+    assert world.orch.limit_hit("missing") is None and world.orch.limit_hit(None) is None
+
+
+def test_an_agent_at_its_limit_is_switched_at_the_next_pass(world, accounts, tmp_path,
+                                                             monkeypatch):
+    monkeypatch.setattr(world.orch, "PROJECTS", tmp_path / "projects")
+    world.run("account", "--spill", "1:98:2")
+    usage_at(world, 90)  # not reached: the limit alone moves it
+    idle_with_status(world, W1, context_tokens=300_000)
+    transcript(world, "s-new", PROMPT, LIMIT)
+
+    world.run("watchdog")
+
+    acc = json.loads((world.root / "accounts.json").read_text())
+    assert not acc["spill"]["active"]
+    assert [j["pane"] for j in accounts] == [W1] and accounts.handoffs == []
+    assert any("usage limit" in e["body"] for e in world.events() if e["kind"] == "account")
 
 
 def test_is_claude(world):
