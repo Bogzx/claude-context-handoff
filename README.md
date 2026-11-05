@@ -128,7 +128,7 @@ the whole fleet overnight (11.8 h), and "today's work is done" with three worker
 | `orch run start --until 09:00 --goal "..." --workers w17:pB7=builder,...` | Registers the run of the orchestrator in this pane (`--until` takes `HH:MM`, `YYYY-MM-DD HH:MM` or `+4h`). `run set`, `run stop` and `run show` change, end or show it. |
 | `orch wait` | The orchestrator's one background watcher. It returns when a worker's turn ended with nothing left running, a worker is blocked at a dialog, a pane lost its agent (3 min), a worker has waited 90 min on its own job, a `--check '<cmd>'` exits 0, or after the 30 min heartbeat. It prints one line per worker. An event is reported once: the next wait doesn't repeat it (`--reset` does). |
 | `orch park <pane> --reason "..." [--until HH:MM]` | Standby with a reason. It ends at the worker's next turn end or at `--until`. `orch unpark` ends it. |
-| `orch ask "<question>" [--option "Deploy" --danger deploy --option "Not yet"]` | Logs a question for the owner in the run and pushes it, with an id and the options the owner's app shows as buttons. `--danger` (`none`, `deploy`, `prod`, `destructive`) applies to the option before it. |
+| `orch ask "<question>" [--option "Deploy" --danger deploy --option "Not yet"]` | Logs a question for the owner in the run and pushes it, with an id and the options the owner's app shows as buttons. `--danger` (`none`, `deploy`, `prod`, `destructive`) applies to the option before it. `--kind plan` marks a new orchestrator's plan question (see orch new); it replaces the pane's open plan question. |
 | `orch answer <id> "<text>"` | Records the owner's answer and prompts the agent that asked. An answered question can't be answered again. |
 | `orch status [--json]`, `orch last <pane>` | The fleet, and a worker's last message and background tasks. `--json` also has the open questions, each agent's latest report and account, and pending account switches. |
 | `orch decisions [--pane P] [--json]` | The pane's newest decision log, parsed: id, time, who (user or agent), the user's quote, what, why (only from an explicit "Why:" or "because"; everything else stays in what), and `superseded_by` when a later entry says "replaces D7", "instead of D7" or "supersedes D7". In log order. |
@@ -168,15 +168,15 @@ plus the fields of its kind:
 | `orch-missing`, `orch-blocked` | the orchestrator pane has no agent, or sits at a dialog | orchestrator | | yes |
 | `nudge` | the watchdog prompts an idle orchestrator | orchestrator | | |
 | `orch-not-acting` | the same problem after several nudges, or the nudge could not be sent | orchestrator | | yes |
-| `ask` | `orch ask` or the MCP `ask_owner` | the agent that asks | `id`, `question`, `options` (`label`, `danger`) | yes |
+| `ask` | `orch ask` or the MCP `ask_owner` | the agent that asks | `id`, `question`, `options` (`label`, `danger`), `question_kind` (`plan` or null) | yes |
 | `answer` | `orch answer` or the app answers | the agent that asked | `id` | |
 | `report` | the MCP `report` tool | the agent | `report` | |
 | `account` | a switch is queued, asked, resumed or done, or the default changes | the agent; null for the default | `account`; `when` (`handoff`, `idle`, `now`); `how` (`handoff`, `resume`) when a switch starts; `reason` (`spill`, `limit`) when the spill rule queued it; `session` after a resume | |
 | `account-failed`, `respawn-failed` | a switch or takeover failed | the agent | | yes |
 | `respawn` | a takeover started its fresh agent | the agent | | |
-| `respawn-dialog` | a takeover's or `orch new`'s new agent waits at a dialog | the agent | `id` for `orch new` | yes |
+| `respawn-dialog` | a takeover's or `orch new`'s new agent waits at a dialog (not for a start from the app, which has its `start` push) | the agent | `action` for `orch new` | yes |
 | `spill` | the spill rule is set, turned off, fires or clears | null | when it fires: `window`, `used`, `since` | when it fires |
-| `new` | a step of `orch new` | the new orchestrator, once its tab exists | `id`, `step` | when it fails |
+| `start` | a step of `orch new` or the gateway's `start` action is doing, ok or failed | the new orchestrator, once its tab exists | `action` (the start's id), `step`, `status`, `error`; the `pane` step also `folder`, `goal`, `by` (`cli`, `phone`) | when it fails |
 | `test` | `orch notify` | null | | yes |
 | `pair` | a phone pairs or unpairs with the gateway | null | | |
 | `action` | the gateway handles an app action | its agent or orchestrator, else null | `action` (its kind), `id`, `status` (`delivered`, `rejected`, `failed`), `error`, `source` (`app`, `relay`), `fields` (the action's other fields) | |
@@ -295,25 +295,30 @@ the next one under a second.
 
 ### New orchestrator (orch new)
 
-`orch new` starts an orchestrator in a new herdr tab in `DIR` and prints its pane first. Its steps:
+`orch new --cwd DIR --goal TEXT --until T` starts an orchestrator in a new herdr tab in `DIR` and prints its pane
+first. The gateway's `start` action runs the same code. Each step is `doing`, `ok` or `failed`:
 
-1. A new decision log for that pane, starting with the goal (D1) and each `--rules` text (D2, ...) as the owner's
-   entries.
-2. A brief at `~/.claude/orch/new/<id>/brief.md` with the goal, the rules, the run and, with `--plan-first`, the
-   instruction to send a roadmap with the `report` tool and ask "Plan ready: ..." (Approve, Edit, Cancel) with
-   `ask_owner` before any other work. The owner approves with `orch answer` or the app.
-3. `claude-acc N` in the pane (`--account auto`, the default, is the account for new agents: the spill target
-   while the rule is active, else the default), with a session id chosen up front, `--model` and `--effort`, and
-   `HANDOFF_LINEAGE` pointing at the new log.
-4. A new agent stopped at a dialog (Claude Code's folder trust question on that account) pushes `respawn-dialog`
-   and waits up to 15 minutes for an answer in the pane, as a takeover does.
-5. Once the agent is up, the run is registered (goal, `--until`, cwd `DIR`, no workers) and the agent is prompted to
-   read the brief, with the same Enter-and-resend check as a takeover prompt.
+1. `pane`: with `--worktree`, `git worktree add <DIR>-<name> -b orch/<name>` first. Then a herdr tab in the folder
+   (its root pane is the orchestrator's), a new decision log for that pane that starts with the goal (D1) and each
+   `--rules` text (D2, ...) as the owner's entries, and a brief at `~/.claude/orch/new/<id>/brief.md` with the goal,
+   the rules, the run and the worker limits (`--worker-model`, `--max-workers`).
+2. `claude`: `claude-acc N` in the pane (`--account auto`, the default, is the account for new agents: the spill
+   target while the rule is active, else the default), with a session id chosen up front, `--model`, `--effort` and
+   `HANDOFF_LINEAGE` pointing at the new log. `--name` names the herdr agent.
+3. `trust`, only when the new agent stops at a dialog (Claude Code's folder trust question on that account): it
+   waits up to 15 minutes for an answer in the pane, as a takeover does. From the CLI it also pushes
+   `respawn-dialog`.
+4. `run`: the run is registered (goal, `--until`, cwd, no workers) with the start's settings in `run.settings`.
+5. `brief`, or `read` with `--plan-first`: the agent is prompted to read the brief, with the same Enter-and-resend
+   check as a takeover prompt. With `--plan-first` the brief asks for a roadmap in a `report` and
+   `orch ask --kind plan` with the options "Approve and start workers" and "Cancel the run", before any other work.
+   That question makes `read` ok and `plan` doing; the owner's answer (`orch answer` or the app) makes `plan` ok.
+   While the plan question is open the watchdog doesn't nudge the run. A revised plan asked again replaces the open
+   question.
 
-Each step is a `new` event with the request's `id` and `step` (`tab`, `log`, `brief`, `start`, `dialog`, `ready`,
-`run`, `prompted`, or `failed`, which alerts), and the request's state is kept in `~/.claude/orch/new/<id>/new.json`.
-The same `--id` again starts nothing and prints that state. `--dry-run` prints every step, the brief and the command,
-and changes nothing.
+Each step is a `start` event, and the start's state is kept in `~/.claude/orch/new/<id>/new.json`. The same `--id`
+again starts nothing and prints that state. `--dry-run` prints every step, the brief and the command, and changes
+nothing.
 
 ### Gateway (orch serve)
 
@@ -342,10 +347,11 @@ on Python 3.8; the push and relay code (`hooks/orch_push.py`) also needs the `cr
 - Reads: `GET /v1/fleet` (runs with their orchestrator and workers, reports, open questions, blocked dialogs with the
   screen text, stall reasons with proposed fixes, accounts with today's samples, pending switches, recent actions),
   `/v1/usage?hours=168`, `/v1/orchestrators/<pane>/decisions`, `/v1/orchestrators/<pane>/history?since=&limit=`,
-  `/v1/panes/<pane>/screen?lines=15` and `/v1/actions/<id>`.
+  `/v1/panes/<pane>/screen?lines=15`, `/v1/actions/<id>` and `/v1/folders?q=&limit=50` (see Starts from the app).
 - Writes: `POST /v1/actions`, one JSON action with the app's `id` (a UUID), `time` and `kind`: `prompt`, `answer`,
   `interrupt` (Esc), `park`, `unpark`, `run` (`extend` from the current end, or `stop`), `nudge`, `account` (`now`,
-  `idle`, `handoff`), `default_account`, `spill`, `ack` (decisions seen) or `push_token` (a rotated FCM token). An id runs once: a retry with the same body gets the
+  `idle`, `handoff`), `default_account`, `spill`, `ack` (decisions seen), `push_token` (a rotated FCM token) or
+  `start` (a new orchestrator, see Starts from the app). An id runs once: a retry with the same body gets the
   first result, and the same id with a different body is refused. Actions older than 10 minutes are refused. The
   answer is 202 `delivered`, 4xx `rejected` or 502 `failed`, with a sentence the app can show. An action becomes
   `picked` once its target agent starts a turn (for an agent that was already working, at its next state change). A
@@ -358,6 +364,30 @@ on Python 3.8; the push and relay code (`hooks/orch_push.py`) also needs the `cr
 Not in the gateway yet: answering a permission dialog (`dialog` is refused), the diff view, the activity lanes and the
 per-agent model.
 
+#### Starts from the app
+
+- They are off until `ORCH_START_ROOTS` is set in `~/.config/orch/.env`: comma-separated folders, `~` allowed.
+  `ORCH_START_EXCLUDE` lists folders a start may never use, such as live production checkouts. Both stay in that
+  file, never in the repo.
+- `start` takes `{folder, worktree?, name?, goal, until ("+4h" or a time), account ("auto" or N), model, effort,
+  worker_model, max_workers (0-16), rules: [text], plan_first}` and runs `orch new` with them. It is refused (409,
+  with the reason) for a folder outside the roots, under an excluded folder, or one an active run works in already
+  (unless `worktree`). The action's id is the start's id. The gateway runs the start detached and answers 202 with
+  `pane` once the new tab exists (or `pane: null` after 20 s; the action lock is held meanwhile), or 502 `failed`
+  when the start failed before it had a pane. The steps then arrive as `start` pushes.
+- `/v1/fleet` shows an unfinished start (the last day's, until `brief` or `plan` is ok) as an orchestrator with
+  activity `starting` and `start: {action, goal, plan_first, until, steps: [{step, status, time, error?}]}`; its
+  agent's dialog during the `trust` step has `kind: "trust"` and the folder as `cwd`. Questions carry `kind`
+  (`"plan"`), runs started this way `run.settings`, and a `start` action's status its `pane`.
+- `/v1/folders` lists the git checkouts that are a root or directly under one, plus the herdr agents' checkouts
+  deeper under a root, never an excluded one, newest work first: `path` (`~` form), `branch` (a short sha when
+  detached), `last_activity` (git index, HEAD or reflog, or a Claude transcript of the folder), `orchestrator`
+  (`{pane, name}` of an active run there) and `trusted` (the folder or a parent is trusted in the `.claude.json` of
+  the account a new agent would use). `q` filters on the path, `limit` is 1-200.
+- Not yet: answering the trust dialog from the app (so a start in a folder the account hasn't trusted waits for an
+  answer in the pane), retrying or cancelling a failed start, `Health.can_start`, closing the tab of a start whose
+  run stopped with no worker.
+
 ### Pushes and the relay (orch_push.py)
 
 The gateway's background loop also pushes to the paired phones and polls the relay mailbox, so notifications and quick
@@ -367,8 +397,9 @@ answers work off the tailnet. The app side is orch-app `docs/PUSH.md`.
   (`~/.config/orch/firebase-sa.json`, 600). The payload is zlib-compressed JSON sealed with AES-256-GCM under the
   pairing key (`ORCH_KEY`), so Google relays only `{v, machine, nonce, ct}`. What is pushed: questions and dialogs open
   30 s (high priority); stalls 5 minutes after the watchdog's nudge, ended runs, usage running out before its reset,
-  spill events, failures (`system`), action statuses; a state snapshot per orchestrator on change (at most one a
-  minute), accounts on a whole-percent change (at most every 5 minutes) and a heartbeat every 10 minutes (collapsible).
+  spill events, failures (`system`), action statuses, the steps of a start (`start`, high priority only when one
+  failed); a state snapshot per orchestrator on change (at most one a minute), accounts on a whole-percent change (at
+  most every 5 minutes) and a heartbeat every 10 minutes (collapsible).
   The gateway trims a message over FCM's 4 KB in fixed steps and lists them in its `trimmed`. A passing FCM
   failure is retried on the next pass; a dead token stops pushes to that phone until the app sends a new one.
 - Up: the phone writes sealed actions to Firestore at `mailboxes/<its anonymous uid>/<machine>/<id>`. The gateway
@@ -451,6 +482,8 @@ All under `~/.claude/handoffs/`:
   relaunch flags) and its latest `report`.
 - `runs/<orchestrator pane>.json`: an `orch` run (end time, goal, workers, parked workers, questions with their ids,
   options and answers), and `runs/<pane>.seen.json`, the events its waits already reported.
+- `~/.claude/orch/new/<id>/`: one `orch new` or app start: `new.json` (its request and steps), `brief.md`, and
+  `start.log` (the detached run's output, for a start from the app).
 - `accounts.json`: pending account switches, the default account, the spill rule and the account names.
 - `gateway-actions.json`: the gateway's actions of the last 24 h by id (result, status), and `decisions-seen.json`,
   the decisions the app marked as seen.
