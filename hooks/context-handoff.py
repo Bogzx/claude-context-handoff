@@ -23,7 +23,8 @@ Inside herdr, every turn end also records the agent's state in
 ~/.claude/handoffs/agents/<pane>.json (background tasks still running, last message, account,
 how to relaunch it), which `orch` (hooks/orch.py) uses to tell a finished worker from one
 waiting on its own job; the orch MCP server adds the agent's turn-end report to the same file.
-An agent in a registered orch run whose turn used tools but sent no report is blocked once.
+An agent in a registered orch run whose turn used tools but sent no report is blocked once,
+if its session runs the orch MCP server.
 A takeover starts under the account `orch account <pane> N` queued for the pane, and
 `orch account <pane> N --now` uses the same respawn to resume the session on account N.
 
@@ -804,13 +805,26 @@ def run_role(pane):
     return None
 
 
-def orch_registered(cwd):
-    """Whether this account's Claude Code config has the orch MCP server (user or local
-    scope), so the agent can call its report tool."""
-    config = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home()) / ".claude.json"
-    cfg = load(config)
-    local = ((cfg.get("projects") or {}).get(cwd or "") or {}).get("mcpServers") or {}
-    return "orch" in (cfg.get("mcpServers") or {}) or "orch" in local
+def orch_loaded(pid):
+    """Whether the claude process `pid` runs the orch MCP server (a `python… orch_mcp.py`
+    child), so this session can call its report tool. The config is not enough: a session
+    started before the server was registered has it in .claude.json but not loaded."""
+    if not pid:
+        return False
+    for proc in Path("/proc").iterdir():
+        if not proc.name.isdigit():
+            continue
+        try:
+            argv = [a.decode(errors="replace")
+                    for a in (proc / "cmdline").read_bytes().split(b"\0") if a]
+            if not (argv and os.path.basename(argv[0]).startswith("python")
+                    and any(os.path.basename(a) == "orch_mcp.py" for a in argv[1:])):
+                continue
+            if int((proc / "stat").read_text().rsplit(")", 1)[1].split()[1]) == pid:
+                return True
+        except (OSError, ValueError, IndexError):
+            continue
+    return False
 
 
 def handoff_underway(state):
@@ -873,13 +887,14 @@ def current_turn(transcript):
 
 
 def report_due(data, state_path):
-    """Block once, for an agent of an active orch run, a turn that used tools and ended
-    without calling the orch MCP report tool. Never twice in a row (stop_hook_active, and
-    once per turn), never for chat-only turns, never while a handoff is underway."""
+    """Block once, for an agent of an active orch run whose session has the orch MCP server
+    loaded, a turn that used tools and ended without calling its report tool. Never twice in a
+    row (stop_hook_active, and once per turn), never for chat-only turns, never while a handoff
+    is underway."""
     if data.get("stop_hook_active"):
         return None
     role = run_role(os.environ["HERDR_PANE_ID"])
-    if not role or not orch_registered(data.get("cwd")):
+    if not role or not orch_loaded(claude_pid()):
         return None
     state = load(state_path)
     if handoff_underway(state):

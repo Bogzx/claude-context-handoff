@@ -184,8 +184,10 @@ as `orch`. It takes the agent's pane from `HERDR_PANE_ID` and offers no tools ou
 
 The Stop hook asks for the report. When an agent is the orchestrator or a worker of an active run, its turn used
 tools, and that turn didn't call `mcp__orch__report`, the hook blocks the turn's end once with a one-line reason.
-Turns that only chatted are left alone, and so are turns while a handoff is due or a takeover is starting, and agents
-whose account config doesn't have the `orch` server. A turn is never blocked twice in a row.
+Turns that only chatted are left alone, and so are turns while a handoff is due or a takeover is starting, and
+sessions that don't run the `orch` server: the hook looks for an `orch_mcp.py` child of the session's claude
+process, so a session started before the install is never asked for a tool it doesn't have. A turn is never blocked
+twice in a row.
 
 For the orchestrator's CLAUDE.md:
 
