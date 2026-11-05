@@ -10,6 +10,8 @@ SuccessExitStatus=3
 Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
 ExecStart=/usr/bin/env python3 %h/.claude/hooks/orch.py serve
 Restart=on-failure
+# A restart (an install) stops the gateway only: the starts it spawned (orch_new.py) run on.
+KillMode=process
 RestartSec=30
 Nice=10
 

@@ -287,6 +287,8 @@ def start(rec, dry=False):
 
     ok = {s["step"] for s in rec.get("steps") or [] if s["status"] == "ok"}
     restart = rec.pop("restart", False)  # a retry on another account: Claude again
+    if not dry:
+        rec["pid"] = os.getpid()  # retry() may run a start whose process is gone again
     current = "pane"
     try:
         if "pane" in ok:
@@ -497,7 +499,7 @@ def retry(rec, account, by):
     again on that account. orch.Refused says why not."""
     if orch.start_cancelled(rec):
         orch.die(f"the start {rec['id']} was cancelled")
-    if rec.get("status") != "failed":
+    if orch.start_done(rec) or (rec.get("status") != "failed" and running(rec.get("pid"))):
         orch.die(f"the start {rec['id']} has not failed ({rec.get('step')} "
                  f"{rec.get('status')}): nothing to retry")
     failed = rec["step"]
@@ -512,6 +514,19 @@ def retry(rec, account, by):
     orch.start_step(rec, failed, "doing", f"retry by {by}"
                     + (f" on account {rec['account']}" if rec.get("restart") else ""))
     spawn(rec["id"])
+
+
+def running(pid):
+    """Whether the start's process is alive (a start left `doing` by a killed process is not)."""
+    if not pid:
+        return True  # not recorded: assume it runs
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True
+    return True
 
 
 def cannot_start(env):

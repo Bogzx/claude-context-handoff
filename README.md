@@ -385,8 +385,10 @@ question), the diff view, the activity lanes and the per-agent model.
   question, else Esc and `/exit`, up to 15 s) and closes the pane the start opened. herdr drops the tab with its last
   pane; a tab someone else split stays, and so does a worktree. A start still running stops at its next step. The
   action ends `picked`, and the start leaves `starting`.
-- `start_retry {action, account?}` runs a failed start again, detached, from its failed step. With another
-  `account`, Claude quits and starts again on that account with a new session id.
+- `start_retry {action, account?}` runs a failed start again, detached, from its failed step, and also a start
+  whose process is gone (it would otherwise stay `doing`). With another `account`, Claude quits and starts again on
+  that account with a new session id. A restart of the gateway (an install) doesn't stop running starts: the unit
+  has `KillMode=process`.
 - `dialog {pane, change, choice}` answers Claude Code's folder-trust question, and only for the pane a start opened
   while that start is at its `trust` step: `allow` picks "Yes", `deny` picks "No" (Claude exits) and cancels the
   start. The gateway checks that the agent is still blocked at the same `change` and that the screen shows a trust

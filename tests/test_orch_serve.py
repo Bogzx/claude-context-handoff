@@ -6,6 +6,7 @@ import os
 import re
 import socket
 import stat
+import subprocess
 import sys
 import threading
 import urllib.error
@@ -1014,6 +1015,27 @@ def trust_step(world, gw):
     world.agent(NEW, "blocked", change=4)
     world.screen = TRUST
     return rec
+
+
+def test_retry_picks_up_a_start_whose_process_died(world, monkeypatch):
+    allow_starts(world, monkeypatch, run_it=False)
+    gw = world.serve.Gateway()
+    world.orch.start_step(trust_step(world, gw), "trust", "doing")
+    path = world.orch.STARTS / "st1" / "new.json"
+    world.orch.save(path, dict(world.orch.load(path), pid=os.getpid()))  # still waiting
+    busy = world.post(gw, id="r1", kind="start_retry", action="st1")
+    assert busy[0] == 409 and "has not failed (trust doing)" in busy[1]["error"]
+    gone = subprocess.Popen(["true"])
+    gone.wait()
+    world.orch.save(path, dict(world.orch.load(path), pid=gone.pid))  # killed meanwhile
+    world.agents[NEW]["agent_status"] = "idle"  # and the question was answered in the pane
+    allow_starts(world, monkeypatch)  # the retry runs in-process
+    assert world.post(gw, id="r2", kind="start_retry", action="st1")[0] == 202
+    rec = world.orch.load(path)
+    assert [(s["step"], s["status"]) for s in rec["steps"]] == [
+        ("pane", "ok"), ("claude", "ok"), ("trust", "ok"), ("run", "ok"), ("read", "doing")]
+    assert rec["pid"] == os.getpid() and not [c for c in world.herdr_calls
+                                              if c[:2] == ("pane", "run")]  # Claude was up
 
 
 def test_the_app_answers_only_a_new_orchestrators_trust_question(world, monkeypatch):
