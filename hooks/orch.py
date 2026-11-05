@@ -53,6 +53,7 @@ MISSING_GRACE = 5 * 60  # a pane without its agent (a takeover takes about a min
 LONG_WAIT = 90 * 60  # idle with background tasks this long: a stuck or forgotten job
 ORCH_NO_WAKE = 5 * 60  # orchestrator idle with nothing that can wake it
 ORCH_SILENT = 60 * 60  # orchestrator idle this long whatever it waits on
+STOP_OVER = 5 * 60  # a stopped lead seen going on this long: one pass can misread its pane
 NUDGE_EVERY = 15 * 60
 NUDGE_BACKOFF = 60 * 60  # after IGNORED nudges in a row on the same problem
 IGNORED = 3
@@ -64,6 +65,8 @@ HOOK = Path(__file__).resolve().parent / "context-handoff.py"
 PROJECTS = Path.home() / ".claude" / "projects"  # the transcripts
 LIMITS = {}  # transcript -> ((size, mtime), what limit_stop found in it)
 LIMIT_TAIL = 1 << 16  # bytes of a transcript read for its last turn's end
+# The usage window behind Claude's words. Its Opus, Sonnet and Fable limits have none.
+LIMIT_WINDOW = {"weekly": "seven_day", "5-hour": "five_hour", "session": "five_hour"}
 AGENTS_VIEW = re.compile(r"(?:^|· )claude agents$")  # the terminal title of Claude's agents view
 VIEW_STATE = {"agents": "agents_view", "trust": "trust"}
 STOPPED = {"limit": "stopped at its usage limit",
@@ -254,6 +257,27 @@ def limit_stop(session):
     return LIMITS[path][1]
 
 
+def holding_limit(st, session, at):
+    """limit_stop, while that limit still holds. Only a new turn changes the transcript, so its
+    record outlives both ways out: a process started since (a resume, on any account), and the
+    window beginning again. An unknown window counts as holding."""
+    limit = limit_stop(st.get("session") or session)
+    if not limit:
+        return None
+    if st.get("event") == "SessionStart" and (st.get("time") or 0) > limit["since"]:
+        return None
+    words = re.match(r"You've hit your (\S+) limit", limit["text"])
+    name = LIMIT_WINDOW.get(words.group(1)) if words else None
+    account = (load(ROOT / "usage.json").get("accounts") or {}).get(st.get("account")) or {}
+    resets = ((account.get("windows") or {}).get(name) or {}).get("resets_at")
+    if not resets:
+        return limit
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import orch_usage
+    began = resets if resets <= at else resets - orch_usage.WINDOWS[name]
+    return None if began > limit["since"] else limit
+
+
 def last_limit(records):
     for record in reversed(records):
         if record.get("type") == "user":
@@ -439,7 +463,7 @@ def view(pane, agent, run, at):
         "report": st.get("report"),  # the latest, whichever session wrote it (it has its time)
         "pane_view": pane_view(pane, agent) if agent else None,
         # the status's session: the agents view keeps herdr on a session that ended
-        "limit": limit_stop(st.get("session") or session) if agent else None,
+        "limit": holding_limit(st, session, at) if agent else None,
         "account": fresh.get("account"),
         "context_tokens": (live.get("context_tokens") if session and live.get("session") == session
                            else fresh.get("context_tokens")),
@@ -451,6 +475,12 @@ def view(pane, agent, run, at):
 def stopped_state(v):
     """limit, agents_view or trust for an agent that can't go on by itself, else None."""
     return "limit" if v["limit"] else VIEW_STATE.get(v["pane_view"])
+
+
+def lead_name(pane, run, agent, cwd=""):
+    """An orchestrator's name: its herdr agent name, else its run's folder, else the pane."""
+    cwd = (run or {}).get("cwd") or (agent or {}).get("cwd") or cwd or ""
+    return (agent or {}).get("name") or os.path.basename(cwd.rstrip("/")) or pane
 
 
 def first_line(text, width=90):
@@ -1046,6 +1076,22 @@ def nudge_reasons(run, ags, at, ws):
     return reasons
 
 
+def stop_alert(orch, run, agent, v, state, host):
+    """The title and body of the alert for a lead that stopped: which one, what stopped it and
+    what the owner can do. The view decides that last part, as in the app."""
+    name = lead_name(orch, run, agent)
+    why = ((v["limit"] or {}).get("text") or "").strip().rstrip(".") or STOPPED[state]
+    if v["pane_view"] == "trust":
+        what = f"Answer it in the pane on {host}."
+    elif v["pane_view"]:
+        what = f"Open a session or leave the view in the pane on {host}."
+    elif v["switch"]:
+        what = f"A move to account {v['switch']['account']} is queued."
+    else:
+        what = "Move it to another account, or message it once the limit resets."
+    return f"Orchestrator stopped: {name} on {host}", f"{name} ({orch}): {why}. {what}"
+
+
 def cmd_watchdog(args):
     ags = agents()
     if ags is None:
@@ -1072,6 +1118,24 @@ def cmd_watchdog(args):
             continue
         agent = ags.get(orch)
         status = agent.get("agent_status") if agent else "missing"
+        v = view(orch, agent, None, at)
+        stopped = stopped_state(v)
+        if stopped:  # whatever herdr says: it calls the trust question blocked
+            # What stopped it, not when: a prompt into a session at its limit hits the same wall
+            stop = [stopped, status_of(orch).get("account"), (v["limit"] or {}).get("text")]
+            for key in ("missing", "blocked", "alerted", "stop_over"):
+                ws.pop(key, None)
+            if ws.get("stop") != stop:
+                title, body = stop_alert(orch, run, agent, v, stopped, host)
+                if args.dry_run:
+                    print(f"would alert: {title}: {body}")
+                    continue
+                ws["stop"] = stop
+                emit("orch-stopped", title, body, orch, push=True, state=stopped)
+            continue  # nothing typed: a nudge only returns the limit message
+        if "stop" in ws and at - ws.setdefault("stop_over", at) >= STOP_OVER:
+            ws.pop("stop")
+            ws.pop("stop_over")
         if status in ("missing", "blocked"):
             ws.pop("idle", None)
             since = ws.setdefault(status, at)
@@ -1087,8 +1151,6 @@ def cmd_watchdog(args):
             ws.pop(key, None)
         if status not in ("idle", "done"):
             continue  # working: it will see the fleet at its turn end
-        if pane_view(orch, agent):
-            continue  # nothing can be typed there; the fleet says what the pane shows
         reasons = nudge_reasons(run, ags, at, ws)
         if not reasons:
             ws.pop("ignored", None)

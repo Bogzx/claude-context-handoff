@@ -146,6 +146,84 @@ WRITE_2 = """\
 
  Esc to cancel
 """
+OPTIONS = """\
+ ❯ 1. Yes
+   2. Yes, and switch to accept edits (auto-approve file edits and common file commands) for this session (shift+tab)
+   3. No
+
+ Esc to cancel · Tab to amend
+"""
+RULE = "╌" * 60
+# Claude Code 2.1.318 in a terminal of 155 x 44, against a fake API (no account).
+OVERWRITE = f"""\
+ Overwrite file
+ notes.md
+{RULE}
+  1 -old line
+  2 -second line
+  1 +SECRET=abc
+  2 +line two
+{RULE}
+ Do you want to overwrite notes.md?
+{OPTIONS}"""
+EDIT = f"""\
+ Edit file
+ notes.md
+{RULE}
+ 1 -old line
+ 1 +SECRET=abc
+ 2  second line
+{RULE}
+ Do you want to make this edit to notes.md?
+{OPTIONS}"""
+NOTEBOOK_EDIT = f"""\
+ Edit notebook
+ /work/proj/nb.ipynb
+ Replace cell contents for cell c1
+{RULE}
+  1 -print('old cell')
+  1 +print('SECRET=abc')
+{RULE}
+ Do you want to make this edit to nb.ipynb?
+{OPTIONS}"""
+NOTEBOOK_INSERT = f"""\
+ Edit notebook
+ /work/proj/nb.ipynb
+ Insert new cell for cell c1 (code)
+{RULE}
+  1 print('SECRET=abc')
+{RULE}
+ Do you want to insert this cell into nb.ipynb?
+{OPTIONS}"""
+NOTEBOOK_DELETE = f"""\
+ Edit notebook
+ /work/proj/nb.ipynb
+ Delete cell for cell c1
+{RULE}
+  1 print('SECRET=abc')
+{RULE}
+ Do you want to delete this cell from nb.ipynb?
+{OPTIONS}"""
+WRAPPED = f"""\
+ Overwrite file
+ …-long-directory/notes-with-a-long-name.md
+{RULE}
+  1 -old line
+  2 -second line
+  1 +SECRET=abc
+  2 +line two
+{RULE}
+ Do you want to overwrite
+ notes-with-a-long-name.md?
+ ❯ 1. Yes
+   2. Yes, and switch to accept edits
+      (auto-approve file edits and common
+      file commands) for this session
+      (shift+tab)
+   3. No
+
+ Esc to cancel · Tab to amend
+"""  # the same, 44 columns wide
 T0 = datetime(2026, 11, 5, 10, 0).timestamp()  # noqa: DTZ001 orch works in local time
 TOKEN = "t0ken-for-tests"
 
@@ -300,6 +378,15 @@ def tool_call(command, tool_id="toolu_1", description="Write the lab notes"):
     return {"type": "assistant", "message": {"content": [
         {"type": "tool_use", "id": tool_id, "name": "Bash",
          "input": {"command": command, "description": description}}]}}
+
+
+def file_call(name="NotebookEdit", **given):
+    """The call behind NOTEBOOK_INSERT: "c1" + "print..." holds the preview's "1 print...", so
+    the search for a command's call finds it."""
+    given = given or {"notebook_path": "/work/proj/nb.ipynb", "cell_id": "c1",
+                      "new_source": "print('SECRET=abc')\n", "edit_mode": "insert"}
+    return {"type": "assistant", "message": {"content": [
+        {"type": "tool_use", "id": "toolu_1", "name": name, "input": given}]}}
 
 
 def tool_result(tool_id="toolu_1"):
@@ -1663,6 +1750,42 @@ def test_the_fleet_says_an_orchestrator_stopped_at_its_limit(world):
     assert lead_of(world, gw, BOSS)["agent"]["limit"] is None  # a new turn began
 
 
+def lead_at_its_limit(world):
+    """A lead whose limit is a minute old; returns the path of its status file."""
+    start_run(world)
+    world.agent(BOSS, "idle")
+    world.turn_end(BOSS, ago=120)
+    when = datetime.fromtimestamp(world.t - 60, timezone.utc)
+    transcript(world, f"s-{BOSS}", limit_record(when.strftime("%Y-%m-%dT%H:%M:%S.000Z")))
+    return world.root / "agents" / "w1-p0.json"
+
+
+def test_the_fleet_stops_saying_limit_once_the_window_has_reset(world):
+    status = lead_at_its_limit(world)
+    status.write_text(json.dumps(dict(json.loads(status.read_text()), account="1")))
+    (world.root / "usage.json").write_text(json.dumps({"accounts": {"1": {
+        "read_at": world.t, "windows": {"seven_day": {"resets_at": world.t + 3600}}}}}))
+    gw = world.serve.Gateway()
+    assert lead_of(world, gw, BOSS)["activity"] == "limit"
+
+    world.t += 3601
+
+    lead = lead_of(world, gw, BOSS)
+    assert lead["agent"]["limit"] is None and lead["activity"] != "limit"
+
+
+def test_the_fleet_stops_saying_limit_once_the_session_is_resumed(world):
+    status = lead_at_its_limit(world)
+    gw = world.serve.Gateway()
+    assert lead_of(world, gw, BOSS)["activity"] == "limit"
+
+    status.write_text(json.dumps(dict(json.loads(status.read_text()), account="2",
+                                      event="SessionStart", time=world.t)))
+
+    lead = lead_of(world, gw, BOSS)
+    assert lead["agent"]["limit"] is None and lead["activity"] != "limit"
+
+
 def test_the_limit_of_a_session_herdr_has_lost_track_of_is_seen(world):
     """The agents view keeps herdr on a session that ended; the status names the running one."""
     gw = world.serve.Gateway()
@@ -1795,16 +1918,123 @@ def test_a_command_the_transcript_does_not_confirm_is_marked_cut(world, records)
     assert "line 01" not in dialog["command"]
 
 
-def test_a_file_dialog_names_its_file_whole(world):
-    gw = world.serve.Gateway()
+def file_dialog(world, gw, screen, *records):
     start_run(world)
     world.agent(W1, "blocked", change=7)
-    world.screen = WRITE
-
+    world.screen = screen
+    transcript(world, f"s-{W1}", *records)
     [dialog] = lead_of(world, gw, BOSS)["dialogs"]
+    return dialog
 
-    assert (dialog["tool"], dialog["command"], dialog["command_cut"]) == ("Write", "hello.txt",
+
+WRITE_TO = WRITE.replace("create hello.txt", "write to hello.txt")  # from the binary, not seen
+
+
+@pytest.mark.parametrize("screen, tool, name", [
+    (WRITE, "Write", "hello.txt"),
+    (WRITE_TO, "Write", "hello.txt"),
+    (OVERWRITE, "Write", "notes.md"),
+    (EDIT, "Edit", "notes.md"),
+    (NOTEBOOK_EDIT, "Edit", "nb.ipynb"),
+    (NOTEBOOK_INSERT, "Edit", "nb.ipynb"),
+    (NOTEBOOK_DELETE, "Edit", "nb.ipynb"),
+], ids=["create", "write to", "overwrite", "edit", "cell edit", "cell insert", "cell delete"])
+def test_a_file_prompt_is_write_or_edit_its_files_name_and_cut(world, screen, tool, name):
+    dialog = file_dialog(world, world.serve.Gateway(), screen, file_call())
+
+    assert (dialog["tool"], dialog["command"], dialog["command_cut"]) == (tool, name, True)
+    assert dialog["text"] == ""
+
+
+@pytest.mark.parametrize("call", [
+    file_call(),
+    file_call("MultiEdit", file_path="/work/proj/nb.ipynb", edits="c1print('SECRET=abc')"),
+    file_call("Write", file_path="/work/proj/nb.ipynb", content="c1print('SECRET=abc')"),
+], ids=["NotebookEdit", "MultiEdit", "Write"])
+def test_a_file_question_nobody_knows_yet_keeps_its_contents_off_the_phone(world, call):
+    """The search finds the call, and the input it would send holds the file's contents."""
+    screen = NOTEBOOK_INSERT.replace("insert this cell into", "rewrite")
+    dialog = file_dialog(world, world.serve.Gateway(), screen, call)
+
+    assert dialog["command"] == "/work/proj/nb.ipynb" and dialog["command_cut"] is True
+    assert dialog["tool"] == ("Write" if "Write" in str(call) else "Edit")
+    assert dialog["text"] == ""
+
+
+def overwrite_call():
+    return file_call("Write", file_path="/work/proj/notes.md", content="SECRET=abc\nline two\n")
+
+
+def test_a_preview_that_matches_no_call_is_not_taken_for_a_command(world):
+    """Its line numbers keep the search from finding the call, but the call is open."""
+    screen = OVERWRITE.replace("overwrite notes.md", "rewrite notes.md")
+    dialog = file_dialog(world, world.serve.Gateway(), screen, overwrite_call())
+
+    assert (dialog["tool"], dialog["command"]) == ("Write", "/work/proj/notes.md")
+    assert dialog["command_cut"] is True and dialog["text"] == ""
+
+
+def test_a_question_wrapped_in_a_narrow_pane_keeps_its_preview_off_the_phone(world):
+    gw = world.serve.Gateway()
+    dialog = file_dialog(world, gw, WRAPPED, overwrite_call())
+
+    assert dialog["text"] == "" and "kind" not in dialog
+    refused = from_phone(world, gw, kind="dialog", pane=W1, change=7, choice="allow")
+    assert refused[0] == 400  # not a prompt it can read: nothing is pressed
+    assert not [c for c in world.herdr_calls if c[:2] == ("agent", "send-keys")]
+
+
+@pytest.mark.parametrize("records", [(overwrite_call(), tool_result()), (tool_call("ls"),)],
+                         ids=["the file call ended", "another tool's call"])
+def test_a_dialog_with_no_file_call_open_keeps_its_screen(world, records):
+    dialog = file_dialog(world, world.serve.Gateway(), WRAPPED, *records)
+
+    assert "notes-with-a-long-name" in dialog["text"]
+
+
+def test_a_command_keeps_its_screen_with_a_file_call_open_beside_it(world):
+    dialog = file_dialog(world, world.serve.Gateway(), BASH, overwrite_call(),
+                         tool_call("rm notes.txt", "toolu_2", "Remove notes.txt"))
+
+    assert (dialog["tool"], dialog["command"]) == ("Bash", "rm notes.txt")
+    assert "rm notes.txt" in dialog["text"]
+
+
+def test_the_trust_question_keeps_its_screen_with_a_stale_file_call(world):
+    """A start reads the question from `text`, and a resumed session can have such a call."""
+    screen = ("Do you trust this folder?\n ❯ No, exit\n   Yes, I trust this folder\n\n"
+              " Enter to confirm · Esc to cancel\n")
+    dialog = file_dialog(world, world.serve.Gateway(), screen, overwrite_call())
+
+    assert "trust this folder" in dialog["text"]
+
+
+def test_a_command_that_only_mentions_a_file_tool_is_still_a_command(world):
+    dialog = file_dialog(world, world.serve.Gateway(), BASH,
+                         tool_call("rm notes.txt", description="Remove notes.txt"))
+
+    assert (dialog["tool"], dialog["command"], dialog["command_cut"]) == ("Bash", "rm notes.txt",
                                                                          False)
+
+
+@pytest.mark.parametrize("screen", [WRITE, OVERWRITE, NOTEBOOK_INSERT],
+                         ids=["create", "overwrite", "cell insert"])
+def test_allow_is_refused_on_a_file_and_deny_and_delegate_still_work(world, screen):
+    gw = world.serve.Gateway()
+    file_dialog(world, gw, screen, file_call())
+
+    refused = from_phone(world, gw, kind="dialog", pane=W1, change=7, choice="allow")
+
+    assert refused[0] == 409
+    status = world.get(gw, f"/v1/actions/{refused[1]['id']}")[1]
+    assert status["error"] == "file changes can't be allowed from the phone: answer it in the pane"
+    assert not [c for c in world.herdr_calls if c[:2] == ("agent", "send-keys")]
+
+    assert from_phone(world, gw, kind="dialog", pane=W1, change=7, choice="delegate")[0] == 202
+    told = world.prompts[-1][1]
+    assert "only the end of it" not in told and "send-keys" in told
+    assert from_phone(world, gw, kind="dialog", pane=W1, change=7, choice="deny")[0] == 202
+    assert [c for c in world.herdr_calls if c[:2] == ("agent", "send-keys")][-1][3:] == ("esc",)
 
 
 def test_allow_is_refused_on_a_cut_command_and_deny_and_delegate_still_work(world):
@@ -1815,7 +2045,8 @@ def test_allow_is_refused_on_a_cut_command_and_deny_and_delegate_still_work(worl
 
     refused = from_phone(world, gw, kind="dialog", pane=W1, change=7, choice="allow")
 
-    assert refused[0] == 409 and "answer it in the pane" in refused[1]["error"]
+    assert refused[0] == 409 and "only part of the command" in refused[1]["error"]
+    assert "answer it in the pane" in refused[1]["error"]
     assert not [c for c in world.herdr_calls if c[:2] == ("agent", "send-keys")]
     assert from_phone(world, gw, kind="dialog", pane=W1, change=7, choice="delegate")[0] == 202
     assert "only the end of it is on screen" in world.prompts[-1][1]
@@ -2644,6 +2875,26 @@ def test_the_push_loop_sends_what_the_phone_needs_once(world, cloud):
     assert health["seq"] == 4 and health["last_heartbeat"] == world.t
 
 
+def test_a_stop_reaches_the_phone_as_a_system_push_at_high_priority(world, cloud):
+    start_run(world)
+    gw = world.serve.Gateway()
+    pair(world, gw)
+    gw.pusher.cycle()
+    cloud.pushes.clear()
+    world.orch.emit("orch-stopped", "Orchestrator stopped: boss on box1",
+                    "boss (w1:p0): stopped. Do this.", BOSS, state="limit")
+    world.orch.emit("orch-missing", "Orchestrator missing", "no agent", BOSS)
+    gw.pusher.cycle()
+
+    stop, other = [p for p in cloud.pushes if p["message"]["kind"] == "system"]
+    assert stop["message"]["orchestrator"] == BOSS
+    assert stop["message"]["body"] == {
+        "time": world.t, "kind": "orch-stopped", "title": "Orchestrator stopped: boss on box1",
+        "body": "boss (w1:p0): stopped. Do this.", "pane": BOSS}
+    assert stop["android"]["priority"] == "HIGH"  # a phone in Doze holds a normal one back
+    assert other["android"]["priority"] == "NORMAL"
+
+
 def test_events_become_pushes_and_old_ones_are_skipped(world, cloud):
     start_run(world)
     gw = world.serve.Gateway()
@@ -2702,6 +2953,51 @@ def test_start_steps_become_start_pushes_high_only_when_one_failed(world, cloud,
     assert failed["message"]["body"]["status"] == "failed"
     assert failed["message"]["body"]["error"] == "herdr couldn't open a tab: no such workspace"
     assert "system" not in cloud.kinds()  # the failure goes once, as a start push
+
+
+def test_a_preview_reaches_the_phone_by_no_road(world, cloud):
+    start_run(world)
+    gw = world.serve.Gateway()
+    pair(world, gw)
+    gw.pusher.cycle()
+    cloud.pushes.clear()
+    world.agent(W1, "blocked", change=7)
+    world.screen = OVERWRITE
+    assert "SECRET" in world.screen
+    transcript(world, f"s-{W1}", file_call("Write", file_path="/work/proj/notes.md",
+                                           content="SECRET=abc\nline two\n"))
+    gw.pusher.cycle()
+    world.t += 61  # past DIALOG_AFTER and STATE_EVERY
+    gw.pusher.cycle()
+    assert {"dialog", "state"} <= set(cloud.kinds())
+
+    cloud.write("uid1", {"id": "r-deny", "time": world.t, "kind": "dialog", "pane": W1,
+                         "change": 7, "choice": "deny"})
+    assert gw.pusher.poll() is True  # by relay: the status and the event come back
+    assert from_phone(world, gw, kind="dialog", pane=W1, change=7, choice="allow")[0] == 409
+    gw.pusher.cycle()
+
+    assert "actions" in cloud.kinds()
+    seen = {"pushes": cloud.pushes, "docs": cloud.docs, "fleet": world.get(gw, "/v1/fleet")[1],
+            "history": world.get(gw, f"/v1/orchestrators/{BOSS}/history?since=0")[1]}
+    assert [k for k, v in seen.items() if "SECRET" in json.dumps(v)] == []
+
+
+def test_allow_on_a_file_is_refused_by_relay_too(world, cloud):
+    start_run(world)
+    gw = world.serve.Gateway()
+    pair(world, gw)
+    gw.pusher.cycle()
+    world.agent(W1, "blocked", change=7)
+    world.screen = OVERWRITE
+    cloud.write("uid1", {"id": "r-allow", "time": world.t, "kind": "dialog", "pane": W1,
+                         "change": 7, "choice": "allow"})
+
+    assert gw.pusher.poll() is True
+
+    status = world.get(gw, "/v1/actions/r-allow")[1]
+    assert status["status"] == "rejected" and "file changes" in status["error"]
+    assert not [c for c in world.herdr_calls if c[:2] == ("agent", "send-keys")]
 
 
 def test_the_relay_runs_each_action_once_and_pushes_its_status(world, cloud):

@@ -188,6 +188,7 @@ plus the fields of its kind:
 | `orch-missing`, `orch-blocked` | the orchestrator pane has no agent, or sits at a dialog | orchestrator | | yes |
 | `nudge` | the watchdog prompts an idle orchestrator | orchestrator | | |
 | `orch-not-acting` | the same problem after several nudges, or the nudge could not be sent | orchestrator | | yes |
+| `orch-stopped` | the watchdog finds the orchestrator at its usage limit, in the agents view or at the trust question: once per stop, and it isn't nudged while stopped. A stop ends when the orchestrator has been seen going on for 5 minutes, or when what stopped it changes. For the trust question this replaces `orch-blocked` | orchestrator | `state` (`limit`, `agents_view`, `trust`) | yes |
 | `ask` | `orch ask` or the MCP `ask_owner` | the agent that asks | `id`, `question`, `options` (`label`, `danger`), `question_kind` (`plan` or null), `default`, `default_at`, `evidence`, `rule` | yes |
 | `answer` | `orch answer`, the app, or the watchdog taking a question's default | the agent that asked | `id`, `by_default` | |
 | `report` | the MCP `report` tool | the agent | `report` | |
@@ -451,7 +452,12 @@ Not in the gateway yet: the diff view, the activity lanes and the per-agent mode
   gateway takes it from the transcript, where Claude Code writes the tool call before it asks: the one unfinished call
   that holds every line on screen. If there is no such call, or more than one, `command` is only what the screen shows
   and `command_cut` is true: `allow` is refused (409) and the prompt is answered in the pane. `deny` and `delegate`
-  still work. A file prompt's `command` is the file's name, which the question gives in full.
+  still work.
+- A file change can't be allowed from the phone. A prompt from Write, Edit, MultiEdit or NotebookEdit has `tool` `Write`
+  or `Edit`, the file's name as `command` and `command_cut` true, so `allow` is refused (409) with its own reason,
+  whichever way the action arrives. `deny` and `delegate` still work, and the orchestrator can still decide it. Its
+  `text` is empty, in the fleet and in pushes, so the file's preview stays off the phone; that includes a dialog whose
+  question wrapped in a narrow pane, while a file tool's call is open. `/v1/panes/<pane>/screen` still shows the pane.
 - `prompt`, `nudge`, `interrupt` and `answer` are refused (409) for a start's pane until Claude runs there and its
   folder-trust question is answered. Before that, a shell would read the text, or its keys could answer the dialog.
   They are refused (409) the same way for any pane in Claude Code's agents view, where the text would start a new
@@ -469,7 +475,9 @@ Not in the gateway yet: the diff view, the activity lanes and the per-agent mode
   has `kind: "permission"` with `tool` and `command` when the screen shows them. Questions carry `kind`
   (`"plan"`), runs started this way `run.settings`, and a `start` action's status its `pane`.
 - An agent that can't go on by itself has a `state` of its own, and an orchestrator in one has the same `activity`:
-  `limit` (Claude's usage limit ended its last turn; `limit` holds the message as `text` and its time as `since`),
+  `limit` (Claude's usage limit ended its last turn and still holds; `limit` holds the message as `text` and its time as
+  `since`. It ends with a new turn, a restart of the session on any account, or the start of a new usage window: known
+  for the weekly and 5-hour limits when `usage.json` has that window, otherwise it lasts until the next turn),
   `agents_view` (the pane shows Claude Code's agents view; its conversation may still run in the background) or `trust`
   (the pane is at the folder-trust question). `limit` wins over the other two. `pane_view` is `agents`, `trust` or null,
   whatever `state` says: it tells whether typing is refused. No Stop hook runs for a turn the limit ended, so the gateway
@@ -503,10 +511,11 @@ answers work off the tailnet. The app side is orch-app `docs/PUSH.md`.
 
 - Down: FCM HTTP v1 data messages sent by the machine itself with the `orch-push` service account
   (`~/.config/orch/firebase-sa.json`, 600). The payload is zlib-compressed JSON sealed with AES-256-GCM under the
-  pairing key (`ORCH_KEY`), so Google relays only `{v, machine, nonce, ct}`. What is pushed: questions and dialogs open
-  30 s (high priority); stalls 5 minutes after the watchdog's nudge, ended runs, usage running out before its reset,
-  spill events, failures (`system`), action statuses, the steps of a start (`start`, high priority only when one
-  failed); a state snapshot per orchestrator on change (at most one a minute), accounts on a whole-percent change (at
+  pairing key (`ORCH_KEY`), so Google relays only `{v, machine, nonce, ct}`. What is pushed: questions at once and dialogs
+  open 30 s (both high priority); stalls 5 minutes after the watchdog's nudge, ended runs, usage running out before its reset,
+  spill events, failures (`system`, high priority only for `orch-stopped`), action statuses, the steps of a start
+  (`start`, high priority only when one failed); a state snapshot per orchestrator on change (at most one a minute),
+  accounts on a whole-percent change (at
   most every 5 minutes) and a heartbeat every 10 minutes (collapsible).
   The gateway trims a message over FCM's 4 KB in fixed steps and lists them in its `trimmed`. A passing FCM
   failure is retried on the next pass; a dead token stops pushes to that phone until the app sends a new one.

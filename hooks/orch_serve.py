@@ -226,6 +226,12 @@ RULE = re.compile(r"^\s*[╌─━-]{8,}\s*$")
 HEADER = re.compile(r"[A-Z]\w* command")
 GUTTER = re.compile(r"^\s*│ ?")  # the bar left of a command in a permission prompt
 CALL_TAIL = 1 << 20  # bytes of a transcript read for a dialog's tool call
+# Claude's file questions, as "Do you want to <verb> <file>?". NotebookEdit has the last three.
+WRITES = ("create", "overwrite", "write to")
+EDITS = ("make this edit to", "insert this cell into", "delete this cell from")
+FILE_QUESTION = re.compile(rf"Do you want to ({'|'.join(WRITES + EDITS)}) (.+)\?")
+FILE_TOOLS = {"Write": "Write", "Edit": "Edit", "MultiEdit": "Edit", "NotebookEdit": "Edit"}
+FILE_REFUSED = "file changes can't be allowed from the phone: answer it in the pane"
 
 
 def permission(lines):
@@ -258,9 +264,9 @@ def permission(lines):
         return None
     question = ASKED.match(lines[q])[1]
     tool = command = None
-    m = re.fullmatch(r"Do you want to (create|make this edit to) (.+)\?", question)
+    m = FILE_QUESTION.fullmatch(question)
     if m:
-        tool, command = ("Write" if m[1] == "create" else "Edit"), m[2]
+        tool, command = ("Write" if m[1] in WRITES else "Edit"), m[2]
     else:
         block, top = [], q  # the command: the lines right above the question
         for i in range(q - 1, -1, -1):
@@ -293,26 +299,40 @@ def pending_calls(session):
     return [c for c in calls if c.get("id") not in done]
 
 
+def file_prompt(found, call):
+    """`found` as a prompt of the file tool `call`: its file's name and none of its contents."""
+    given = call.get("input") or {}
+    return dict(found, tool=FILE_TOOLS[call["name"]], command_cut=True,
+                command=given.get("file_path") or given.get("notebook_path"))
+
+
 def whole_command(found, session):
     """`found` (a permission prompt) with the whole command and `command_cut`. The screen can't
     say what Allow would run: a command taller than the terminal shows only its end. Claude
     Code writes the tool call to the transcript before it asks, so the command comes from
     there, when exactly one unfinished call holds every line on screen. Otherwise the text is
     only what the screen shows, and command_cut stops Allow, in the app and in act_permission.
-    A file prompt names its file in the question, whole."""
-    if not found or found["tool"] in ("Write", "Edit"):
-        return found and dict(found, command_cut=False)
+    A file prompt is always cut: it names its file, and its contents stay off the phone, so
+    nobody there can read what Allow would write. The owner's rule. A question this parser
+    doesn't know yet is taken for one while a file tool's call is open: what it took for a
+    command would be the preview."""
+    if not found or found["tool"] in FILE_TOOLS:
+        return found and dict(found, command_cut=True)
+    pending = pending_calls(session)
     shown = ["".join(x.split()) for x in (found["command"] or "").split("\n")]
     shown = [x for x in shown if x]  # without spaces: the terminal wraps a line anywhere
     calls = []
-    for call in pending_calls(session) if shown else ():
+    for call in pending if shown else ():
         given = call.get("input") or {}
         held = "".join("".join(v for v in given.values() if isinstance(v, str)).split())
         if all(x in held for x in shown):
             calls.append((call, given))
     if len(calls) != 1:
-        return dict(found, command_cut=True)
+        files = [c for c in pending if c.get("name") in FILE_TOOLS]
+        return file_prompt(found, files[-1]) if files else dict(found, command_cut=True)
     call, given = calls[0]
+    if call.get("name") in FILE_TOOLS:
+        return file_prompt(found, call)
     command = given.get("command")
     return dict(found, tool=call.get("name"), command_cut=False,
                 command=command if isinstance(command, str)
@@ -331,8 +351,13 @@ def dialog_json(a, agent):
     report = a["report"] or {}
     lines = orch.screen_lines(a["pane"], 40, "visible") or []
     found = whole_command(permission(lines), a["session"])
+    # A file prompt's preview stays off the phone. A question too long for a narrow pane wraps
+    # and isn't parsed, so its open call says what it is; the trust question has no preview.
+    private = (found["tool"] in FILE_TOOLS if found else a["pane_view"] != "trust" and any(
+        c.get("name") in FILE_TOOLS for c in pending_calls(a["session"])))
     return dict({"pane": a["pane"], "label": a["label"], "since": a["since"],
-                 "change": (agent or {}).get("state_change_seq"), "text": "\n".join(lines),
+                 "change": (agent or {}).get("state_change_seq"),
+                 "text": "" if private else "\n".join(lines),
                  "doing": report.get("summary") or orch.first_line(a["last"], 160),
                  "danger": True},  # no rule yet: every dialog answer is treated as dangerous
                 **({"kind": "permission", "tool": found["tool"], "command": found["command"],
@@ -433,12 +458,6 @@ def trusted(account):
     projects = orch.load(orch.account_config(account)).get("projects") or {}
     return {Path(p) for p, v in projects.items()
             if isinstance(v, dict) and v.get("hasTrustDialogAccepted")}
-
-
-def lead_name(pane, run, agent, cwd=""):
-    """An orchestrator's name: its herdr agent name, else its run's folder, else the pane."""
-    cwd = (run or {}).get("cwd") or (agent or {}).get("cwd") or cwd or ""
-    return (agent or {}).get("name") or os.path.basename(cwd.rstrip("/")) or pane
 
 
 class Reject(Exception):
@@ -696,7 +715,7 @@ class Gateway:
                 stall = stall_json(reasons, workers, v["report"], nudges.get(pane))
         dialogs = [dialog_json(a, ags.get(a["pane"])) for a in [lead, *workers]
                    if a["state"] == "blocked" or a["pane_view"] == "trust"]
-        name = lead_name(pane, run, agent, (start or {}).get("cwd"))
+        name = orch.lead_name(pane, run, agent, (start or {}).get("cwd"))
         if start:  # a new orchestrator: its start's steps until the brief or the plan's OK
             activity, since, stall = "starting", start.get("time"), None
             doing = {s["step"]: s["time"] for s in start["steps"] if s["status"] == "doing"}
@@ -758,7 +777,8 @@ class Gateway:
             gd, run = git_dir(path), runs.get(path)
             lead = (run or {}).get("orchestrator")
             out.append({"path": shown, "branch": branch_of(gd), "last_activity": last_work(path, gd),
-                        "orchestrator": {"pane": lead, "name": lead_name(lead, run, ags.get(lead))}
+                        "orchestrator": {"pane": lead,
+                                         "name": orch.lead_name(lead, run, ags.get(lead))}
                         if run else None,
                         "trusted": path in trust})  # a trusted parent doesn't count
         out.sort(key=lambda f: -(f["last_activity"] or 0))
@@ -1294,7 +1314,8 @@ def act_permission(gw, body, rec, pane, choice):
         lead = run["orchestrator"]
         typable(lead)
         out = target(lead)
-        cut = " (only the end of it is on screen)" if found["command_cut"] else ""
+        cut = (" (only the end of it is on screen)"
+               if found["command_cut"] and found["tool"] not in FILE_TOOLS else "")
         text = (f"The owner leaves this permission prompt to you: {label} ({pane}) asks "
                 f"\"{found['question']}\" for {what}{cut}. The screen:\n" + "\n".join(lines)
                 + f"\nDecide and answer it in that pane: `herdr agent send-keys {pane} enter` "
@@ -1303,6 +1324,8 @@ def act_permission(gw, body, rec, pane, choice):
         if not orch.prompt(lead, text):
             raise Reject(f"could not prompt {lead}", 502, "failed")
     else:
+        if choice == "allow" and found["tool"] in FILE_TOOLS:
+            raise Reject(FILE_REFUSED)
         if choice == "allow" and found["command_cut"]:
             raise Reject(f"only part of the command in {pane} can be read: answer it in the pane")
         keys = permission_keys(found, choice)
