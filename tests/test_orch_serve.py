@@ -41,6 +41,48 @@ my-app on  main
    Yes, I trust this folder
 
  Enter to confirm · Esc to cancel"""  # Claude Code 2.x, as seen live on 2026-11-05
+# Claude Code 2.1.318's permission prompts, captured with `herdr agent read --source visible` on
+# 2026-11-05 in an 8-row pane: a short terminal shows only the option under the cursor.
+BASH = """\
+ Remove notes.txt
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ rm notes.txt
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ Do you want to proceed?
+ ❯ 1. Yes
+
+ Esc to cancel · Tab to amend
+"""
+BASH_3 = """\
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ rm notes.txt
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ Do you want to proceed?
+ ❯ 3. Yes, and switch to auto mode · auto mode handles
+      these prompts for you
+
+ Esc to cancel
+"""
+WRITE = """\
+ hello.txt
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+  1 hi
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ Do you want to create hello.txt?
+ ❯ 1. Yes
+
+ Esc to cancel · Tab to amend
+"""
+WRITE_2 = """\
+  1 hi
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ Do you want to create hello.txt?
+ ❯ 2. Yes, and switch to accept edits (auto-approve file
+      edits and common file commands) for this session
+      (shift+tab)
+
+ Esc to cancel
+"""
 T0 = datetime(2026, 11, 5, 10, 0).timestamp()  # noqa: DTZ001 orch works in local time
 TOKEN = "t0ken-for-tests"
 
@@ -646,7 +688,7 @@ def test_actions_are_refused_with_a_reason(world):
     assert busy[0] == 409 and busy[1]["error"] == f"{W1} is working, not idle"
     assert "not logged in" in world.post(gw, id="s2", kind="account", pane=W1, account="3",
                                          when="idle")[1]["error"]
-    assert world.post(gw, id="d1", kind="dialog", pane=W2, change=1, choice="allow")[0] == 400
+    assert world.post(gw, id="d1", kind="dialog", pane=LOOSE, change=1, choice="allow")[0] == 400
     assert world.post(gw, id="r1", kind="run", orchestrator=W2, op="extend")[0] == 409
     assert world.post(gw, id="pk", kind="park", orchestrator=BOSS, pane=LOOSE)[0] == 409
     qid = world.orch.ask(W1, "Deploy?")
@@ -946,6 +988,73 @@ def test_a_starting_orchestrator_takes_no_typed_input_until_claude_runs_and_trus
     assert [status for status, _ in typed(3)] == [202, 202, 202]
     world.orch.save(world.orch.STARTS / "st1" / "new.json", dict(rec, restart=True))  # retry
     assert world.post(gw, id="p4", kind="prompt", pane=NEW, text="y")[0] == 409
+
+
+
+def test_permission_prompts_parse_from_captured_screens(world):
+    serve = world.serve
+    bash = serve.permission(BASH.split("\n"))
+    assert bash == {"question": "Do you want to proceed?", "tool": None,
+                    "command": "rm notes.txt", "options": ["1. Yes"], "cursor": "1. Yes"}
+    assert serve.permission_keys(bash, "allow") == ["enter"]
+    assert serve.permission_keys(bash, "deny") == ["esc"]
+    third = serve.permission(BASH_3.split("\n"))
+    assert third["cursor"] == ("3. Yes, and switch to auto mode · auto mode handles these "
+                               "prompts for you")
+    assert serve.permission_keys(third, "allow") is None  # never Enter on another option
+    write = serve.permission(WRITE.split("\n"))
+    assert (write["tool"], write["command"], write["cursor"]) == ("Write", "hello.txt", "1. Yes")
+    assert serve.permission(WRITE_2.split("\n"))["cursor"].endswith("for this session "
+                                                                     "(shift+tab)")
+    # the same prompt in a tall terminal (the captured options, all on screen at once)
+    tall = ("Bash command\n\n  rm notes.txt\n  Remove notes.txt\n\n Do you want to proceed?\n"
+            " ❯ 1. Yes\n   2. Yes, and always allow access to tmp/ from this project\n"
+            "   3. Yes, and switch to auto mode\n   4. No\n\n Esc to cancel · Tab to amend")
+    found = serve.permission(tall.split("\n"))
+    assert (found["tool"], found["command"]) == ("Bash", "rm notes.txt\nRemove notes.txt")
+    assert len(found["options"]) == 4 and found["cursor"] == "1. Yes"
+    for other in (TRUST, world.screen, "❯ \n────\n  ? for shortcuts", ""):
+        assert serve.permission(other.split("\n")) is None
+
+
+def test_the_app_answers_a_permission_prompt_of_an_agent_in_a_run(world):
+    gw = world.serve.Gateway()
+    start_run(world)
+    world.agent(W1, "blocked", change=7)
+    world.screen = BASH
+    [dialog] = lead_of(world, gw, BOSS)["dialogs"]
+    assert (dialog["kind"], dialog["tool"], dialog["command"]) == ("permission", None,
+                                                                    "rm notes.txt")
+    assert gw.route("GET", "/v1/health", {}, None, "127.0.0.1")[1]["dialogs"] == [
+        "trust", "permission"]
+
+    stale = from_phone(world, gw, kind="dialog", pane=W1, change=6, choice="allow")
+    assert stale[0] == 409 and "the dialog changed" in stale[1]["error"]
+    assert from_phone(world, gw, kind="dialog", pane=W1, change=7, choice="allow")[0] == 202
+    assert world.herdr_calls[-1] == ("agent", "send-keys", W1, "enter")
+    assert from_phone(world, gw, kind="dialog", pane=W1, change=7, choice="deny")[0] == 202
+    assert world.herdr_calls[-1] == ("agent", "send-keys", W1, "esc")
+    assert from_phone(world, gw, kind="dialog", pane=W1, change=7, choice="delegate")[0] == 202
+    lead, text = world.prompts[-1]
+    assert lead == BOSS and "builder (w1:p1)" in text and "rm notes.txt" in text
+    assert f"herdr agent send-keys {W1} enter" in text and f"send-keys {W1} esc" in text
+    answered = [(e["choice"], e["by"]) for e in world.events() if e["kind"] == "permission"]
+    assert answered == [("allow", "nPHONE"), ("deny", "nPHONE"), ("delegate", "nPHONE")]
+
+    keys = len(world.herdr_calls)
+    world.screen = BASH_3  # someone moved the cursor in the pane
+    moved = from_phone(world, gw, kind="dialog", pane=W1, change=7, choice="allow")
+    assert moved[0] == 409 and "not \"1. Yes\"" in moved[1]["error"]
+    world.screen = "Bash command\n  rm x\nWhat should Claude do?\n❯ 1. Retry\n"
+    assert from_phone(world, gw, kind="dialog", pane=W1, change=7, choice="allow")[0] == 400
+    world.screen = BASH
+    world.agent(BOSS, "blocked", change=3)  # the orchestrator itself: nobody to delegate to
+    assert from_phone(world, gw, kind="dialog", pane=BOSS, change=3, choice="delegate")[0] == 409
+    assert from_phone(world, gw, kind="dialog", pane=W1, choice="allow")[0] == 400  # no change
+    world.agent(W1, "working", change=8)
+    assert from_phone(world, gw, kind="dialog", pane=W1, change=8, choice="allow")[0] == 409
+    assert world.herdr_calls[keys:] == [c for c in world.herdr_calls[keys:]
+                                        if c[:2] != ("agent", "send-keys")]  # no keys sent
 
 
 def from_phone(w, gw, **action):

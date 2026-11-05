@@ -179,6 +179,7 @@ plus the fields of its kind:
 | `start` | a step of `orch new` or the gateway's `start` action is doing, ok or failed | the new orchestrator, once its tab exists | `action` (the start's id), `step`, `status`, `error`; the `pane` step also `folder`, `goal`, `by` (`cli`, `phone`) | when it fails |
 | `start-cancel` | a start was cancelled (the app's `start_cancel`, or "No" at its trust question) | the new orchestrator, or null | `action`, `by` | |
 | `trust` | the app answered a new orchestrator's folder-trust question | the new orchestrator | `action`, `choice` (`allow`, `deny`), `by` (the phone), `source` | |
+| `permission` | the app answered a tool permission prompt, or left it to the orchestrator | the agent at the prompt | `choice` (`allow`, `deny`, `delegate`), `by`, `tool`, `command`, `source` | |
 | `test` | `orch notify` | null | | yes |
 | `pair` | a phone pairs or unpairs with the gateway | null | | |
 | `action` | the gateway handles an app action | its agent or orchestrator, else null | `action` (its kind), `id`, `status` (`delivered`, `rejected`, `failed`), `error`, `source` (`app`, `relay`), `fields` (the action's other fields) | |
@@ -409,14 +410,22 @@ question), the diff view, the activity lanes and the per-agent model.
 - `dialog {pane, change, choice}` answers Claude Code's folder-trust question, and only for the pane a start opened
   while that start is at its `trust` step: `allow` picks "Yes", `deny` picks "No" (Claude exits) and cancels the
   start. The gateway checks that the agent is still blocked at the same `change` and that the screen shows a trust
-  question with Yes and No, and it logs who answered (a `trust` event). Any other dialog is answered in the pane.
+  question with Yes and No, and it logs who answered (a `trust` event).
+- `dialog` also answers a tool permission prompt ("Do you want to proceed?", "Do you want to create FILE?", ...) of
+  an agent in an active run: `allow` presses Enter, and only while the cursor is on "1. Yes", where Claude Code
+  puts it; `deny` presses Esc, which Claude Code takes as "No" (the turn stops and the agent waits for a message);
+  `delegate` sends the screen to the run's orchestrator and asks it to answer in the pane (refused for the
+  orchestrator's own prompt). `change` is required; the agent must still be blocked at it, with the prompt on
+  screen. A `permission` event logs who answered. Any other dialog is answered in the pane. A short terminal shows
+  only the option under the cursor, which is enough for these answers.
 - `prompt`, `nudge`, `interrupt` and `answer` are refused (409) for a start's pane until Claude runs there and its
   folder-trust question is answered. Before that, a shell would read the text, or its keys could answer the dialog.
 - `/v1/health` has `can_start` and, when false, `cannot_start`: ORCH_START_ROOTS not set, herdr not running, or
-  claude-acc missing.
+  claude-acc missing; and `dialogs: ["trust", "permission"]`, the dialog kinds the `dialog` action answers.
 - `/v1/fleet` shows an unfinished start (the last day's, until `brief` or `plan` is ok) as an orchestrator with
   activity `starting` and `start: {action, goal, plan_first, until, steps: [{step, status, time, error?}]}`; its
-  agent's dialog during the `trust` step has `kind: "trust"` and the folder as `cwd`. Questions carry `kind`
+  agent's dialog during the `trust` step has `kind: "trust"` and the folder as `cwd`. A tool permission prompt
+  has `kind: "permission"` with `tool` and `command` when the screen shows them. Questions carry `kind`
   (`"plan"`), runs started this way `run.settings`, and a `start` action's status its `pane`.
 - `/v1/folders` lists the git checkouts that are a root or directly under one, plus the herdr agents' checkouts
   deeper under a root, never an excluded one, newest work first: `path` (`~` form), `branch` (a short sha when
