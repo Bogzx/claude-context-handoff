@@ -1505,6 +1505,97 @@ def test_pairing_stores_the_token_and_sends_a_test_push(world, cloud):
     assert cloud.pushes[-1]["token"] == "fcm-2"
 
 
+def from_the_phone(world, gw, **action):
+    return gw.route("POST", "/v1/actions", {}, dict(action, kind="test_push"), "127.0.0.1")
+
+
+def test_a_test_push_goes_once_to_the_phone_that_asks_at_normal_priority(world, cloud):
+    gw = world.serve.Gateway()
+    pair(world, gw)
+    phones = world.serve.orch_push.load_phones()
+    phones["nOTHER"] = {"fcm_token": "fcm-other", "token_error": None, "relay_uid": "uid2"}
+    world.serve.orch_push.save_phones(phones)
+    cloud.pushes.clear()
+    action = {"id": "t1", "time": world.t}
+
+    first = from_the_phone(world, gw, **action)
+
+    assert first == (202, {"id": "t1", "status": "delivered", "delivered_at": world.t,
+                           "picked_at": None, "error": None})
+    [push] = cloud.pushes
+    assert push["token"] == "fcm-1" and push["android"] == {"priority": "NORMAL", "ttl": "300s"}
+    assert push["message"] == {"seq": 2, "sent": world.t, "kind": "test", "orchestrator": None,
+                               "body": None}
+
+    assert from_the_phone(world, gw, **action) == first  # a retry: same answer, no second push
+    assert len(cloud.pushes) == 1
+    assert from_the_phone(world, gw, id="t2", time=world.t)[0] == 202  # a new tap, a new action
+    assert [p["message"]["seq"] for p in cloud.pushes] == [2, 3]
+
+
+def test_a_test_push_from_a_phone_that_never_paired_is_refused(world, cloud):
+    gw = world.serve.Gateway()
+
+    status, out = from_the_phone(world, gw, id="t1", time=world.t)
+
+    assert status == 409 and out["status"] == "rejected" and "pair it again" in out["error"]
+    assert cloud.sends == 0
+
+
+def test_a_test_push_without_a_service_account_says_why(world, cloud):
+    world.serve.orch_push.SA_FILE.unlink()
+    gw = world.serve.Gateway()
+    pair(world, gw)
+
+    status, out = from_the_phone(world, gw, id="t1", time=world.t)
+
+    assert status == 502 and out["status"] == "failed" and out["delivered_at"] is None
+    assert "no service account key" in out["error"] and cloud.sends == 0
+
+
+def test_a_test_push_that_fcm_refuses_says_why_and_a_retry_changes_nothing(world, cloud):
+    gw = world.serve.Gateway()
+    pair(world, gw)
+    cloud.pushes.clear()
+    cloud.fcm = [(404, {"error": {"status": "NOT_FOUND", "message": "token gone",
+                                  "details": [{"errorCode": "UNREGISTERED"}]}})]
+    sends = cloud.sends
+
+    first = from_the_phone(world, gw, id="t1", time=world.t)
+
+    assert first[0] == 502 and first[1]["status"] == "failed" and "FCM" in first[1]["error"]
+    assert cloud.pushes == []
+    assert from_the_phone(world, gw, id="t1", time=world.t) == first
+    assert cloud.sends == sends + 1
+
+
+def test_a_test_push_is_sent_outside_the_action_lock(world, cloud, monkeypatch):
+    gw = world.serve.Gateway()
+    pair(world, gw)
+    held = []
+
+    def test(pid):
+        held.append(gw.lock.locked())
+        return {"seq": 9, "sent": world.t}
+
+    monkeypatch.setattr(gw.pusher, "test", test)
+
+    assert from_the_phone(world, gw, id="t1", time=world.t)[0] == 202
+    assert held == [False]  # reads go on, and the push loop can't deadlock with it
+
+
+def test_a_test_push_by_relay_reaches_the_phone_that_wrote_it(world, cloud):
+    gw = world.serve.Gateway()
+    pair(world, gw)
+    cloud.pushes.clear()
+    cloud.write("uid1", {"id": "t1", "time": world.t - 20, "kind": "test_push"})
+
+    assert gw.pusher.poll() is True
+
+    [push] = cloud.pushes
+    assert push["token"] == "fcm-1" and push["message"]["kind"] == "test"
+
+
 def test_pairing_admits_a_node_of_the_machines_own_user_only(world, cloud, http):
     world.whois["100.64.0.1"]["UserProfile"] = {"LoginName": "owner@example.com"}
     world.whois["127.0.0.1"] = {"Node": {"StableID": "nTAB", "ComputedName": "tablet",
