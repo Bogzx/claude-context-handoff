@@ -259,7 +259,7 @@ ORCHESTRATOR = {"pane": str, "name": str, "machine": str, "cwd?": str,
                 "activity": {"working", "waiting", "stalled", "done", "offline", "starting"},
                 "activity_since?": NUM, "agent": AGENT,
                 "run?": {"goal": str, "created": NUM, "until": NUM, "ended?": NUM,
-                         "settings?": dict},
+                         "settings?": dict, "cost_usd?": NUM, "week_points?": NUM},
                 "report?": ORCH_REPORT, "questions": [QUESTION], "dialogs": [DIALOG],
                 "stall?": STALL, "workers": [AGENT], "lanes?": dict,
                 "start?": {"action": str, "goal": str, "plan_first": bool, "until": NUM,
@@ -598,8 +598,26 @@ def test_screen(world):
 def test_the_background_loop_keeps_the_usage_scan_warm(world):
     assert (300, world.serve.warm_usage) in world.serve.BACKGROUND
     assert (5, world.serve.push_and_relay) in world.serve.BACKGROUND
-    world.serve.warm_usage(None)
+    world.serve.warm_usage(world.serve.Gateway())
     assert (world.root / "usage-cache.json").exists()
+
+
+def assistant(at, mid, out_tokens):  # opus 5.5: $4 / $20 per million in / out
+    stamp = datetime.fromtimestamp(at, timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    return json.dumps({"type": "assistant", "timestamp": stamp, "message": {
+        "id": mid, "model": "claude-opus-5-5",
+        "usage": {"input_tokens": 1000, "output_tokens": out_tokens}}}) + "\n"
+
+
+def spend(world, session, *lines):
+    project = world.home / ".claude" / "projects" / "-work-proj"
+    project.mkdir(parents=True, exist_ok=True)
+    (project / f"{session}.jsonl").write_text("".join(lines))
+
+
+def change_run(world, **fields):
+    path = world.root / "runs" / "w1-p0.json"
+    path.write_text(json.dumps(dict(json.loads(path.read_text()), **fields)))
 
 
 def test_usage_has_the_api_shape_and_points_per_period(world):
@@ -607,20 +625,10 @@ def test_usage_has_the_api_shape_and_points_per_period(world):
     usage = json.loads((world.root / "usage.json").read_text())
     usage["sessions"] = {"s-other": {"account": "1", "time": world.t}}
     (world.root / "usage.json").write_text(json.dumps(usage))
-    project = world.home / ".claude" / "projects" / "-work-proj"
-    project.mkdir(parents=True)
-
-    def assistant(at, mid, out_tokens):  # opus 5.5: $4 / $20 per million in / out
-        stamp = datetime.fromtimestamp(at, timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
-        return json.dumps({"type": "assistant", "timestamp": stamp, "message": {
-            "id": mid, "model": "claude-opus-5-5",
-            "usage": {"input_tokens": 1000, "output_tokens": out_tokens}}}) + "\n"
-    (project / f"s-{W1}.jsonl").write_text(assistant(world.t - 1800, "m1", 1_000_000)
-                                           + assistant(world.t - 3 * 86400, "m2", 3_000_000))
-    (project / "s-other.jsonl").write_text(assistant(world.t - 600, "m3", 500_000))
-    run = json.loads((world.root / "runs" / "w1-p0.json").read_text())
-    run["created"] = world.t - 4 * 86400
-    (world.root / "runs" / "w1-p0.json").write_text(json.dumps(run))
+    spend(world, f"s-{W1}", assistant(world.t - 1800, "m1", 1_000_000),
+          assistant(world.t - 3 * 86400, "m2", 3_000_000))
+    spend(world, "s-other", assistant(world.t - 600, "m3", 500_000))
+    change_run(world, created=world.t - 4 * 86400)
     status, out = world.get(world.serve.Gateway(), "/v1/usage?hours=168")
     assert status == 200
     conforms(out, USAGE)
@@ -639,6 +647,55 @@ def test_usage_has_the_api_shape_and_points_per_period(world):
     [run] = out["runs"].values()
     assert run["week_points"] is None  # the orchestrator itself spent nothing here
     assert out["accounts"]["1"]["windows"]["seven_day"]["machine_cost_usd"] == 90.01
+
+
+def costly_run(world):
+    """The run's orchestrator and builder spent $20.004 each, all of this machine's week so far
+    (80%): the run has cost $40.01 and 80 points."""
+    busy_fleet(world)
+    spend(world, f"s-{BOSS}", assistant(world.t - 1800, "m1", 1_000_000))
+    spend(world, f"s-{W1}", assistant(world.t - 600, "m2", 1_000_000))
+    change_run(world, created=world.t - 4 * 86400)
+
+
+def test_the_fleet_has_the_run_cost_from_the_background_pass_only(world, monkeypatch):
+    costly_run(world)
+    gw = world.serve.Gateway()
+    assert "cost_usd" not in gw.fleet()[1]["orchestrators"][0]["run"]  # no pass yet
+    world.serve.warm_usage(gw)
+
+    def no_scan(*args, **kwargs):
+        raise AssertionError("a fleet read scanned the transcripts")
+    monkeypatch.setattr(world.serve.orch_usage, "report", no_scan)
+    monkeypatch.setattr(world.serve.orch_usage, "scan", no_scan)
+    status, fleet = world.get(gw, "/v1/fleet")
+    assert status == 200
+    conforms(fleet, FLEET)
+    run = fleet["orchestrators"][0]["run"]
+    assert run["cost_usd"] == 40.01 and run["week_points"] == pytest.approx(80, abs=0.01)
+    assert run["goal"] == "ship the fixes"  # next to the run's own fields
+
+
+def test_a_run_whose_lead_spent_long_before_the_default_period_still_has_week_points(world):
+    costly_run(world)
+    spend(world, f"s-{BOSS}", assistant(world.t - 3 * 86400, "m1", 1_000_000))
+    gw = world.serve.Gateway()
+    world.serve.warm_usage(gw)
+    assert gw.fleet()[1]["orchestrators"][0]["run"]["week_points"] == pytest.approx(80, abs=0.01)
+    assert gw.usage(1)["runs"][next(iter(gw.run_costs))]["week_points"] is None  # why: not 1 h
+
+
+def test_a_state_push_carries_the_run_cost(world, cloud):
+    costly_run(world)
+    gw = world.serve.Gateway()
+    pair(world, gw)
+    world.serve.warm_usage(gw)
+    cloud.pushes.clear()
+    gw.pusher.cycle()
+    [state] = [p["message"] for p in cloud.pushes
+               if p["message"]["kind"] == "state" and p["message"]["orchestrator"] == BOSS]
+    assert state["body"]["run"]["cost_usd"] == 40.01
+    assert state["body"]["run"]["week_points"] == pytest.approx(80, abs=0.01)
 
 
 # --- actions ----------------------------------------------------------------------------------------

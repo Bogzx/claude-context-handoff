@@ -412,6 +412,11 @@ def account_at(info, when):
     return current
 
 
+def run_id(run):
+    started = time.strftime("%Y-%m-%d %H:%M", time.localtime(run.get("created") or 0))
+    return f"{run['orchestrator']}@{started}"
+
+
 def runs_of(root):
     out = []
     for path in sorted((root / "runs").glob("*.json")):
@@ -419,8 +424,7 @@ def runs_of(root):
             continue
         run = load(path)
         if run.get("orchestrator"):
-            started = time.strftime("%Y-%m-%d %H:%M", time.localtime(run.get("created") or 0))
-            run["id"] = f"{run['orchestrator']}@{started}"
+            run["id"] = run_id(run)
             out.append(run)
     return out
 

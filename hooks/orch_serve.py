@@ -56,8 +56,12 @@ NOT_PAIRED = 3  # serve's exit status without a token; the unit counts it as a c
 
 
 def warm_usage(gateway):
-    """Keep the transcript scan current, so /v1/usage doesn't pay for a long first scan."""
-    orch_usage.scan(orch.ROOT, Path.home() / ".claude" / "projects", orch.now(), orch.agents())
+    """Keep the transcript scan current, so /v1/usage doesn't pay for a long first scan, and the
+    runs' cost for the fleet, whose every read and push can't wait for a scan. The whole
+    retention: a run's account is found from its orchestrator's use in the period."""
+    runs = gateway.usage(orch_usage.RETENTION / 3600)["runs"]
+    gateway.run_costs = {rid: {"cost_usd": r["cost"], "week_points": r["week_points"]}
+                         for rid, r in runs.items()}
 
 
 def push_and_relay(gateway):
@@ -407,6 +411,7 @@ class Gateway:
         me = whois(tailscale_ip() or "") if allow_self else None
         self.self_names = (me or {}).get("names", set())
         self.pusher = orch_push.Pusher(self)
+        self.run_costs = {}  # run id -> {cost_usd, week_points}, from warm_usage
 
     # auth
 
@@ -643,7 +648,8 @@ class Gateway:
             "cwd": (agent or {}).get("cwd") or (run or {}).get("cwd") or (start or {}).get("cwd"),
             "activity": activity, "activity_since": since, "agent": lead,
             "run": dict({k: run.get(k) for k in ("goal", "created", "until", "ended")},
-                        **({"settings": run["settings"]} if run.get("settings") else {}))
+                        **({"settings": run["settings"]} if run.get("settings") else {}),
+                        **self.run_costs.get(orch_usage.run_id(run), {}))
                    if run else None,
             "report": lead["report"],
             "questions": [question_json(q) for q in orch.shown_questions(run, at)],
