@@ -282,6 +282,16 @@ printf '%s' "$input" | python3 ~/.claude/hooks/orch.py usage capture >/dev/null 
 `orch usage capture` keeps the latest limits per account in `usage.json` and adds a line to `usage-history.jsonl`
 at most every 5 minutes per account. It prints nothing and ignores input it can't read.
 
+A statusline repeats its session's last limits on every refresh for as long as the session stays open, so an idle
+session can report a value that is days old. A reading is therefore dated by the session's last API response in its
+transcript, never by the capture, and only a newer reading replaces the stored one. A reading whose response can't be
+found is dropped. An account counts as stale once its reading is 10 minutes old: no session on it has had an API
+response since, on this machine.
+
+Account numbers are local to a machine. `login` in `orch account --json`, `orch usage --json` and the gateway's
+accounts is a hash of the account's login and organization (null without a login), and it is what says that two
+machines share an account.
+
 `orch usage --json` reports, per account and window, the percentage used, the reset time, the burn rate over the last
 1-2 hours of history, the projected time to 100% and whether that comes before the reset. It also counts tokens
 (input, output, cache read, cache write) and an API-equivalent cost per agent, orchestrator and worker, run, day,

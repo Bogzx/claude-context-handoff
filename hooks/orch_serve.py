@@ -287,9 +287,7 @@ def last_work(path, gitdir):
 
 def trusted(account):
     """Folders Claude Code was told to trust on the account (its .claude.json project list)."""
-    path = (Path.home() / ".claude.json" if str(account) == "1"
-            else orch.account_dir(account) / ".claude.json")
-    projects = orch.load(path).get("projects") or {}
+    projects = orch.load(orch.account_config(account)).get("projects") or {}
     return {Path(p) for p, v in projects.items()
             if isinstance(v, dict) and v.get("hasTrustDialogAccepted")}
 
@@ -624,6 +622,7 @@ class Gateway:
                     and abs((h["windows"][name].get("resets_at") or 0)
                             - (win.get("resets_at") or 0)) < 120]
             out[acc] = {"id": acc, "name": orch.account_name(acc, names),
+                        "login": (known.get(acc) or {}).get("login"),
                         "config_dir": "~/.claude" if acc == "1" else f"~/.claude-{acc}",
                         "logged_in": (known.get(acc) or {}).get("logged_in", False),
                         "updated": w["updated"], "stale": w["stale"], "windows": w["windows"]}

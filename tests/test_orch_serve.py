@@ -207,7 +207,8 @@ STALL = {"nudged_at?": NUM, "reasons": [{"key": str, "kind": str, "pane?": str, 
                                          "fix?": str, "message?": str, "picked": bool}]}
 WINDOW = {"used_percentage": NUM, "resets_at": NUM, "burn_per_hour?": NUM, "basis_minutes?": NUM,
           "projected_full_at?": NUM, "full_before_reset?": bool, "samples": [[NUM]]}
-ACCOUNT = {"id": str, "name": str, "config_dir": str, "logged_in": bool, "updated?": NUM,
+ACCOUNT = {"id": str, "name": str, "login?": str, "config_dir": str, "logged_in": bool,
+           "updated?": NUM,
            "stale": bool, "pct_per_100k_uncached?": NUM, "windows": {"seven_day?": WINDOW,
                                                                       "five_hour?": WINDOW}}
 ACTION_STATUS = {"id": str, "status": {"delivered", "picked", "rejected", "failed"},
@@ -403,7 +404,7 @@ def busy_fleet(w):
     (w.root / "watchdog.json").write_text(json.dumps(
         {BOSS: {"first_seen": {f"{W2}:blocked:s-{W2}:1": w.t - 11 * 60}}}))
     (w.root / "usage.json").write_text(json.dumps({"accounts": {"1": {
-        "time": w.t - 30, "windows": {"seven_day": {"used_percentage": 80,
+        "read_at": w.t - 30, "windows": {"seven_day": {"used_percentage": 80,
                                                     "resets_at": w.t + 86400}}}}}))
     with open(w.root / "usage-history.jsonl", "w") as f:
         f.writelines(json.dumps({"time": w.t - 3600 + i * 900, "account": "1", "windows": {
@@ -719,6 +720,21 @@ def test_each_action_kind_does_its_job(world):
     assert kinds == ["answer", "park", "unpark", "run", "run", "run", "run", "nudge",
                      "interrupt", "account", "account", "spill", "spill", "spill",
                      "default_account"]
+
+
+def test_accounts_carry_the_hash_of_their_login_for_the_app_to_merge_machines_by(world):
+    (world.home / ".claude.json").write_text(json.dumps({"oauthAccount": {
+        "accountUuid": "u1", "organizationUuid": "o1", "emailAddress": "me@example.com"}}))
+    gw = world.serve.Gateway()
+
+    fleet = world.get(gw, "/v1/fleet")[1]
+
+    assert fleet["accounts"]["1"]["login"] == world.orch.account_login(1)
+    assert len(fleet["accounts"]["1"]["login"]) == 16
+    assert fleet["accounts"]["2"]["login"] is None  # no login known: the app merges nothing
+    assert "example" not in json.dumps(fleet["accounts"])
+    assert world.get(gw, "/v1/usage?hours=24")[1]["accounts"]["1"]["login"] == (
+        fleet["accounts"]["1"]["login"])
 
 
 def test_an_account_switch_now_runs_in_the_background(world, monkeypatch):
@@ -1551,7 +1567,7 @@ def test_a_usage_alert_is_sent_once_per_window_even_days_later(world, cloud):
 
     def burning():  # account 1 at 4 %/h: full long before its reset in days
         (world.root / "usage.json").write_text(json.dumps({"accounts": {"1": {
-            "time": world.t - 30, "windows": {"seven_day": {"used_percentage": 80,
+            "read_at": world.t - 30, "windows": {"seven_day": {"used_percentage": 80,
                                                         "resets_at": resets}}}}}))
         with open(world.root / "usage-history.jsonl", "a") as f:
             f.writelines(json.dumps({"time": world.t - 3600 + i * 900, "account": "1", "windows": {

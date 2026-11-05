@@ -3,7 +3,9 @@
 `orch usage capture` runs from the statusline command on every refresh, with the statusline
 JSON on stdin. It keeps the account's latest rate-limit windows in ~/.claude/handoffs/usage.json
 (per account: claude-acc N runs with CLAUDE_CONFIG_DIR=~/.claude-N, unset is account 1) and
-appends ~/.claude/handoffs/usage-history.jsonl at most every 5 minutes per account.
+appends ~/.claude/handoffs/usage-history.jsonl at most every 5 minutes per account. A statusline
+repeats its session's last limits on every refresh for as long as the session stays open, so a
+reading is dated by the session's last API response, and only a newer reading replaces it.
 
 `orch usage [--json]` reports per account and window: used %, reset time, burn rate over the
 last 1-2 h of history and the projected time to 100%; and tokens per agent from the transcripts
@@ -21,11 +23,11 @@ import time
 from pathlib import Path
 
 HISTORY_EVERY = 5 * 60  # usage-history.jsonl: at most one line per account this often
-REFRESH = 60  # usage.json is rewritten at least this often while a statusline runs
 WINDOWS = {"five_hour": 5 * 3600, "seven_day": 7 * 86400}
 BURN_LOOKBACK = 2 * 3600  # the burn rate uses history this far back
 BURN_MIN_SPAN = 15 * 60  # and needs at least this much of it
-STALE = 10 * 60  # usage.json older than this: no session has refreshed its statusline
+STALE = 10 * 60  # a reading older than this: no session on the account got an API response
+TAIL = 1 << 20  # how much of a transcript's end is searched for its last API response
 BUCKET = 10 * 60  # token buckets in the cache
 RETENTION = 8 * 86400  # buckets kept (covers the 7-day window)
 CHUNK = 8 << 20  # transcripts are read this much at a time
@@ -81,6 +83,35 @@ def account_of(config_dir):
 
 # --- capture (statusline) ----------------------------------------------------------------------
 
+def api_response(line):
+    """The transcript line's entry if it is an API response, else None: Claude Code's own
+    notices are assistant entries too, with no real model or usage."""
+    try:
+        e = json.loads(line)
+    except ValueError:
+        return None
+    if not isinstance(e, dict) or e.get("type") != "assistant":
+        return None
+    m = e.get("message") or {}
+    return e if (m.get("model") or "").startswith("claude") and m.get("usage") else None
+
+
+def last_response(path):
+    """When the transcript's session last got an API response, or None when the end of the file
+    shows none. Not the file's time: an idle session goes on writing its own entries."""
+    try:
+        with open(path, "rb") as f:
+            f.seek(max(0, f.seek(0, os.SEEK_END) - TAIL))
+            lines = f.read().splitlines()
+    except (OSError, TypeError, ValueError):
+        return None
+    for line in reversed(lines):
+        e = api_response(line) if b'"assistant"' in line else None
+        if e:
+            return stamp(e.get("timestamp") or "")
+    return None
+
+
 def capture(text, env, root, at):
     """Record the rate-limit windows of the statusline JSON `text` for the session's account."""
     try:
@@ -102,23 +133,24 @@ def capture(text, env, root, at):
         changed = True
     limits = data.get("rate_limits") or {}
     windows = {k: v for k, v in limits.items() if isinstance(v, dict)}
-    if windows:
-        entry = cur.setdefault("accounts", {}).setdefault(account, {})
-        due = at - entry.get("history_time", 0) >= HISTORY_EVERY
-        if due or entry.get("windows") != windows or at - entry.get("time", 0) >= REFRESH:
-            entry.update(time=at, windows=windows,
-                         config_dir=env.get("CLAUDE_CONFIG_DIR") or "")
-            if due:
-                entry["history_time"] = at
-                root.mkdir(parents=True, exist_ok=True)
-                line = json.dumps({"time": at, "account": account, "windows": windows}) + "\n"
-                with open(root / "usage-history.jsonl", "a+b") as f:
-                    if f.seek(0, os.SEEK_END):  # a record cut short by a killed capture
-                        f.seek(-1, os.SEEK_END)  # stays alone on its line
-                        if f.read(1) != b"\n":
-                            line = "\n" + line
-                    f.write(line.encode())
-            changed = True
+    read = last_response(data.get("transcript_path")) if windows else None
+    entry = (cur.get("accounts") or {}).get(account) or {}
+    newest = entry.get("read_at", 0)
+    if read and (read > newest or (read == newest and windows != entry.get("windows"))):
+        due = read - entry.get("history_time", 0) >= HISTORY_EVERY
+        cur.setdefault("accounts", {})[account] = {
+            "read_at": read, "windows": windows, "config_dir": env.get("CLAUDE_CONFIG_DIR") or "",
+            "history_time": read if due else entry.get("history_time", 0)}
+        if due:
+            root.mkdir(parents=True, exist_ok=True)
+            line = json.dumps({"time": read, "account": account, "windows": windows}) + "\n"
+            with open(root / "usage-history.jsonl", "a+b") as f:
+                if f.seek(0, os.SEEK_END):  # a record cut short by a killed capture
+                    f.seek(-1, os.SEEK_END)  # stays alone on its line
+                    if f.read(1) != b"\n":
+                        line = "\n" + line
+                f.write(line.encode())
+        changed = True
     if changed:
         save(path, cur)
 
@@ -176,11 +208,14 @@ def windows_report(root, at):
     points = history(root, at - BURN_LOOKBACK)
     out = {}
     for account, entry in sorted((cur.get("accounts") or {}).items()):
+        read = entry.get("read_at")
+        if not read:  # from before readings were dated: its age is unknown
+            continue
         mine = [p for p in points if p.get("account") == account]
-        latest = {"time": entry.get("time"), "windows": entry.get("windows") or {}}
+        latest = {"time": read, "windows": entry.get("windows") or {}}
         out[account] = {
-            "updated": entry.get("time"),
-            "stale": at - (entry.get("time") or 0) > STALE,
+            "updated": read,
+            "stale": at - read > STALE,
             "windows": {name: window_report(name, w, mine + [latest], at)
                         for name, w in (entry.get("windows") or {}).items()
                         if isinstance(w, dict)},
@@ -264,17 +299,11 @@ def scan_file(path, session, state, buckets, at):
 
 
 def take_line(line, state, mine, at):
-    try:
-        e = json.loads(line)
-    except ValueError:
+    e = api_response(line)
+    if not e:
         return
-    if not isinstance(e, dict) or e.get("type") != "assistant":
-        return
-    m = e.get("message") or {}
-    model = m.get("model") or ""
-    usage = m.get("usage") or {}
-    if not model.startswith("claude") or not usage:
-        return
+    m = e["message"]
+    model, usage = m["model"], m["usage"]
     counts = counts_of(usage)
     mid = m.get("id") or e.get("requestId")
     if mid and mid == state.get("last_id"):
@@ -419,6 +448,7 @@ def report(root, projects, agents, at, hours, known=None):
     runs = runs_of(root)
     readings, known = windows_report(root, at), known or {}
     accounts = {acc: {"id": acc, "name": (known.get(acc) or {}).get("name") or f"Acct {acc}",
+                      "login": (known.get(acc) or {}).get("login"),
                       **(readings.get(acc) or {"updated": None, "stale": True, "windows": {}})}
                 for acc in sorted({*readings, *known}, key=lambda a: (len(a), a))}
     since = at - hours * 3600

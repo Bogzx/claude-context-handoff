@@ -739,7 +739,8 @@ def test_accounts_are_named_in_account_status_and_usage(world, accounts, capsys,
     monkeypatch.setenv("HOME", str(tmp_path))  # no transcripts
     world.run("usage", "--json")  # no reading for any account yet: each one is still listed
     assert json.loads(capsys.readouterr().out)["accounts"]["2"] == {
-        "id": "2", "name": "spare", "updated": None, "stale": True, "windows": {}}
+        "id": "2", "name": "spare", "login": None, "updated": None, "stale": True,
+        "windows": {}}
 
 
 def test_account_switch_when_idle_resumes_a_small_context(world, accounts, capsys):
@@ -863,8 +864,34 @@ def test_a_switch_now_clears_a_pending_one(world, accounts):
 
 def usage_at(world, pct, window="seven_day", age=30, resets_in=86400):
     (world.root / "usage.json").write_text(json.dumps({"accounts": {"1": {
-        "time": world.t - age, "windows": {window: {"used_percentage": pct,
+        "read_at": world.t - age, "windows": {window: {"used_percentage": pct,
                                                     "resets_at": world.t + resets_in}}}}}))
+
+
+def test_a_login_hash_is_the_same_for_one_login_whatever_its_local_number(world, accounts,
+                                                                           tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    first, second = tmp_path / ".claude.json", tmp_path / "claude-2" / ".claude.json"
+
+    def login(path, **who):
+        path.write_text(json.dumps({"oauthAccount": who}))
+
+    me = {"accountUuid": "u1", "organizationUuid": "o1", "emailAddress": "me@example.com"}
+    login(first, **me)
+    login(second, **me, displayName="the same login, another copy of its profile")
+    listed = world.orch.account_list()
+    assert listed["1"]["login"] == listed["2"]["login"]
+    assert len(listed["1"]["login"]) == 16 and "example" not in json.dumps(listed)
+
+    login(second, **dict(me, accountUuid="u2"))
+    assert world.orch.account_login(2) != listed["1"]["login"]
+    login(second, **dict(me, organizationUuid="o2"))  # its limits are the organization's
+    assert world.orch.account_login(2) != listed["1"]["login"]
+
+    login(second, emailAddress="me@example.com")  # no ids to tell it by: never the same
+    assert world.orch.account_login(2) is None
+    second.unlink()
+    assert world.orch.account_login(2) is None
 
 
 def test_spill_moves_account_one_agents_once_it_reaches_the_threshold(world, accounts, capsys):

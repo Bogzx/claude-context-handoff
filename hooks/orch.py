@@ -32,6 +32,7 @@ $ORCH_NOTIFY_CMD, else an executable ~/.claude/handoffs/notify, called as
 ORCH_EVENT. Python 3.8 compatible (Ubuntu 20.04).
 """
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -979,15 +980,32 @@ def cmd_decisions(args):
 
 # --- account switching -----------------------------------------------------------------------
 
+def account_config(account):
+    """Claude Code's own settings of the account, with its login and trusted folders."""
+    return (Path.home() / ".claude.json" if str(account) == "1"
+            else account_dir(account) / ".claude.json")
+
+
+def account_login(account):
+    """A hash of the login behind the account, or None without one. Account numbers are local:
+    this is what says that two machines share an account. It covers the organization too,
+    because the limits are its subscription's."""
+    who = load(account_config(account)).get("oauthAccount") or {}
+    user, organization = who.get("accountUuid"), who.get("organizationUuid")
+    if not user or not organization:
+        return None
+    return hashlib.sha256(f"{user}:{organization}".encode()).hexdigest()[:16]
+
+
 def account_list():
-    """Account number -> {dir, logged_in, name}: ~/.claude, then ~/.claude-2, ... while they
-    exist."""
+    """Account number -> {dir, logged_in, name, login}: ~/.claude, then ~/.claude-2, ... while
+    they exist."""
     names = load(ROOT / "accounts.json").get("names") or {}
     n, accounts = 1, {}
     while account_dir(n).exists():
         accounts[str(n)] = {"dir": str(account_dir(n)),
                             "logged_in": (account_dir(n) / ".credentials.json").exists(),
-                            "name": account_name(str(n), names)}
+                            "name": account_name(str(n), names), "login": account_login(n)}
         n += 1
     return accounts
 
