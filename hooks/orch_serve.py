@@ -218,6 +218,8 @@ ASKED = re.compile(r"^\s*(Do you want to .+\?)\s*$")
 NUMBERED = re.compile(r"^\s*(?P<cursor>[❯›>])?\s*(?P<n>\d+)\.\s+(?P<label>\S.*?)\s*$")
 RULE = re.compile(r"^\s*[╌─━-]{8,}\s*$")
 HEADER = re.compile(r"[A-Z]\w* command")
+GUTTER = re.compile(r"^\s*│ ?")  # the bar left of a command in a permission prompt
+CALL_TAIL = 1 << 20  # bytes of a transcript read for a dialog's tool call
 
 
 def permission(lines):
@@ -262,13 +264,53 @@ def permission(lines):
                 continue
             if HEADER.fullmatch(lines[i].strip()):
                 break
-            block.insert(0, lines[i].strip())
+            block.insert(0, GUTTER.sub("", lines[i]).strip())
             top = i
         header = next((x.strip() for x in reversed(lines[:top]) if HEADER.fullmatch(x.strip())),
                       None)  # "Bash command", above the block in a tall terminal
-        tool, command = header and header.split()[0], "\n".join(block)[:500] or None
+        tool, command = header and header.split()[0], "\n".join(block).strip() or None
     return {"question": question, "tool": tool, "command": command, "options": options,
             "cursor": options[cursor]}
+
+
+def pending_calls(session):
+    """The tool calls in the session's transcript that have no result yet."""
+    path = orch.transcript_path(session)
+    calls, done = [], set()
+    for record in orch.tail_records(path, CALL_TAIL) if path else ():
+        content = (record.get("message") or {}).get("content")
+        for block in content if isinstance(content, list) else ():
+            if block.get("type") == "tool_use":
+                calls.append(block)
+            elif block.get("type") == "tool_result":
+                done.add(block.get("tool_use_id"))
+    return [c for c in calls if c.get("id") not in done]
+
+
+def whole_command(found, session):
+    """`found` (a permission prompt) with the whole command and `command_cut`. The screen can't
+    say what Allow would run: a command taller than the terminal shows only its end. Claude
+    Code writes the tool call to the transcript before it asks, so the command comes from
+    there, when exactly one unfinished call holds every line on screen. Otherwise the text is
+    only what the screen shows, and command_cut stops Allow, in the app and in act_permission.
+    A file prompt names its file in the question, whole."""
+    if not found or found["tool"] in ("Write", "Edit"):
+        return found and dict(found, command_cut=False)
+    shown = ["".join(x.split()) for x in (found["command"] or "").split("\n")]
+    shown = [x for x in shown if x]  # without spaces: the terminal wraps a line anywhere
+    calls = []
+    for call in pending_calls(session) if shown else ():
+        given = call.get("input") or {}
+        held = "".join("".join(v for v in given.values() if isinstance(v, str)).split())
+        if all(x in held for x in shown):
+            calls.append((call, given))
+    if len(calls) != 1:
+        return dict(found, command_cut=True)
+    call, given = calls[0]
+    command = given.get("command")
+    return dict(found, tool=call.get("name"), command_cut=False,
+                command=command if isinstance(command, str)
+                else json.dumps(given, ensure_ascii=False, indent=1))
 
 
 def permission_keys(found, choice):
@@ -282,13 +324,13 @@ def permission_keys(found, choice):
 def dialog_json(a, agent):
     report = a["report"] or {}
     lines = orch.screen_lines(a["pane"], 40, "visible") or []
-    found = permission(lines)
+    found = whole_command(permission(lines), a["session"])
     return dict({"pane": a["pane"], "label": a["label"], "since": a["since"],
                  "change": (agent or {}).get("state_change_seq"), "text": "\n".join(lines),
                  "doing": report.get("summary") or orch.first_line(a["last"], 160),
                  "danger": True},  # no rule yet: every dialog answer is treated as dangerous
-                **({"kind": "permission", "tool": found["tool"], "command": found["command"]}
-                   if found else {}))
+                **({"kind": "permission", "tool": found["tool"], "command": found["command"],
+                    "command_cut": found["command_cut"]} if found else {}))
 
 
 def stall_json(reasons, workers, report, nudged_at):
@@ -1220,7 +1262,7 @@ def act_permission(gw, body, rec, pane, choice):
     if change != agent.get("state_change_seq"):
         raise Reject("the dialog changed since the app showed it: refresh")
     lines = orch.screen_lines(pane, 40, "visible")
-    found = permission(lines)
+    found = whole_command(permission(lines), (agent.get("agent_session") or {}).get("value"))
     if not found:
         raise Reject(f"{pane} doesn't show a tool permission prompt: answer this dialog in "
                      "the pane", 400)
@@ -1234,14 +1276,17 @@ def act_permission(gw, body, rec, pane, choice):
         lead = run["orchestrator"]
         typable(lead)
         out = target(lead)
+        cut = " (only the end of it is on screen)" if found["command_cut"] else ""
         text = (f"The owner leaves this permission prompt to you: {label} ({pane}) asks "
-                f"\"{found['question']}\" for {what}. The screen:\n" + "\n".join(lines)
+                f"\"{found['question']}\" for {what}{cut}. The screen:\n" + "\n".join(lines)
                 + f"\nDecide and answer it in that pane: `herdr agent send-keys {pane} enter` "
                 f"allows (the cursor is on {found['cursor']!r}), `herdr agent send-keys {pane} "
                 "esc` denies.")
         if not orch.prompt(lead, text):
             raise Reject(f"could not prompt {lead}", 502, "failed")
     else:
+        if choice == "allow" and found["command_cut"]:
+            raise Reject(f"only part of the command in {pane} can be read: answer it in the pane")
         keys = permission_keys(found, choice)
         if keys is None:
             raise Reject(f"the cursor in {pane} is on {found['cursor']!r}, not \"1. Yes\": "
@@ -1252,8 +1297,9 @@ def act_permission(gw, body, rec, pane, choice):
             raise Reject(f"could not answer the dialog in {pane}", 502, "failed")
     done = {"allow": "allowed", "deny": "denied", "delegate": "left to the orchestrator"}
     orch.emit("permission", f"Permission {done[choice]} from the app",
-              f"{label} ({pane}): {what}, by {by}", pane, choice=choice, by=by,
-              tool=found["tool"], command=found["command"], source=rec["source"])
+              f"{label} ({pane}): {what[:500]}, by {by}", pane, choice=choice, by=by,
+              tool=found["tool"], command=(found["command"] or "")[:500] or None,
+              source=rec["source"])
     return out
 
 

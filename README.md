@@ -434,6 +434,11 @@ Not in the gateway yet: the diff view, the activity lanes and the per-agent mode
   orchestrator's own prompt). `change` is required; the agent must still be blocked at it, with the prompt on
   screen. A `permission` event logs who answered. Any other dialog is answered in the pane. A short terminal shows
   only the option under the cursor, which is enough for these answers.
+- A permission prompt's `command` is the whole command. A command taller than the terminal shows only its end, so the
+  gateway takes it from the transcript, where Claude Code writes the tool call before it asks: the one unfinished call
+  that holds every line on screen. If there is no such call, or more than one, `command` is only what the screen shows
+  and `command_cut` is true: `allow` is refused (409) and the prompt is answered in the pane. `deny` and `delegate`
+  still work. A file prompt's `command` is the file's name, which the question gives in full.
 - `prompt`, `nudge`, `interrupt` and `answer` are refused (409) for a start's pane until Claude runs there and its
   folder-trust question is answered. Before that, a shell would read the text, or its keys could answer the dialog.
 - `/v1/health` has `can_start` and, when false, `cannot_start`: ORCH_START_ROOTS not set, herdr not running, or

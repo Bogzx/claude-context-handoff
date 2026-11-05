@@ -155,6 +155,33 @@ def screen_lines(pane, lines, source="recent"):
     return r.stdout.rstrip("\n").split("\n")[-lines:]
 
 
+# --- transcripts -----------------------------------------------------------------------------
+
+def transcript_path(session):
+    """The session's transcript, or None."""
+    return next(PROJECTS.glob(f"*/{session}.jsonl"), None) if session else None
+
+
+def tail_records(path, size):
+    """The JSON records in the last `size` bytes of a transcript, oldest first."""
+    try:
+        with open(path, "rb") as f:
+            start = max(f.seek(0, os.SEEK_END) - size, 0)
+            f.seek(start)
+            lines = f.read().split(b"\n")
+    except OSError:
+        return []
+    out = []
+    for line in lines[1:] if start else lines:  # a tail starts inside a record
+        try:
+            record = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(record, dict):
+            out.append(record)
+    return out
+
+
 # --- this machine ------------------------------------------------------------------------
 
 CONFIG = Path.home() / ".config" / "orch" / ".env"  # the gateway's: token, key, allow-list

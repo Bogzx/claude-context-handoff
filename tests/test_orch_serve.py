@@ -63,6 +63,69 @@ BASH_3 = """\
 
  Esc to cancel
 """
+# The same prompt for a 78-line command, from the real binary in a 155 x 44 terminal against a
+# fake API (2026-11-05): only its end is on screen, and a long command keeps its left bar.
+LONG_BASH = """\
+ │
+ │     line 41 of a long heredoc, indented on purpose
+ │     line 42 of a long heredoc, indented on purpose
+ │     line 43 of a long heredoc, indented on purpose
+ │     line 44 of a long heredoc, indented on purpose
+ │     line 45 of a long heredoc, indented on purpose
+ │     line 46 of a long heredoc, indented on purpose
+ │     line 47 of a long heredoc, indented on purpose
+ │     line 48 of a long heredoc, indented on purpose
+ │     line 49 of a long heredoc, indented on purpose
+ │     line 50 of a long heredoc, indented on purpose
+ │     line 51 of a long heredoc, indented on purpose
+ │     line 52 of a long heredoc, indented on purpose
+ │     line 53 of a long heredoc, indented on purpose
+ │     line 54 of a long heredoc, indented on purpose
+ │     line 55 of a long heredoc, indented on purpose
+ │     line 56 of a long heredoc, indented on purpose
+ │     line 57 of a long heredoc, indented on purpose
+ │     line 58 of a long heredoc, indented on purpose
+ │     line 59 of a long heredoc, indented on purpose
+ │     line 60 of a long heredoc, indented on purpose
+ │
+ │     line 61 of a long heredoc, indented on purpose
+ │     line 62 of a long heredoc, indented on purpose
+ │     line 63 of a long heredoc, indented on purpose
+ │     line 64 of a long heredoc, indented on purpose
+ │     line 65 of a long heredoc, indented on purpose
+ │     line 66 of a long heredoc, indented on purpose
+ │     line 67 of a long heredoc, indented on purpose
+ │     line 68 of a long heredoc, indented on purpose
+ │     line 69 of a long heredoc, indented on purpose
+ │     line 70 of a long heredoc, indented on purpose
+ │ EOF
+ │ echo
+ │ xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+ │ xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ Do you want to proceed?
+ ❯ 1. Yes
+   2. Yes, and always allow access to /tmp from this project
+   3. Yes, and switch to auto mode · auto mode handles these prompts for you
+   4. No
+
+ Esc to cancel · Tab to amend
+"""
+SHORT_BASH = """\
+ Write the lab notes
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ │ rm -rf build
+ │
+ │ ls
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ Do you want to proceed?
+ ❯ 1. Yes
+   2. Yes, and always allow access to tmp/ from this project
+   3. Yes, and switch to auto mode · auto mode handles these prompts for you
+   4. No
+
+ Esc to cancel · Tab to amend
+"""
 WRITE = """\
  hello.txt
 ╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
@@ -206,6 +269,34 @@ def world(tmp_path, monkeypatch):
     orch.set_name("2", "spare")
     w.agent(BOSS, "idle", name="Website")
     return w
+
+
+def long_command():
+    """The command LONG_BASH shows the end of: its first line is off the screen."""
+    body = ["cat > /tmp/lab-notes.txt <<'EOF'"]
+    for i in range(1, 71):
+        body.append(f"    line {i:02d} of a long heredoc, indented on purpose")
+        if i % 20 == 0:
+            body.append("")
+    return "\n".join(body + ["EOF", "echo " + "x" * 300])
+
+
+def transcript(world, session, *records):
+    path = world.orch.PROJECTS / "-work-proj" / f"{session}.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "a") as f:
+        f.writelines(json.dumps(record) + "\n" for record in records)
+
+
+def tool_call(command, tool_id="toolu_1", description="Write the lab notes"):
+    return {"type": "assistant", "message": {"content": [
+        {"type": "tool_use", "id": tool_id, "name": "Bash",
+         "input": {"command": command, "description": description}}]}}
+
+
+def tool_result(tool_id="toolu_1"):
+    return {"type": "user", "message": {"content": [
+        {"type": "tool_result", "tool_use_id": tool_id, "content": "ok"}]}}
 
 
 def start_run(w):
@@ -1436,13 +1527,121 @@ def test_permission_prompts_parse_from_captured_screens(world):
         assert serve.permission(other.split("\n")) is None
 
 
+def test_a_dialog_sends_the_whole_command_from_the_transcript(world):
+    gw = world.serve.Gateway()
+    start_run(world)
+    world.agent(W1, "blocked", change=7)
+    world.screen = LONG_BASH
+    whole = long_command()
+    transcript(world, f"s-{W1}", tool_result("toolu_0"), tool_call(whole))
+
+    [dialog] = lead_of(world, gw, BOSS)["dialogs"]
+
+    assert dialog["command"] == whole  # its top, its indentation and its blank lines
+    assert dialog["command"].startswith("cat > /tmp/lab-notes.txt")
+    assert (dialog["tool"], dialog["command_cut"]) == ("Bash", False)
+    assert "cat > /tmp/lab-notes.txt" not in dialog["text"]  # the screen never showed it
+
+
+def test_a_short_command_loses_its_bar_and_its_description(world):
+    gw = world.serve.Gateway()
+    start_run(world)
+    world.agent(W1, "blocked", change=7)
+    world.screen = SHORT_BASH
+    transcript(world, f"s-{W1}", tool_call("rm -rf build\n\nls"))
+
+    [dialog] = lead_of(world, gw, BOSS)["dialogs"]
+
+    assert (dialog["command"], dialog["command_cut"]) == ("rm -rf build\n\nls", False)
+
+
+@pytest.mark.parametrize("records", [
+    [],  # no transcript to read
+    [tool_call("rm -rf /somewhere/else")],  # another call than the dialog's
+    [tool_call(long_command()), tool_result()],  # finished: the dialog is about another one
+    [tool_call(long_command(), "toolu_1"), tool_call(long_command(), "toolu_2")],  # which one?
+], ids=["none", "other", "finished", "two"])
+def test_a_command_the_transcript_does_not_confirm_is_marked_cut(world, records):
+    gw = world.serve.Gateway()
+    start_run(world)
+    world.agent(W1, "blocked", change=7)
+    world.screen = LONG_BASH
+    transcript(world, f"s-{W1}", *records)
+
+    [dialog] = lead_of(world, gw, BOSS)["dialogs"]
+
+    assert dialog["command_cut"] is True
+    assert "line 60" in dialog["command"] and "│" not in dialog["command"]  # what the screen has
+    assert "line 01" not in dialog["command"]
+
+
+def test_a_file_dialog_names_its_file_whole(world):
+    gw = world.serve.Gateway()
+    start_run(world)
+    world.agent(W1, "blocked", change=7)
+    world.screen = WRITE
+
+    [dialog] = lead_of(world, gw, BOSS)["dialogs"]
+
+    assert (dialog["tool"], dialog["command"], dialog["command_cut"]) == ("Write", "hello.txt",
+                                                                         False)
+
+
+def test_allow_is_refused_on_a_cut_command_and_deny_and_delegate_still_work(world):
+    gw = world.serve.Gateway()
+    start_run(world)
+    world.agent(W1, "blocked", change=7)
+    world.screen = LONG_BASH
+
+    refused = from_phone(world, gw, kind="dialog", pane=W1, change=7, choice="allow")
+
+    assert refused[0] == 409 and "answer it in the pane" in refused[1]["error"]
+    assert not [c for c in world.herdr_calls if c[:2] == ("agent", "send-keys")]
+    assert from_phone(world, gw, kind="dialog", pane=W1, change=7, choice="delegate")[0] == 202
+    assert "only the end of it is on screen" in world.prompts[-1][1]
+    assert from_phone(world, gw, kind="dialog", pane=W1, change=7, choice="deny")[0] == 202
+
+
+def test_allow_on_a_whole_command_logs_it_short_and_tells_the_orchestrator_all_of_it(world):
+    gw = world.serve.Gateway()
+    start_run(world)
+    world.agent(W1, "blocked", change=7)
+    world.screen = LONG_BASH
+    whole = long_command()
+    transcript(world, f"s-{W1}", tool_call(whole))
+
+    assert from_phone(world, gw, kind="dialog", pane=W1, change=7, choice="delegate")[0] == 202
+    assert whole in world.prompts[-1][1]
+    assert from_phone(world, gw, kind="dialog", pane=W1, change=7, choice="allow")[0] == 202
+
+    allowed = [e for e in world.events() if e["kind"] == "permission"][-1]
+    assert len(allowed["command"]) == 500 and len(allowed["body"]) < 600
+
+
+def test_a_long_command_is_never_cut_on_its_way_to_the_phone(world):
+    gw = world.serve.Gateway()
+    start_run(world)
+    world.agent(W1, "blocked", change=7)
+    world.screen = SHORT_BASH
+    noise = "".join(format(i * 2654435761 % 2 ** 32, "08x") for i in range(3000))  # no compressing
+    whole = "rm -rf build\n\nls\n" + noise
+    transcript(world, f"s-{W1}", tool_call(whole))
+    [dialog] = lead_of(world, gw, BOSS)["dialogs"]
+    assert dialog["command"] == whole
+
+    message = world.serve.orch_push.fit("box1", {"kind": "dialog", "seq": 1, "body": dialog})
+
+    assert message["body"] is None and message["trimmed"] == ["all"]  # the app refreshes
+
+
 def test_the_app_answers_a_permission_prompt_of_an_agent_in_a_run(world):
     gw = world.serve.Gateway()
     start_run(world)
     world.agent(W1, "blocked", change=7)
     world.screen = BASH
+    transcript(world, f"s-{W1}", tool_call("rm notes.txt", description="Remove notes.txt"))
     [dialog] = lead_of(world, gw, BOSS)["dialogs"]
-    assert (dialog["kind"], dialog["tool"], dialog["command"]) == ("permission", None,
+    assert (dialog["kind"], dialog["tool"], dialog["command"]) == ("permission", "Bash",
                                                                     "rm notes.txt")
     assert gw.route("GET", "/v1/health", {}, None, "127.0.0.1")[1]["dialogs"] == [
         "trust", "permission"]
