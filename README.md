@@ -128,8 +128,12 @@ the whole fleet overnight (11.8 h), and "today's work is done" with three worker
 | `orch run start --until 09:00 --goal "..." --workers w17:pB7=builder,...` | Registers the run of the orchestrator in this pane (`--until` takes `HH:MM`, `YYYY-MM-DD HH:MM` or `+4h`). `run set`, `run stop` and `run show` change, end or show it. |
 | `orch wait` | The orchestrator's one background watcher. It returns when a worker's turn ended with nothing left running, a worker is blocked at a dialog, a pane lost its agent (3 min), a worker has waited 90 min on its own job, a `--check '<cmd>'` exits 0, or after the 30 min heartbeat. It prints one line per worker. An event is reported once: the next wait doesn't repeat it (`--reset` does). |
 | `orch park <pane> --reason "..." [--until HH:MM]` | Standby with a reason. It ends at the worker's next turn end or at `--until`. `orch unpark` ends it. |
-| `orch ask "<question>"` | Logs a question for the owner in the run and pushes it. |
-| `orch status [--json]`, `orch last <pane>` | The fleet, and a worker's last message and background tasks. |
+| `orch ask "<question>" [--option "Deploy" --danger deploy --option "Not yet"]` | Logs a question for the owner in the run and pushes it, with an id and the options the owner's app shows as buttons. `--danger` (`none`, `deploy`, `prod`, `destructive`) applies to the option before it. |
+| `orch answer <id> "<text>"` | Records the owner's answer and prompts the agent that asked. An answered question can't be answered again. |
+| `orch status [--json]`, `orch last <pane>` | The fleet, and a worker's last message and background tasks. `--json` also has the open questions, each agent's latest report and account, and pending account switches. |
+| `orch decisions [--pane P] [--json]` | The pane's newest decision log, parsed: id, time, who (user or agent), the user's quote, what (first sentence), why, and `superseded_by` when a later entry says "replaces D7", "instead of D7" or "supersedes D7". The user's decisions come first. |
+| `orch account [<pane> <N>] [--now \| --when-idle \| --at-handoff]`, `orch account --default N` | Which Claude account (`claude-acc N`) an agent runs on, and moving it to another one (see Accounts). |
+| `orch usage [--json] [--hours 24]`, `orch usage capture` | Account limits and tokens per agent (see Usage). |
 | `orch watchdog [--dry-run]` | One watchdog pass. A systemd user timer runs it every 5 minutes. |
 
 Inside herdr, the Stop hook writes `~/.claude/handoffs/agents/<pane>.json` at every turn end, with the session, the
@@ -152,10 +156,85 @@ minutes or has been at a dialog for 10. When the run's end time passes, it marks
 ### Alerts
 
 Everything goes to `~/.claude/handoffs/events.jsonl`, one JSON object per line (`time`, `host`, `kind`, `pane`,
-`title`, `body`). Alerts for the owner (a failed takeover, an `orch ask`, an orchestrator gone, blocked or not acting,
-a run that ended) also raise a herdr notification and run the notify command, if there is one: `$ORCH_NOTIFY_CMD`, else
-an executable `~/.claude/handoffs/notify`. It is called as `<command> <title> <body>` with `ORCH_EVENT_KIND` set. That
-is where a phone push plugs in. `orch notify <title> <body>` sends a test.
+`title`, `body`, plus fields of the kind: `id` and `options` for `ask`, `report` for `report`, `account` and `when`
+for `account`). Alerts for the owner (a failed takeover or account switch, an `orch ask`, an orchestrator gone,
+blocked or not acting, a run that ended) also raise a herdr notification and run the notify command, if there is one:
+`$ORCH_NOTIFY_CMD`, else an executable `~/.claude/handoffs/notify`. It is called as `<command> <title> <body>` with
+`ORCH_EVENT_KIND` set and the whole event as JSON in `ORCH_EVENT`. That is where a phone push plugs in.
+`orch notify <title> <body>` sends a test.
+
+### Turn-end reports (MCP)
+
+`hooks/orch_mcp.py` is a small MCP server (stdio, standard library only) that `install.sh` registers at user scope
+as `orch`. It takes the agent's pane from `HERDR_PANE_ID` and offers no tools outside herdr. Its two tools:
+
+- `report`: the agent's state at the end of a working turn. It goes into `report` in
+  `~/.claude/handoffs/agents/<pane>.json` (the Stop hook keeps it there when it rewrites the file) and into
+  events.jsonl as kind `report`. `summary` (one line) is required; everything else is optional:
+
+  | Role | Fields |
+  | --- | --- |
+  | orchestrator | `state` (`working`, `waiting_on_workers`, `waiting_on_owner`, `done`), `progress` {`done`, `total`, `label`}, `waiting_on` [{`who`, `what`, `eta`}], `next` [text], `roadmap` [{`id`, `title`, `status` (`done`, `doing`, `next`, `later`, `blocked`), `owner`, `eta`}], `risks` [text], `milestones` [{`kind` (`pr_merged`, `deploy`, `release`, `other`), `ref`, `url`}] |
+  | worker | `status` (`done`, `partial`, `blocked`), `tests` [{`cmd`, `passed`, `failed`}], `changed_files`, `needs_live_test`, `issues_for_others` [text] |
+
+  `role` is taken from the pane's run (orchestrator or worker) unless the call sets it. A report that doesn't fit the
+  schema is refused with the reason, so the agent can fix it.
+- `ask_owner`: `question` and `options` [{`label`, `danger`}], the same as `orch ask` with options. It returns the
+  question id; the answer comes back as a prompt once `orch answer` runs.
+
+The Stop hook asks for the report. When an agent is the orchestrator or a worker of an active run, its turn used
+tools, and that turn didn't call `mcp__orch__report`, the hook blocks the turn's end once with a one-line reason.
+Turns that only chatted are left alone, and so are turns while a handoff is due or a takeover is starting, and agents
+whose account config doesn't have the `orch` server. A turn is never blocked twice in a row.
+
+For the orchestrator's CLAUDE.md:
+
+> End each working turn with the orch `report` tool: a one-line summary, then your state, progress, who you are
+> waiting on, next steps and roadmap. Ask the owner with `ask_owner` (or `orch ask --option ...`) and keep working.
+
+### Accounts
+
+`claude-acc N` runs Claude Code as account N: account 1 is `~/.claude`, account N is `CLAUDE_CONFIG_DIR=~/.claude-N`,
+which shares everything with `~/.claude` except the login and `.claude.json`. Each account has its own 5-hour and
+7-day limits. The status file records which account each agent runs on.
+
+`orch account <pane> N` moves an agent to account N in one of three ways:
+
+- `--at-handoff` (the default): the next takeover starts under account N. It costs nothing extra but may be hours
+  away.
+- `--when-idle`: the watchdog does a `--now` switch the next time the agent is idle with no background tasks, one
+  switch per pass.
+- `--now`: only for an idle agent with no background tasks. The agent exits, `claude-acc N --resume <session>` starts
+  in the same pane with the same flags, model and effort, and orch checks that it came up. The first turn after it
+  re-reads the whole context uncached on the new account.
+
+Pending switches are kept in `accounts.json` and shown by `orch status --json`. Every switch is logged as kind
+`account`; a failed one is pushed. When the new account hasn't trusted the folder yet, the restarted agent stops at
+Claude Code's trust question; orch reports that at once and the question has to be answered in the pane.
+`orch account --default N` records the account for new agents.
+
+### Usage
+
+The statusline command gets the account's limits on stdin (`rate_limits.five_hour` and `rate_limits.seven_day`, each
+`used_percentage` and `resets_at` in epoch seconds, present while the API reports them). Add this line to
+`~/.claude/statusline.sh`, after it has read its input into `$input`:
+
+```bash
+printf '%s' "$input" | python3 ~/.claude/hooks/orch.py usage capture >/dev/null 2>&1 &
+```
+
+`orch usage capture` keeps the latest limits per account in `usage.json` and adds a line to `usage-history.jsonl`
+at most every 5 minutes per account. It prints nothing and ignores input it can't read.
+
+`orch usage --json` reports, per account and window, the percentage used, the reset time, the burn rate over the last
+1-2 hours of history, the projected time to 100% and whether that comes before the reset. It also counts tokens
+(input, output, cache read, cache write) and an API-equivalent cost per agent, orchestrator and worker, run, day,
+account and machine, plus each agent's share of the window, from the transcripts in `~/.claude/projects`. Sessions are
+matched to panes through the status files, herdr and the lineage folders, and to accounts through the status files
+and the statusline. The cost is an estimate from list prices (`PRICES` in `hooks/orch_usage.py`), not a bill, and the
+shares only count this machine. Transcripts are read incrementally (`usage-cache.json` keeps the offsets and 10-minute
+buckets for 8 days, and older files are skipped). On dev1, with 4.4 GB of transcripts, the first pass took 7 s and
+the next one under a second.
 
 ## Outside herdr
 
@@ -177,8 +256,9 @@ cd claude-context-handoff
 ```
 
 `install.sh` copies `hooks/` into `~/.claude/hooks/`, links `~/.local/bin/orch` to `orch.py`, installs and starts the
-`orch-watchdog.timer` systemd user unit, and runs `context-handoff-install.py`, which merges the hooks and env into
-`~/.claude/settings.json`. For other hosts it copies the files to `~/.cache/claude-context-handoff` there and runs the
+`orch-watchdog.timer` systemd user unit, registers the `orch` MCP server at user scope in every account
+(`claude mcp add --scope user orch -- python3 ~/.claude/hooks/orch_mcp.py`, skipped where it is already there), and
+runs `context-handoff-install.py`, which merges the hooks and env into `~/.claude/settings.json`. For other hosts it copies the files to `~/.cache/claude-context-handoff` there and runs the
 same script. It is idempotent and backs up the settings to `settings.json.bak-<timestamp>`
 whenever it changes them. It adds:
 
@@ -188,8 +268,9 @@ whenever it changes them. It adds:
 
 Running sessions pick up the settings at their next start.
 
-Account 2 needs nothing extra: `claude-acc` symlinks `~/.claude-2/settings.json` and `~/.claude-2/hooks` to
-`~/.claude`.
+Account 2 shares the hooks and settings: `claude-acc` symlinks `~/.claude-2/settings.json` and `~/.claude-2/hooks`
+to `~/.claude`. Its MCP servers live in its own `~/.claude-2/.claude.json`, which is why `install.sh` registers `orch`
+in each account.
 
 To change the hook, edit it here, commit, then run both install commands above.
 
@@ -219,9 +300,12 @@ All under `~/.claude/handoffs/`:
 - `state/<session-id>.json`: per-session lineage and stage timestamps (`dir`, `soft`, `urgent`, `stop_*`,
   `respawned`). Files older than 7 days are deleted.
 - `respawn.log`: takeovers, postponements and failures.
-- `agents/<pane>.json`: each herdr agent's latest turn end (session, background tasks, last message).
-- `runs/<orchestrator pane>.json`: an `orch` run (end time, goal, workers, parked workers, questions), and
-  `runs/<pane>.seen.json`, the events its waits already reported.
+- `agents/<pane>.json`: each herdr agent's latest turn end (session, background tasks, last message, account, pid,
+  relaunch flags) and its latest `report`.
+- `runs/<orchestrator pane>.json`: an `orch` run (end time, goal, workers, parked workers, questions with their ids,
+  options and answers), and `runs/<pane>.seen.json`, the events its waits already reported.
+- `accounts.json`: pending account switches and the default account.
+- `usage.json` (latest limits per account, and each session's account), `usage-history.jsonl`, `usage-cache.json`.
 - `events.jsonl`: takeovers, failures, nudges, alerts and run changes. `watchdog.json`: the watchdog's memory.
 - `archive/` and `<project-path>--<pane>.md`: the flat layout used before 2026-10-26. The hook no longer reads them.
 
