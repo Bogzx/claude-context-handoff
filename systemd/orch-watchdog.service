@@ -1,0 +1,9 @@
+[Unit]
+Description=orch watchdog: wake idle herdr orchestrators whose workers sit idle
+
+[Service]
+Type=oneshot
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/usr/bin/env python3 %h/.claude/hooks/orch.py watchdog
+Nice=10
+TimeoutStartSec=120

@@ -8,7 +8,10 @@ flags, model, effort and account, and the new agent continues from the handoff. 
 as the backstop.
 
 Decisions don't go in the handoff. They go in an append-only decision log that every agent taking over the same work
-reads in full and adds to (see [Decision log](#decision-log)).
+reads and adds to (see [Decision log](#decision-log)).
+
+`orch` (in `hooks/orch.py`) keeps a herdr orchestration moving across those takeovers: a run registered per
+orchestrator pane, one shared wait, parked workers and a watchdog timer (see [Orchestration runs](#orchestration-runs-orch)).
 
 Installed on dev1, dev2 and ob1 since 2026-10-24.
 
@@ -37,14 +40,23 @@ decision log.
 At the first Stop after the handoff has been written, the hook starts a detached process
 (`context-handoff.py --respawn <job>`) that:
 
-1. reads the herdr agent name of the pane, waits for the turn to finish, and sends `/exit`
-   (then SIGTERM, then SIGKILL, only if the process is still `claude`);
-2. waits for herdr to release the pane, archives the handoff as the next `gen-NN.md` in the lineage folder, and adds a
+1. reads the herdr agent name of the pane and waits until the agent is no longer working (up to 30 minutes:
+   another Stop hook, such as `/goal`'s, can keep the turn going). If it is still working, is at a dialog, or started
+   background tasks after the handoff, the takeover is postponed: the hook's state is reset, so the next turn end
+   tries again;
+2. sends `/exit` (then SIGTERM, then SIGKILL, only if the process is still `claude`);
+3. waits for herdr to release the pane, archives the handoff as the next `gen-NN.md` in the lineage folder, and adds a
    generation line to the decision log;
-3. types `HANDOFF_LINEAGE=<lineage folder> CLAUDE_CONFIG_DIR=… claude <original flags> --model <live model> --effort
+4. types `HANDOFF_LINEAGE=<lineage folder> CLAUDE_CONFIG_DIR=… claude <original flags> --model <live model> --effort
    <live effort>` into the pane with `herdr pane run`;
-4. waits until the new agent is idle, restores the old name, and prompts it to read the decision log in full, then
-   the archived handoff, and continue.
+5. waits until the new agent is idle, restores the old name, and prompts it to read the decision log (see below), then
+   the archived handoff, and continue. The prompt also names the pane's `orch` run, if it has an active one;
+6. checks that the new agent started working. If not, it presses Enter, then sends the prompt once more, and then
+   fails loudly. On 2026-11-02 a takeover prompt was typed but never submitted, and the pane sat unstarted for 9 hours
+   while the log said "respawned";
+7. if the old session had an unmet `/goal`, sends `/goal <condition>` again. It is queued behind the takeover prompt,
+   and Claude Code runs it as the command (checked live on 2026-11-05). A `/goal` is per session, so without this it
+   ended at the first takeover.
 
 The relaunch keeps the original command-line flags but drops the session identity (`--resume`, `--continue`,
 `--session-id`, `--fork-session`) and the old initial prompt. The model is taken from the transcript, so a `/model`
@@ -52,8 +64,9 @@ switch carries over, and the effort comes from the hook input or `$CLAUDE_EFFORT
 `CLAUDE_CONFIG_DIR`, which `claude-acc N` sets for accounts above 1 (`pibo2`). It goes in as a prefix on the
 command only, so a later `pibo` in the same pane is not affected.
 
-Every takeover is logged in `~/.claude/handoffs/respawn.log`. A failure is logged there too and raises a herdr
-notification.
+Every takeover is logged in `~/.claude/handoffs/respawn.log` and `events.jsonl`. A failure is logged there too,
+raises a herdr notification and goes to the owner's notify command (see [Alerts](#alerts)). A postponed takeover is
+logged as `postponed: <why>`.
 
 ### Background tasks
 
@@ -64,8 +77,8 @@ and asks again. After that it only shows "the respawn waits for N background tas
 the first turn end after the last task is gone. Scheduled `/loop` jobs don't block; the template records them so
 the new agent can recreate them.
 
-For an orchestrator this means its per-worker `herdr agent wait` loops: it records and stops them, and the new
-orchestrator re-arms them.
+For an orchestrator this means its `orch wait`: it stops it, and the new orchestrator re-arms it. The `orch` run
+itself is keyed by pane and carries over.
 
 ## Decision log
 
@@ -76,6 +89,12 @@ of the reasons. The third pointed to "spec + build doc for the full list" and ke
 p7X went from about 50 lines of design decisions in generation 4 to none of them in generation 5.
 
 Now each piece of work gets a lineage folder, and its decisions go in `decisions.md` there:
+
+- What a new agent reads: the whole log while it is up to 30 KB. Past that, `decisions-index.md` (the first 160
+  characters of every entry, written at each takeover) and the log from the generation that just finished, plus the
+  one before it if both fit in 60 KB. Older entries are looked up by D-number. Reading every log in full had made each
+  new AlphaProve orchestrator start at 140–190K of its 400K tokens (177 KB log), and the bg3-ai log reached 587 KB.
+  So the first line of an entry has to say on its own what was decided and by whom.
 
 - One entry per decision, numbered D1, D2, … across generations: date and time, who decided (the user, quoted
   verbatim, or the agent), what was chosen or ruled out, and why, with the evidence for a ruled-out approach.
@@ -97,6 +116,47 @@ The log stays in `~/.claude/handoffs`, not in the repo. Several agents share a w
 untracked files, and logs can mention prod details. Decisions the project needs beyond one piece of work still belong
 in the repo's own docs.
 
+## Orchestration runs (orch)
+
+`hooks/orch.py`, installed as `~/.local/bin/orch`. It came from an audit of four orchestrator runs (2026-11-05). The
+orchestrators sat idle for hours while their workers waited: watchers killed under memory pressure (14.4 h), a takeover
+that never started (9 h), a home-made wait loop kept alive by a leftover shell (6.8 h), an approval question parking
+the whole fleet overnight (11.8 h), and "today's work is done" with three workers on standby.
+
+| Command | What it does |
+| --- | --- |
+| `orch run start --until 09:00 --goal "..." --workers w17:pB7=builder,...` | Registers the run of the orchestrator in this pane (`--until` takes `HH:MM`, `YYYY-MM-DD HH:MM` or `+4h`). `run set`, `run stop` and `run show` change, end or show it. |
+| `orch wait` | The orchestrator's one background watcher. It returns when a worker's turn ended with nothing left running, a worker is blocked at a dialog, a pane lost its agent (3 min), a worker has waited 90 min on its own job, a `--check '<cmd>'` exits 0, or after the 30 min heartbeat. It prints one line per worker. An event is reported once: the next wait doesn't repeat it (`--reset` does). |
+| `orch park <pane> --reason "..." [--until HH:MM]` | Standby with a reason. It ends at the worker's next turn end or at `--until`. `orch unpark` ends it. |
+| `orch ask "<question>"` | Logs a question for the owner in the run and pushes it. |
+| `orch status [--json]`, `orch last <pane>` | The fleet, and a worker's last message and background tasks. |
+| `orch watchdog [--dry-run]` | One watchdog pass. A systemd user timer runs it every 5 minutes. |
+
+Inside herdr, the Stop hook writes `~/.claude/handoffs/agents/<pane>.json` at every turn end, with the session, the
+background tasks still running and the last message. SessionStart writes it too. This is how `orch` tells a finished
+worker from one waiting on its own job. A file from another session than the pane's current agent is ignored.
+
+The watchdog only looks at registered, unexpired runs and does nothing for any other pane. When a run's orchestrator is idle,
+it prompts it if any of these hold:
+
+- an unparked worker has been idle for 10 minutes with nothing running;
+- a worker has been at a dialog for 10 minutes, has had no agent for 5, or has waited 90 minutes on its own job;
+- the orchestrator's last turn ended with no background task (nothing would wake it) 5 minutes ago and a worker is
+  idle;
+- the orchestrator has been idle for an hour.
+
+It prompts at most every 15 minutes. After three prompts in a row about the same problem, it alerts the owner and
+slows down to hourly. It also alerts the owner, without prompting, when the orchestrator pane has had no agent for 5
+minutes or has been at a dialog for 10. When the run's end time passes, it marks the run ended and alerts once.
+
+### Alerts
+
+Everything goes to `~/.claude/handoffs/events.jsonl`, one JSON object per line (`time`, `host`, `kind`, `pane`,
+`title`, `body`). Alerts for the owner (a failed takeover, an `orch ask`, an orchestrator gone, blocked or not acting,
+a run that ended) also raise a herdr notification and run the notify command, if there is one: `$ORCH_NOTIFY_CMD`, else
+an executable `~/.claude/handoffs/notify`. It is called as `<command> <title> <body>` with `ORCH_EVENT_KIND` set. That
+is where a phone push plugs in. `orch notify <title> <body>` sends a test.
+
 ## Outside herdr
 
 There is no takeover. The user is told the handoff is ready. On `/clear` or after a compaction, SessionStart injects
@@ -116,8 +176,10 @@ cd claude-context-handoff
 ./install.sh bogdan@dev2 ubuntu@ob1   # other machines over ssh
 ```
 
-`install.sh` copies `hooks/` into `~/.claude/hooks/` and runs `context-handoff-install.py`, which merges the hooks and
-env into `~/.claude/settings.json`. It is idempotent and backs up the settings to `settings.json.bak-<timestamp>`
+`install.sh` copies `hooks/` into `~/.claude/hooks/`, links `~/.local/bin/orch` to `orch.py`, installs and starts the
+`orch-watchdog.timer` systemd user unit, and runs `context-handoff-install.py`, which merges the hooks and env into
+`~/.claude/settings.json`. For other hosts it copies the files to `~/.cache/claude-context-handoff` there and runs the
+same script. It is idempotent and backs up the settings to `settings.json.bak-<timestamp>`
 whenever it changes them. It adds:
 
 - `env`: `CLAUDE_CODE_AUTO_COMPACT_WINDOW=633000`, `CLAUDE_CODE_IDLE_COMPACT_MIN_TOKENS=400000`
@@ -153,9 +215,14 @@ All under `~/.claude/handoffs/`:
   - `handoff.md`: the pending handoff.
   - `decisions.md`: the decision log, and `.decisions.sealed`, its copy as of the last handoff.
   - `gen-NN.md`: consumed handoffs, in order.
+  - `decisions-index.md`: the first line of every entry, rewritten at each takeover once the log is over 30 KB.
 - `state/<session-id>.json`: per-session lineage and stage timestamps (`dir`, `soft`, `urgent`, `stop_*`,
   `respawned`). Files older than 7 days are deleted.
-- `respawn.log`: takeovers and failures.
+- `respawn.log`: takeovers, postponements and failures.
+- `agents/<pane>.json`: each herdr agent's latest turn end (session, background tasks, last message).
+- `runs/<orchestrator pane>.json`: an `orch` run (end time, goal, workers, parked workers, questions), and
+  `runs/<pane>.seen.json`, the events its waits already reported.
+- `events.jsonl`: takeovers, failures, nudges, alerts and run changes. `watchdog.json`: the watchdog's memory.
 - `archive/` and `<project-path>--<pane>.md`: the flat layout used before 2026-10-26. The hook no longer reads them.
 
 ## Checking it works
@@ -163,7 +230,9 @@ All under `~/.claude/handoffs/`:
 ```bash
 uv run --no-project --with pytest pytest -q                 # offline tests
 uv run --python 3.8 --no-project --with pytest pytest -q    # the Python that ob1 runs
-tail ~/.claude/handoffs/respawn.log
+tail ~/.claude/handoffs/respawn.log ~/.claude/handoffs/events.jsonl
+systemctl --user list-timers orch-watchdog.timer
+orch watchdog --dry-run
 sha256sum ~/.claude/hooks/context-handoff.py hooks/context-handoff.py
 ssh bogdan@dev2 'sha256sum ~/.claude/hooks/context-handoff.py'
 ssh ubuntu@ob1 'sha256sum ~/.claude/hooks/context-handoff.py'
@@ -188,6 +257,13 @@ the log and then `gen-01.md`, and found the `## Generation 2` line the hook had 
   write into the same lineage if it ever reached the threshold.
 - A session that was between its notice and its takeover when the new layout was installed gets the notice again
   with the new paths. A pending handoff it wrote in the flat layout stays where it is.
+- When the takeover prompt doesn't start the new agent, it is sent a second time, and if the first copy was still in
+  the input box the agent gets it twice.
+- A `/goal` is carried over only through a herdr takeover, not through `/clear` or compaction.
+- The watchdog sees what herdr and the status files show. An orchestrator that answers every prompt but never assigns
+  work is reported to the owner after three prompts; it is not stopped.
+- `orch` runs on one machine's herdr server. An orchestrator driving workers on another machine (`herdr --machine`)
+  isn't covered.
 
 ## Why 400K and 600K
 
