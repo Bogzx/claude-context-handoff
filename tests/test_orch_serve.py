@@ -306,10 +306,9 @@ def test_serve_binds_to_the_tailscale_ip_on_the_fixed_port(world, monkeypatch, c
     with pytest.raises(SystemExit):
         world.orch.main(["serve"])
     assert "listens only on the tailnet" in capsys.readouterr().err
-    world.serve.write_env({})
-    with pytest.raises(SystemExit):
-        world.orch.main(["serve"])
-    assert "orch pair" in capsys.readouterr().err
+    world.serve.write_env({"ORCH_START_ROOTS": "~/Repo"})  # settings, but not paired
+    assert world.orch.main(["serve"]) == world.serve.NOT_PAIRED == 3  # orch-serve.service's
+    assert "not paired: run `orch pair` first" in capsys.readouterr().err
 
 
 def test_pair_keeps_a_private_token_and_prints_the_pairing_string(world, capsys):

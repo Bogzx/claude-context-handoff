@@ -1,11 +1,12 @@
 [Unit]
 Description=orch serve: the gateway for the owner's phone app, on the Tailscale IP only
 # Not before `orch pair` has written the token. The file may hold other settings before that
-# (ORCH_START_ROOTS): without a token the start is skipped, not failed and retried.
+# (ORCH_START_ROOTS): without a token `orch serve` exits 3, a clean stop that isn't retried.
+# (Not ExecCondition: systemd 245 restarts a unit whose condition failed.)
 ConditionPathExists=%h/.config/orch/.env
 
 [Service]
-ExecCondition=/bin/grep -Eq "^ *ORCH_TOKEN *= *[^ ]" %h/.config/orch/.env
+SuccessExitStatus=3
 Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
 ExecStart=/usr/bin/env python3 %h/.claude/hooks/orch.py serve
 Restart=on-failure

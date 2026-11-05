@@ -52,6 +52,7 @@ MAX_BODY = 64 * 1024
 WHOIS_TTL = 60
 EVENTS_TAIL = 8 << 20  # bytes of events.jsonl read for history and the last nudge
 PANE_WAIT = 20  # seconds the start action waits for the new orchestrator's pane
+NOT_PAIRED = 3  # serve's exit status without a token; the unit counts it as a clean stop
 
 
 def warm_usage(gateway):
@@ -1063,8 +1064,10 @@ def background(gateway, stop):
 # --- commands ------------------------------------------------------------------------------------
 
 def serve(args):
-    if not read_env().get("ORCH_TOKEN"):
-        orch.die(f"not paired: run `orch pair` first (it creates {CONFIG})")
+    if not read_env().get("ORCH_TOKEN"):  # .env may hold the start settings before pairing
+        print(f"orch serve: not paired: run `orch pair` first (it writes the token to {CONFIG})",
+              file=sys.stderr)
+        return NOT_PAIRED
     addr = tailscale_ip()
     if not addr:
         orch.die("no Tailscale IPv4 (`tailscale ip -4`): the gateway listens only on the tailnet")
