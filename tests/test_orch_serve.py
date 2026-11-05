@@ -1792,10 +1792,10 @@ def test_pairing_stores_the_token_and_sends_a_test_push(world, cloud):
     status, paired = pair(world, gw)
     assert status == 200
     conforms(paired, PAIRED)
-    assert paired["test_push"] == {"seq": 1, "sent": world.t}
+    assert paired["test_push"] == {"seq": 0, "sent": world.t}
     [push] = cloud.pushes
     assert push["token"] == "fcm-1" and push["android"] == {"priority": "NORMAL", "ttl": "300s"}
-    assert push["message"] == {"seq": 1, "sent": world.t, "kind": "test", "orchestrator": None,
+    assert push["message"] == {"seq": 0, "sent": world.t, "kind": "test", "orchestrator": None,
                                "body": None}
     phones = world.serve.orch_push.PHONES
     assert stat.S_IMODE(os.stat(phones).st_mode) == 0o600
@@ -1804,11 +1804,11 @@ def test_pairing_stores_the_token_and_sends_a_test_push(world, cloud):
         "token_error": None, "device": "OnePlus 12", "app_version": "0.3.0", "relay_uid": "uid1"}
     health = gw.route("GET", "/v1/health", {}, None, "127.0.0.1")[1]
     conforms(health, HEALTH)
-    assert health["push"] == {"registered": True, "seq": 1, "last_sent": world.t,
+    assert health["push"] == {"registered": True, "seq": 0, "last_sent": world.t,
                               "last_heartbeat": None}
     assert health["relay"] == {"last_poll": None, "error": None}
     world.t += 60
-    assert pair(world, gw, token="fcm-2")[1]["test_push"]["seq"] == 2  # a new token replaces it
+    assert pair(world, gw, token="fcm-2")[1]["test_push"]["seq"] == 0  # a new token replaces it
     assert json.loads(phones.read_text())["nPHONE"]["fcm_token"] == "fcm-2"
     assert cloud.pushes[-1]["token"] == "fcm-2"
 
@@ -1832,13 +1832,39 @@ def test_a_test_push_goes_once_to_the_phone_that_asks_at_normal_priority(world, 
                            "picked_at": None, "error": None})
     [push] = cloud.pushes
     assert push["token"] == "fcm-1" and push["android"] == {"priority": "NORMAL", "ttl": "300s"}
-    assert push["message"] == {"seq": 2, "sent": world.t, "kind": "test", "orchestrator": None,
+    assert push["message"] == {"seq": 0, "sent": world.t, "kind": "test", "orchestrator": None,
                                "body": None}
 
     assert from_the_phone(world, gw, **action) == first  # a retry: same answer, no second push
     assert len(cloud.pushes) == 1
     assert from_the_phone(world, gw, id="t2", time=world.t)[0] == 202  # a new tap, a new action
-    assert [p["message"]["seq"] for p in cloud.pushes] == [2, 3]
+    assert [p["message"]["seq"] for p in cloud.pushes] == [0, 0]
+
+
+def test_a_test_push_leaves_no_number_for_another_phone_to_wait_for(world, cloud):
+    """A gap in seq is a lost push to the app, and a `test` reaches one phone only."""
+    gw = world.serve.Gateway()
+    pair(world, gw)
+    phones = world.serve.orch_push.load_phones()
+    phones["nOTHER"] = {"fcm_token": "fcm-other", "token_error": None}
+    world.serve.orch_push.save_phones(phones)
+    gw.pusher.cycle()
+    cloud.pushes.clear()
+
+    world.orch.emit("spill", "Account 1 at 98%: moving to 2", "its week reached 98%", None)
+    gw.pusher.cycle()
+    assert from_the_phone(world, gw, id="t1", time=world.t)[0] == 202
+    assert pair(world, gw, token="fcm-2")[1]["test_push"]["seq"] == 1  # the current number
+    world.t += 1
+    world.orch.emit("spill", "Account 1 back under 98%", "its week reset", None)
+    gw.pusher.cycle()
+
+    other = [(p["message"]["kind"], p["message"]["seq"]) for p in cloud.pushes
+             if p["token"] == "fcm-other"]
+    assert other == [("spill", 1), ("spill", 2), ("actions", 3)]  # no number missing
+    mine = [(p["message"]["kind"], p["message"]["seq"]) for p in cloud.pushes
+            if p["token"] != "fcm-other"]
+    assert mine == [("spill", 1), ("test", 1), ("test", 1), ("spill", 2), ("actions", 3)]
 
 
 def test_a_test_push_from_a_phone_that_never_paired_is_refused(world, cloud):
@@ -1950,9 +1976,9 @@ def test_the_push_loop_sends_what_the_phone_needs_once(world, cloud):
     # in the order queued; collapsible kinds carry the current seq without raising it, and
     # account 1 burns 4 %/h, so it runs out before its reset: a `usage` alert
     assert [(p["message"]["kind"], p["message"]["orchestrator"], p["message"]["seq"])
-            for p in cloud.pushes] == [("state", BOSS, 1), ("state", LOOSE, 1),
-                                       ("usage", None, 2), ("accounts", None, 2),
-                                       ("heartbeat", None, 2)]
+            for p in cloud.pushes] == [("state", BOSS, 0), ("state", LOOSE, 0),
+                                       ("usage", None, 1), ("accounts", None, 1),
+                                       ("heartbeat", None, 1)]
     states = {p["message"]["orchestrator"]: p for p in cloud.pushes if p["message"]["kind"] == "state"}
     assert states[BOSS]["android"] == {"priority": "NORMAL", "ttl": "86400s",
                                        "collapse_key": f"{MACHINE}:state:{BOSS}"}
@@ -1965,14 +1991,14 @@ def test_the_push_loop_sends_what_the_phone_needs_once(world, cloud):
     world.t += 31  # the tester's dialog has been open for 30 s now
     gw.pusher.cycle()
     [dialog] = cloud.pushes
-    assert dialog["message"]["kind"] == "dialog" and dialog["message"]["seq"] == 3
+    assert dialog["message"]["kind"] == "dialog" and dialog["message"]["seq"] == 2
     assert dialog["android"] == {"priority": "HIGH", "ttl": "86400s"}
     assert dialog["message"]["orchestrator"] == BOSS and dialog["message"]["body"]["pane"] == W2
     cloud.pushes.clear()
     qid = world.orch.ask(W1, "Merge #12?", [{"label": "Merge"}, {"label": "Not yet"}])
     gw.pusher.cycle()
     [question] = cloud.pushes
-    assert question["message"]["kind"] == "question" and question["message"]["seq"] == 4
+    assert question["message"]["kind"] == "question" and question["message"]["seq"] == 3
     assert question["android"]["priority"] == "HIGH"
     assert question["message"]["orchestrator"] == BOSS
     conforms(question["message"]["body"], QUESTION)
@@ -1982,17 +2008,17 @@ def test_the_push_loop_sends_what_the_phone_needs_once(world, cloud):
     gw.pusher.cycle()
     assert sorted(cloud.kinds()) == ["stall", "state"]
     [stall] = [p for p in cloud.pushes if p["message"]["kind"] == "stall"]
-    assert stall["message"]["seq"] == 5 and stall["message"]["orchestrator"] == BOSS
+    assert stall["message"]["seq"] == 4 and stall["message"]["orchestrator"] == BOSS
     conforms(stall["message"]["body"], STALL)
     cloud.pushes.clear()
     world.t += 600
     gw.pusher.cycle()
     [beat] = [p for p in cloud.pushes if p["message"]["kind"] == "heartbeat"]
     assert beat["android"]["collapse_key"] == f"{MACHINE}:heartbeat:"
-    assert beat["message"]["seq"] == 5 and set(beat["message"]["body"]["states"]) == {BOSS, LOOSE}
+    assert beat["message"]["seq"] == 4 and set(beat["message"]["body"]["states"]) == {BOSS, LOOSE}
     assert "dialog" not in cloud.kinds() and "stall" not in cloud.kinds()  # each went once
     health = gw.route("GET", "/v1/health", {}, None, "127.0.0.1")[1]["push"]
-    assert health["seq"] == 5 and health["last_heartbeat"] == world.t
+    assert health["seq"] == 4 and health["last_heartbeat"] == world.t
 
 
 def test_events_become_pushes_and_old_ones_are_skipped(world, cloud):
@@ -2006,7 +2032,7 @@ def test_events_become_pushes_and_old_ones_are_skipped(world, cloud):
     world.orch.emit("report", "Worker report", "...", W1)  # not a push
     gw.pusher.cycle()
     assert [(p["message"]["kind"], p["message"]["orchestrator"], p["message"]["seq"])
-            for p in cloud.pushes] == [("system", BOSS, 2), ("spill", None, 3)]
+            for p in cloud.pushes] == [("system", BOSS, 1), ("spill", None, 2)]
     assert cloud.pushes[0]["message"]["body"] == {
         "time": world.t, "kind": "respawn-failed", "title": "Handoff takeover failed",
         "body": "w1:p1: at a dialog", "pane": W1}
@@ -2076,7 +2102,7 @@ def test_the_relay_runs_each_action_once_and_pushes_its_status(world, cloud):
     assert acts["message"]["body"] == [{"id": "r1", "status": "delivered",
                                         "delivered_at": world.t, "picked_at": None,
                                         "error": None}]
-    assert acts["message"]["seq"] == 3 and acts["android"]["priority"] == "NORMAL"
+    assert acts["message"]["seq"] == 2 and acts["android"]["priority"] == "NORMAL"
     prompts = len(world.prompts)
     cloud.write("uid1", answer)  # the same message again (a replay, or a failed delete)
     cloud.write("uid1", dict(answer, id="r2", text="Merge"))  # the question is closed now
@@ -2133,7 +2159,7 @@ def test_a_passing_failure_keeps_the_push_for_the_next_pass(world, cloud):
     world.t += 20
     gw.pusher.cycle()
     [question] = cloud.pushes
-    assert question["message"]["seq"] == 2 and question["message"]["sent"] == world.t
+    assert question["message"]["seq"] == 1 and question["message"]["sent"] == world.t
 
 
 def test_without_a_service_account_nothing_is_pushed_and_health_says_why(world, cloud):
