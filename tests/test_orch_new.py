@@ -319,3 +319,54 @@ def test_a_phone_start_stays_inside_the_start_roots(world):
     with pytest.raises(world.orch.Refused) as e:
         check(world.folder)
     assert f"{PANE} works in ~/Repo/my-app already" in e.value.text
+
+
+TRUST_SCREEN = """\
+ Do you trust the files in this folder?
+
+ /home/me/Repo/my-app
+
+ 1. Earlier output that happens to be numbered
+ 2. More of it
+
+ Claude Code may read, write, or execute files contained in this directory.
+
+ {a} 1. Yes, proceed
+ {b} 2. No, exit
+
+ Enter to confirm · Esc to exit"""
+
+
+@pytest.mark.parametrize(("cursor", "choice", "keys"), [
+    (0, "allow", ["enter"]), (0, "deny", ["down", "enter"]),
+    (1, "allow", ["up", "enter"]), (1, "deny", ["enter"])])
+def test_trust_keys_move_from_the_cursor_to_yes_or_no(world, cursor, choice, keys):
+    screen = TRUST_SCREEN.format(a="❯" if cursor == 0 else " ", b="❯" if cursor == 1 else " ")
+    assert world.new.trust_keys(screen.split("\n"), choice) == keys
+
+
+@pytest.mark.parametrize("screen", [
+    "Bash command\n  rm -rf build\nDo you want to proceed?\n❯ 1. Yes\n  2. No",  # not trust
+    TRUST_SCREEN.format(a=" ", b=" "),  # no cursor
+    "Do you trust this folder?\n❯ 1. Yes, proceed\n  2. Yes, and remember",  # no No
+    "", None])
+def test_trust_keys_refuse_any_other_screen(world, screen):
+    assert world.new.trust_keys(screen.split("\n") if screen else screen, "allow") is None
+
+
+def test_a_cancel_stops_a_start_waiting_at_the_trust_question(world, monkeypatch):
+    world.herdr.states = ["blocked"]
+    polls = []
+
+    def sleep(seconds):  # the owner cancels a minute into the wait
+        polls.append(seconds)
+        world.t += seconds
+        if len(polls) == 60:
+            world.orch.save(world.orch.STARTS / "r1" / "cancelled.json",
+                            {"time": world.t, "by": "phone"})
+
+    monkeypatch.setattr(world.orch, "sleep", sleep)
+    assert world.run("--id", "r1") == 1
+    assert len(polls) == 60  # it stopped at the next poll, not after 15 minutes
+    assert world.steps()[-1] == ("trust", "doing")  # no failed step: the cancel says it all
+    assert world.orch.load_run(PANE) == {} and world.herdr.prompts == []

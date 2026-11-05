@@ -138,6 +138,18 @@ def prompt(pane, text):
     return result.returncode == 0
 
 
+def screen_lines(pane, lines, source="recent"):
+    """The pane's last `lines` lines of terminal text, or None when herdr can't read it."""
+    try:
+        r = herdr("agent", "read", pane, "--source", source, "--lines", str(lines),
+                  "--format", "text", timeout=20)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if not r or r.returncode != 0:
+        return None
+    return r.stdout.rstrip("\n").split("\n")[-lines:]
+
+
 # --- this machine ------------------------------------------------------------------------
 
 CONFIG = Path.home() / ".config" / "orch" / ".env"  # the gateway's: token, key, allow-list
@@ -552,6 +564,12 @@ def start_step(rec, step, status, text="", **extra):
     emit("start", f"Start of {folder}: {step} {status}", text, rec.get("pane"),
          push=status == "failed", action=rec["id"], step=step, status=status, error=error,
          **extra)
+
+
+def start_cancelled(rec):
+    """{time, by} once the start was cancelled, else {}. A file of its own (<id>/cancelled.json),
+    so a running start's saves of new.json can't drop it."""
+    return load(STARTS / rec["id"] / "cancelled.json")
 
 
 def start_done(rec):

@@ -19,6 +19,18 @@ import pytest
 HOOKS = Path(__file__).resolve().parent.parent / "hooks"
 BOSS, W1, W2, LOOSE = "w1:p0", "w1:p1", "w1:p2", "w1:p9"
 NEW = "w1:p5"  # the pane `herdr tab create` opens
+TRUST = """\
+ Do you trust the files in this folder?
+
+ /home/me/Repo/my-app
+
+ Claude Code may read, write, or execute files contained in this directory. This can pose
+ security risks, so only use files from trusted sources.
+
+ ❯ 1. Yes, proceed
+   2. No, exit
+
+ Enter to confirm · Esc to exit"""
 T0 = datetime(2026, 11, 5, 10, 0).timestamp()  # noqa: DTZ001 orch works in local time
 TOKEN = "t0ken-for-tests"
 
@@ -34,6 +46,7 @@ class World:
         self.herdr_calls = []
         self.tab_ok = True  # whether `herdr tab create` opens NEW
         self.tab_cwd = None
+        self.tab_alive = False  # whether the tab outlives its pane (someone split it)
         self.screen = "Bash command\n  rm saves/tmp/x.lsv\nDo you want to proceed?\n"
         self.whois = {"127.0.0.1": {"Node": {"StableID": "nPHONE", "ComputedName": "phone",
                                              "Name": "phone.tail.ts.net."}},
@@ -67,7 +80,24 @@ class World:
         if args[:2] == ("pane", "run"):  # Claude comes up idle in the new tab's folder
             self.agent(args[2], "idle")
             self.agents[args[2]]["cwd"] = self.tab_cwd
+        if args[:2] == ("agent", "send-keys") and args[-1] == "enter" and "trust" in self.screen:
+            lines = self.screen.split("\n")  # the cursor starts on option 1
+            first = next(i for i, line in enumerate(lines) if "1." in line)
+            if "No, exit" in lines[first + args.count("down") - args.count("up")]:
+                self.agents.pop(args[2], None)  # Claude quits
+            else:
+                self.agents[args[2]]["agent_status"] = "idle"
+        if args[:2] == ("pane", "close"):
+            self.agents.pop(args[2], None)
+        if args[:2] == ("tab", "get"):
+            return SimpleNamespace(returncode=0 if self.tab_alive else 1, stdout="", stderr="")
         return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    def prompt(self, pane, text):
+        self.prompts.append((pane, text))
+        if text == "/exit":
+            self.agents.pop(pane, None)
+        return self.prompt_ok
 
     def tailscale(self, *args):
         if args == ("ip", "-4"):
@@ -110,8 +140,7 @@ def world(tmp_path, monkeypatch):
     monkeypatch.setattr(orch, "PROJECTS", home / ".claude" / "projects")
     monkeypatch.setattr(orch, "now", lambda: w.t)
     monkeypatch.setattr(orch, "agents", lambda: dict(w.agents))
-    monkeypatch.setattr(orch, "prompt",
-                        lambda pane, text: w.prompts.append((pane, text)) or w.prompt_ok)
+    monkeypatch.setattr(orch, "prompt", w.prompt)
     monkeypatch.setattr(orch, "herdr", w.herdr)
     monkeypatch.setattr(serve, "tailscale", w.tailscale)
     monkeypatch.setattr(serve, "CONFIG", tmp_path / "config" / ".env")
@@ -854,6 +883,189 @@ def test_a_start_at_the_trust_dialog_shows_a_trust_dialog(world, monkeypatch):
     assert "kind" not in dialog  # another dialog of the same agent
 
 
+def from_phone(w, gw, **action):
+    """An action from the paired phone (127.0.0.1 is its tailnet node in the world)."""
+    action.setdefault("id", f"a{len(w.events())}-{action.get('kind')}")
+    action.setdefault("time", w.t)
+    return gw.route("POST", "/v1/actions", {}, action, "127.0.0.1")
+
+
+def test_reads_go_on_while_a_start_waits_for_its_pane(world, monkeypatch):
+    allow_starts(world, monkeypatch, run_it=False)  # the detached start has no tab yet
+    gw = world.serve.Gateway()
+    seen = []
+
+    def sleep(seconds):  # the start's request waits here; meanwhile the phone reads
+        assert not gw.lock.locked()
+        if not seen:
+            seen.append(world.get(gw, "/v1/actions/st1")[1])
+            seen.append(world.get(gw, "/v1/fleet")[0])
+            seen.append(gw.route("GET", "/v1/health", {}, None, "127.0.0.1")[0])
+            path = world.orch.STARTS / "st1" / "new.json"
+            world.orch.save(path, dict(world.orch.load(path), pane=NEW))  # the tab opens
+            seen.append(world.get(gw, "/v1/actions/st1")[1]["pane"])
+        world.t += seconds
+
+    monkeypatch.setattr(world.orch, "sleep", sleep)
+    status, out = world.post(gw, **start_action(id="st1"))
+    assert status == 202 and out["pane"] == NEW
+    assert seen[0]["status"] == "delivered" and seen[0]["pane"] is None
+    assert seen[1:] == [200, 200, NEW]
+    [event] = [e for e in world.events() if e["kind"] == "action"]  # logged once, when answered
+    assert event["status"] == "delivered" and event["pane"] == NEW
+
+
+def test_cancel_quits_the_new_orchestrator_and_closes_only_its_pane(world, monkeypatch):
+    allow_starts(world, monkeypatch)
+    world.serve.orch_push.save_phones({"nPHONE": {"node": "phone", "device": "OnePlus 12"}})
+    gw = world.serve.Gateway()
+    world.post(gw, **start_action(id="st1"))  # plan first: it reads, the run is registered
+    status, out = from_phone(world, gw, id="c1", kind="start_cancel", action="st1")
+    assert status == 202 and out["status"] == "picked" and out["picked_at"] == world.t
+    assert (NEW, "/exit") in world.prompts and NEW not in world.agents
+    assert ("pane", "close", NEW) in world.herdr_calls
+    assert not [c for c in world.herdr_calls if c[:2] == ("tab", "close")]
+    assert world.orch.load_run(NEW)["ended"] == world.t
+    lead = lead_of(world, gw, NEW)  # the stopped run, no longer starting
+    assert lead["activity"] == "done" and lead["start"] is None
+    [event] = [e for e in world.events() if e["kind"] == "start-cancel"]
+    assert event["pane"] == NEW and event["action"] == "st1" and event["by"] == "phone (OnePlus 12)"
+    assert event["body"] == f"by phone (OnePlus 12): run stopped; pane {NEW} closed"
+    again = world.post(gw, id="c2", kind="start_cancel", action="st1")
+    assert again[0] == 409 and again[1]["error"] == "the start st1 was cancelled already"
+    assert world.post(gw, id="c3", kind="start_cancel", action="nope")[0] == 404
+    (world.home / "Repo" / "two" / ".git").mkdir(parents=True)
+    world.tab_alive = True  # someone split the new tab
+    world.post(gw, **start_action(id="st2", folder="~/Repo/two", plan_first=False))
+    done = world.post(gw, id="c4", kind="start_cancel", action="st2")
+    assert done[0] == 409 and "is done" in done[1]["error"]  # a running orchestrator now
+    world.agent(NEW, "idle")
+    rec = world.orch.load(world.orch.STARTS / "st2" / "new.json")
+    world.orch.save(world.orch.STARTS / "st2" / "new.json", dict(rec, steps=rec["steps"][:-1]))
+    world.post(gw, id="c5", kind="start_cancel", action="st2")
+    assert "tab w1:t9 kept: it has other panes" in world.events()[-2]["body"]
+
+
+def test_retry_runs_a_failed_start_again_from_its_failed_step(world, monkeypatch):
+    allow_starts(world, monkeypatch)
+    gw = world.serve.Gateway()
+    world.tab_ok = False
+    assert world.post(gw, **start_action(id="st1"))[0] == 502
+    world.tab_ok = True
+    assert world.post(gw, id="r1", kind="start_retry", action="st1")[0] == 202
+    rec = world.orch.load(world.orch.STARTS / "st1" / "new.json")
+    assert [(s["step"], s["status"]) for s in rec["steps"]] == [
+        ("pane", "ok"), ("claude", "ok"), ("run", "ok"), ("read", "doing")]
+    assert rec["retries"] == [{"time": world.t, "by": "the app", "step": "pane", "account": "2"}]
+    again = world.post(gw, id="r2", kind="start_retry", action="st1")
+    assert again[0] == 409 and "has not failed" in again[1]["error"]
+
+
+def test_retry_on_another_account_restarts_claude_after_nobody_trusted_the_folder(
+        world, monkeypatch):
+    allow_starts(world, monkeypatch)
+    gw = world.serve.Gateway()
+    world.screen = TRUST
+    run = world.herdr
+
+    def herdr(*args, **kw):  # Claude on account 2 stops at the trust question
+        out = run(*args, **kw)
+        if args[:2] == ("pane", "run") and " 2 --session-id " in args[3]:
+            world.agents[args[2]]["agent_status"] = "blocked"
+        return out
+
+    monkeypatch.setattr(world.orch, "herdr", herdr)
+    status, out = world.post(gw, **start_action(id="st1"))
+    assert status == 202 and out["pane"] == NEW  # answered once the pane was there
+    rec = world.orch.load(world.orch.STARTS / "st1" / "new.json")
+    assert rec["status"] == "failed" and rec["step"] == "trust"  # 15 minutes, nobody answered
+    first = rec["session"]
+    assert world.post(gw, id="r1", kind="start_retry", action="st1", account="1")[0] == 202
+    rec = world.orch.load(world.orch.STARTS / "st1" / "new.json")
+    assert [(s["step"], s["status"]) for s in rec["steps"]] == [
+        ("pane", "ok"), ("claude", "ok"), ("run", "ok"), ("read", "doing")]
+    assert ("agent", "send-keys", NEW, "down", "enter") in world.herdr_calls  # "No, exit"
+    second = [c[3] for c in world.herdr_calls if c[:2] == ("pane", "run")][-1]
+    assert f" 1 --session-id {rec['session']} " in second and rec["session"] != first
+    assert world.orch.load_run(NEW)["settings"]["account"] == "1"
+    assert rec["account"] == "1" and "restart" not in rec
+    bad = world.post(gw, id="r2", kind="start_retry", action="st1", account=["1"])
+    assert bad[0] == 400
+
+
+def trust_step(world, gw):
+    """A phone start whose new agent waits at the trust question (the detached start is
+    elsewhere)."""
+    world.post(gw, **start_action(id="st1"))
+    path = world.orch.STARTS / "st1" / "new.json"
+    rec = dict(world.orch.load(path), pane=NEW)
+    for step, status in [("pane", "ok"), ("claude", "doing")]:
+        world.orch.start_step(rec, step, status)
+    world.agent(NEW, "blocked", change=4)
+    world.screen = TRUST
+    return rec
+
+
+def test_the_app_answers_only_a_new_orchestrators_trust_question(world, monkeypatch):
+    allow_starts(world, monkeypatch, run_it=False)
+    world.serve.orch_push.save_phones({"nPHONE": {"node": "phone", "device": "OnePlus 12"}})
+    gw = world.serve.Gateway()
+    rec = trust_step(world, gw)
+    answer = {"kind": "dialog", "pane": NEW, "change": 4, "choice": "allow"}
+    early = from_phone(world, gw, **answer)  # the start isn't at its trust step yet
+    assert early[0] == 400 and "answer this dialog in the pane" in early[1]["error"]
+    world.orch.start_step(rec, "trust", "doing")
+    world.agent(W2, "blocked", change=2)
+    assert from_phone(world, gw, **dict(answer, pane=W2, change=2))[0] == 400  # not a start's
+    assert from_phone(world, gw, **dict(answer, choice="delegate"))[0] == 400
+    stale = from_phone(world, gw, **dict(answer, change=3))
+    assert stale[0] == 409 and "changed since" in stale[1]["error"]
+    world.screen = "Bash command\n  rm -rf build\nDo you want to proceed?\n❯ 1. Yes\n  2. No\n"
+    other = from_phone(world, gw, **answer)
+    assert other[0] == 409 and "doesn't show Claude Code's folder-trust question" in other[1]["error"]
+    world.screen = TRUST
+    assert not [c for c in world.herdr_calls if c[:2] == ("agent", "send-keys")]
+    assert from_phone(world, gw, **answer)[0] == 202
+    assert ("agent", "send-keys", NEW, "enter") in world.herdr_calls
+    assert world.agents[NEW]["agent_status"] == "idle"
+    [event] = [e for e in world.events() if e["kind"] == "trust"]
+    assert event["pane"] == NEW and event["action"] == "st1" and event["choice"] == "allow"
+    assert event["by"] == "phone (OnePlus 12)" and event["source"] == "app"
+    assert event["body"] == "~/Repo/my-app on account 2, by phone (OnePlus 12)"
+
+
+def test_denying_the_trust_question_quits_claude_and_cancels_the_start(world, monkeypatch):
+    allow_starts(world, monkeypatch, run_it=False)
+    gw = world.serve.Gateway()
+    world.orch.start_step(trust_step(world, gw), "trust", "doing")
+    assert world.post(gw, kind="dialog", pane=NEW, change=4, choice="deny")[0] == 202
+    assert ("agent", "send-keys", NEW, "down", "enter") in world.herdr_calls
+    assert NEW not in world.agents and ("pane", "close", NEW) in world.herdr_calls
+    assert world.orch.start_cancelled({"id": "st1"})["by"] == "the app"
+    assert [e["kind"] for e in world.events()][-3:] == ["trust", "start-cancel", "action"]
+    assert NEW not in world.serve.Gateway.starts(world.t)
+
+
+def test_health_says_whether_a_start_can_work_here(world, monkeypatch, tmp_path):
+    gw = world.serve.Gateway()
+    acc = tmp_path / "claude-acc"
+    monkeypatch.setattr(world.serve.orch_new, "claude_acc", lambda: str(acc))
+
+    def health():
+        return gw.route("GET", "/v1/health", {}, None, "127.0.0.1")[1]
+
+    assert health()["can_start"] is False
+    assert "ORCH_START_ROOTS is not set" in health()["cannot_start"]
+    world.serve.write_env(dict(world.serve.read_env(), ORCH_START_ROOTS="~/Repo"))
+    assert health()["cannot_start"] == "claude-acc is not installed"
+    acc.write_text("#!/bin/sh\n")
+    acc.chmod(0o755)
+    out = health()
+    assert out["can_start"] is True and "cannot_start" not in out
+    monkeypatch.setattr(world.orch, "agents", lambda: None)
+    assert health()["cannot_start"] == "herdr isn't running"
+
+
 def git_checkout(path, head="ref: refs/heads/main", at=None, worktree=None):
     """A checkout's .git (a folder, or a worktree's .git file) with HEAD written at `at`."""
     path.mkdir(parents=True, exist_ok=True)
@@ -923,6 +1135,7 @@ def test_folders_lists_the_checkouts_under_the_roots_newest_work_first(world, tm
 KEY = bytes(range(32))
 MACHINE = "box1"  # the tailnet name the world fixture gives this machine
 HEALTH = {"machine": str, "version": str, "time": NUM, "addr?": str, "orchestrators": [str],
+          "can_start": bool, "cannot_start?": str,
           "accounts": dict, "push": {"registered": bool, "seq": int, "last_sent?": NUM,
                                      "last_heartbeat?": NUM, "error?": str},
           "relay?": {"last_poll?": NUM, "error?": str}}

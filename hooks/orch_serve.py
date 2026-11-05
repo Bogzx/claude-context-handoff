@@ -187,23 +187,11 @@ def question_json(q):
             "answer": q.get("answer"), "answered": q.get("answered")}
 
 
-def screen_lines(pane, lines, source="recent"):
-    """The pane's last `lines` lines of terminal text, or None when herdr can't read it."""
-    try:
-        r = orch.herdr("agent", "read", pane, "--source", source, "--lines", str(lines),
-                       "--format", "text", timeout=20)
-    except (OSError, subprocess.SubprocessError):
-        return None
-    if not r or r.returncode != 0:
-        return None
-    return r.stdout.rstrip("\n").split("\n")[-lines:]
-
-
 def dialog_json(a, agent):
     report = a["report"] or {}
     return {"pane": a["pane"], "label": a["label"], "since": a["since"],
             "change": (agent or {}).get("state_change_seq"),
-            "text": "\n".join(screen_lines(a["pane"], 40, "visible") or []),
+            "text": "\n".join(orch.screen_lines(a["pane"], 40, "visible") or []),
             "doing": report.get("summary") or orch.first_line(a["last"], 160),
             "danger": True}  # no rule yet: every dialog answer is treated as dangerous
 
@@ -393,7 +381,7 @@ class Gateway:
                                          int(arg.get("limit") or 200))
             if len(parts) == 3 and parts[0] == "panes" and parts[2] == "screen":
                 lines = max(1, min(500, int(arg.get("lines") or 15)))
-                text = screen_lines(parts[1], lines)
+                text = orch.screen_lines(parts[1], lines)
                 if text is None:
                     return 404, {"error": f"can't read the screen of {parts[1]}"}
                 return 200, {"pane": parts[1], "time": orch.now(), "lines": text}
@@ -433,6 +421,8 @@ class Gateway:
         out = {"machine": self.machine(), "version": VERSION, "time": orch.now(),
                "addr": tailscale_ip(), "orchestrators": self.orchestrators(),
                "accounts": self.account_names(), "push": self.pusher.health(phone)}
+        why = orch_new.cannot_start(read_env(self.config))
+        out.update(can_start=why is None, **({"cannot_start": why} if why else {}))
         if any(p.get("relay_uid") for p in orch_push.load_phones().values()):
             out["relay"] = dict(self.pusher.relay)
         return out
@@ -522,7 +512,7 @@ class Gateway:
         for path in sorted(orch.STARTS.glob("*/new.json")) if orch.STARTS.is_dir() else ():
             rec = orch.load(path)
             if (rec.get("pane") and (rec.get("time") or 0) >= at - orch.START_SHOWN
-                    and not orch.start_done(rec)
+                    and not orch.start_done(rec) and not orch.start_cancelled(rec)
                     and (rec.get("time") or 0) >= (out.get(rec["pane"]) or {}).get("time", 0)):
                 out[rec["pane"]] = rec
         return out
@@ -720,7 +710,9 @@ class Gateway:
     def status_json(rec):
         out = {k: rec.get(k) for k in ("id", "status", "delivered_at", "picked_at", "error")}
         if rec.get("kind") == "start":  # the new orchestrator's pane, once it exists
-            out["pane"] = rec.get("pane")
+            out["pane"] = rec.get("pane") or (
+                orch.load(orch.STARTS / rec["id"] / "new.json").get("pane")
+                if rec.get("status") == "delivered" else None)
         return out
 
     def picked(self, log, ags, at):
@@ -768,6 +760,7 @@ class Gateway:
                                  "error": "this id was already used for another action"}
                 return old["code"], self.status_json(old)
             at = orch.now()
+            wait = None
             rec = {"id": aid, "kind": body.get("kind"), "time": body.get("time"), "received": at,
                    "source": source, "phone": phone, "fingerprint": fingerprint,
                    "delivered_at": None, "picked_at": None, "error": None}
@@ -782,6 +775,7 @@ class Gateway:
                 if not handler:
                     raise Reject(f"unknown action kind {body.get('kind')!r}", 400)
                 tracked = handler(self, body, rec) or {}
+                wait = tracked.pop("wait", None)
                 rec.update(status="delivered", delivered_at=orch.now(), code=202, **tracked)
             except Reject as e:
                 rec.update(status=e.status, error=e.text, code=e.code)
@@ -789,8 +783,26 @@ class Gateway:
                 rec.update(status="rejected", error=e.text, code=409)
             log[aid] = rec
             self.save_actions(log, at)
-            self.log_action(rec, body, source)
+            if not wait:
+                self.log_action(rec, body, source)
+        if wait:  # the slow part (a start's wait for its pane, a cancel): reads go on meanwhile
+            try:
+                rec.update(wait() or {})
+            except Reject as e:
+                rec.update(status=e.status, error=e.text, code=e.code)
+            with self.lock:
+                log = self.load_actions()
+                log[aid] = rec
+                self.save_actions(log, orch.now())
+                self.log_action(rec, body, source)
         return rec["code"], self.status_json(rec)
+
+    @staticmethod
+    def who(phone):
+        """A phone for the logs: its tailnet name and device, else its StableID."""
+        p = orch_push.load_phones().get(phone or "") or {}
+        name = p.get("node") or phone or "the app"
+        return f"{name} ({p['device']})" if p.get("device") else name
 
     def log_action(self, rec, body, source):
         fields = {k: v for k, v in body.items() if k not in ("id", "kind", "time")}
@@ -941,7 +953,8 @@ def act_push_token(gw, body, rec):
 
 def act_start(gw, body, rec):
     """A new orchestrator (orch_new): checked here, then run detached; answered once its pane
-    exists (or after PANE_WAIT seconds), the rest arrives as `start` pushes."""
+    exists (or after PANE_WAIT seconds), outside the action lock. The rest arrives as `start`
+    pushes."""
     opts = {k: body.get(k) for k in ("folder", "worktree", "name", "goal", "until", "account",
                                      "model", "effort", "worker_model", "max_workers", "rules",
                                      "plan_first")}
@@ -949,27 +962,90 @@ def act_start(gw, body, rec):
     if not orch_new.accept(start):
         raise Reject(f"a start {rec['id']} exists already on {gw.machine()}")
     orch_new.spawn(start["id"])
-    deadline = orch.now() + PANE_WAIT
-    while True:
-        now = orch.load(orch.STARTS / start["id"] / "new.json")
-        if now.get("pane"):
-            return {"pane": now["pane"]}
-        if now.get("status") == "failed":
-            raise Reject(now.get("error") or "the start failed", 502, "failed")
-        if orch.now() >= deadline:
-            return {"pane": None}
-        orch.sleep(0.2)
+
+    def wait():
+        deadline = orch.now() + PANE_WAIT
+        while True:
+            now = orch.load(orch.STARTS / start["id"] / "new.json")
+            if now.get("pane"):
+                return {"pane": now["pane"]}
+            if now.get("status") == "failed":
+                raise Reject(now.get("error") or "the start failed", 502, "failed")
+            if orch.now() >= deadline:
+                return {"pane": None}
+            orch.sleep(0.2)
+    return {"wait": wait}
+
+
+def start_of_action(body):
+    """The start record a start_cancel or start_retry names (`action`: the start's id)."""
+    sid = need(body, "action")
+    rec = orch.load(orch.STARTS / sid / "new.json") if re.fullmatch(r"[A-Za-z0-9_-]{1,64}",
+                                                                     sid) else {}
+    if not rec:
+        raise Reject(f"no start {sid}", 404)
+    return rec
+
+
+def act_start_cancel(gw, body, rec):
+    start = start_of_action(body)
+    if orch.start_cancelled(start):
+        raise Reject(f"the start {start['id']} was cancelled already")
+    if orch.start_done(start):
+        raise Reject(f"the start {start['id']} is done: {start.get('pane')} is a running "
+                     "orchestrator (stop its run instead)")
+    by = gw.who(rec.get("phone"))
+    return {"pane": start.get("pane"),
+            "wait": lambda: {"status": "picked", "picked_at": orch.now(),
+                             "result": orch_new.cancel(start, by)}}
+
+
+def act_start_retry(gw, body, rec):
+    start = start_of_action(body)
+    account = body.get("account")
+    if account is not None and not isinstance(account, (str, int)):
+        raise Reject("account is a number", 400)
+    orch_new.retry(start, account, gw.who(rec.get("phone")))
+    return {"pane": start.get("pane")}
 
 
 def act_dialog(gw, body, rec):
-    raise Reject("answering a dialog from the app is not supported by this gateway yet", 400)
+    """Only Claude Code's folder-trust question of a new orchestrator: allow picks Yes, deny
+    picks No (Claude exits) and cancels the start. Every other dialog is answered in the pane."""
+    pane, choice = need(body, "pane"), need(body, "choice")
+    start = orch.start_of(pane)
+    if not start or orch.start_cancelled(start) or not any(
+            s["step"] == "trust" and s["status"] == "doing" for s in start.get("steps") or []):
+        raise Reject("this gateway answers only a new orchestrator's folder-trust question: "
+                     "answer this dialog in the pane", 400)
+    if choice not in ("allow", "deny"):
+        raise Reject(f"choice {choice!r}: allow or deny for the folder-trust question", 400)
+    agent = (orch.agents() or {}).get(pane) or {}
+    if agent.get("agent_status") != "blocked":
+        raise Reject(f"{pane} is not at the folder-trust question any more")
+    if body.get("change") is not None and body["change"] != agent.get("state_change_seq"):
+        raise Reject("the dialog changed since the app showed it: refresh")
+    keys = orch_new.trust_keys(orch.screen_lines(pane, 40, "visible"), choice)
+    if keys is None:
+        raise Reject(f"{pane} doesn't show Claude Code's folder-trust question")
+    by = gw.who(rec.get("phone"))
+    out = target(pane)
+    if choice == "allow" and orch.herdr("agent", "send-keys", pane, *keys).returncode != 0:
+        raise Reject(f"could not answer the dialog in {pane}", 502, "failed")
+    orch.emit("trust", f"Folder trust {'allowed' if choice == 'allow' else 'denied'} from the app",
+              f"{orch_new.tilde(start['cwd'])} on account {start['account']}, by {by}", pane,
+              action=start["id"], choice=choice, by=by, source=rec["source"])
+    if choice == "deny":  # "No" quits Claude: the start is cancelled
+        out["wait"] = lambda: {"result": orch_new.cancel(start, by)}
+    return out
 
 
 ACTIONS = {"prompt": act_prompt, "answer": act_answer, "interrupt": act_interrupt,
            "park": act_park, "unpark": act_park, "run": act_run, "nudge": act_nudge,
            "account": act_account, "default_account": act_default_account, "ack": act_ack,
            "spill": act_spill, "push_token": act_push_token,
-           "dialog": act_dialog, "start": act_start}
+           "dialog": act_dialog, "start": act_start, "start_cancel": act_start_cancel,
+           "start_retry": act_start_retry}
 
 
 # --- HTTP ----------------------------------------------------------------------------------------

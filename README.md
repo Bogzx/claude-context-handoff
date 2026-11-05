@@ -177,6 +177,8 @@ plus the fields of its kind:
 | `respawn-dialog` | a takeover's or `orch new`'s new agent waits at a dialog (not for a start from the app, which has its `start` push) | the agent | `action` for `orch new` | yes |
 | `spill` | the spill rule is set, turned off, fires or clears | null | when it fires: `window`, `used`, `since` | when it fires |
 | `start` | a step of `orch new` or the gateway's `start` action is doing, ok or failed | the new orchestrator, once its tab exists | `action` (the start's id), `step`, `status`, `error`; the `pane` step also `folder`, `goal`, `by` (`cli`, `phone`) | when it fails |
+| `start-cancel` | a start was cancelled (the app's `start_cancel`, or "No" at its trust question) | the new orchestrator, or null | `action`, `by` | |
+| `trust` | the app answered a new orchestrator's folder-trust question | the new orchestrator | `action`, `choice` (`allow`, `deny`), `by` (the phone), `source` | |
 | `test` | `orch notify` | null | | yes |
 | `pair` | a phone pairs or unpairs with the gateway | null | | |
 | `action` | the gateway handles an app action | its agent or orchestrator, else null | `action` (its kind), `id`, `status` (`delivered`, `rejected`, `failed`), `error`, `source` (`app`, `relay`), `fields` (the action's other fields) | |
@@ -340,7 +342,8 @@ on Python 3.8; the push and relay code (`hooks/orch_push.py`) also needs the `cr
 - The machine's name in the API, pushes and the relay is `ORCH_MACHINE` from that file, else its Tailscale device
   name (`tailscale status --json`, `Self.HostName`), else its hostname.
 - `orch serve --allow-self` also admits the machine's own node. It is off by default and meant for a local test.
-- `GET /v1/health` (version, clock, push and relay state; the `Server` header is `orch/<version>`), `POST /v1/pair`
+- `GET /v1/health` (version, clock, push and relay state, `can_start` and `cannot_start`; the `Server` header is
+  `orch/<version>`), `POST /v1/pair`
   (the phone's FCM token and relay uid; a node of the machine's own Tailscale user with the right token joins the
   allow-list by StableID, then gets a `test` push) and `DELETE /v1/pair` (leaves the allow-list, token forgotten).
   The gateway keeps the phones in `~/.config/orch/phones.json` (600).
@@ -350,8 +353,9 @@ on Python 3.8; the push and relay code (`hooks/orch_push.py`) also needs the `cr
   `/v1/panes/<pane>/screen?lines=15`, `/v1/actions/<id>` and `/v1/folders?q=&limit=50` (see Starts from the app).
 - Writes: `POST /v1/actions`, one JSON action with the app's `id` (a UUID), `time` and `kind`: `prompt`, `answer`,
   `interrupt` (Esc), `park`, `unpark`, `run` (`extend` from the current end, or `stop`), `nudge`, `account` (`now`,
-  `idle`, `handoff`), `default_account`, `spill`, `ack` (decisions seen), `push_token` (a rotated FCM token) or
-  `start` (a new orchestrator, see Starts from the app). An id runs once: a retry with the same body gets the
+  `idle`, `handoff`), `default_account`, `spill`, `ack` (decisions seen), `push_token` (a rotated FCM token),
+  `dialog` (only a new orchestrator's folder-trust question), or `start`, `start_cancel` and `start_retry` (see
+  Starts from the app). An id runs once: a retry with the same body gets the
   first result, and the same id with a different body is refused. Actions older than 10 minutes are refused. The
   answer is 202 `delivered`, 4xx `rejected` or 502 `failed`, with a sentence the app can show. An action becomes
   `picked` once its target agent starts a turn (for an agent that was already working, at its next state change). A
@@ -362,8 +366,8 @@ on Python 3.8; the push and relay code (`hooks/orch_push.py`) also needs the `cr
   `~/.config/orch/.env` has the token: `orch pair`, then `systemctl --user start orch-serve`. Before that the file
   may hold other settings (`ORCH_START_ROOTS`): `orch serve` then exits 3, which the unit counts as a clean stop.
 
-Not in the gateway yet: answering a permission dialog (`dialog` is refused), the diff view, the activity lanes and the
-per-agent model.
+Not in the gateway yet: answering a permission dialog (`dialog` answers only a new orchestrator's folder-trust
+question), the diff view, the activity lanes and the per-agent model.
 
 #### Starts from the app
 
@@ -374,8 +378,21 @@ per-agent model.
   worker_model, max_workers (0-16), rules: [text], plan_first}` and runs `orch new` with them. It is refused (409,
   with the reason) for a folder outside the roots, under an excluded folder, or one an active run works in already
   (unless `worktree`). The action's id is the start's id. The gateway runs the start detached and answers 202 with
-  `pane` once the new tab exists (or `pane: null` after 20 s; the action lock is held meanwhile), or 502 `failed`
-  when the start failed before it had a pane. The steps then arrive as `start` pushes.
+  `pane` once the new tab exists (or `pane: null` after 20 s), or 502 `failed` when the start failed before it had a
+  pane. Only that request waits: reads and other actions go on, and `/v1/actions/<id>` shows the pane as soon as it
+  exists. The steps then arrive as `start` pushes.
+- `start_cancel {action}` cancels a start that isn't done: it ends the run, quits the new Claude ("No" at the trust
+  question, else Esc and `/exit`, up to 15 s) and closes the pane the start opened. herdr drops the tab with its last
+  pane; a tab someone else split stays, and so does a worktree. A start still running stops at its next step. The
+  action ends `picked`, and the start leaves `starting`.
+- `start_retry {action, account?}` runs a failed start again, detached, from its failed step. With another
+  `account`, Claude quits and starts again on that account with a new session id.
+- `dialog {pane, change, choice}` answers Claude Code's folder-trust question, and only for the pane a start opened
+  while that start is at its `trust` step: `allow` picks "Yes", `deny` picks "No" (Claude exits) and cancels the
+  start. The gateway checks that the agent is still blocked at the same `change` and that the screen shows a trust
+  question with Yes and No, and it logs who answered (a `trust` event). Any other dialog is answered in the pane.
+- `/v1/health` has `can_start` and, when false, `cannot_start`: ORCH_START_ROOTS not set, herdr not running, or
+  claude-acc missing.
 - `/v1/fleet` shows an unfinished start (the last day's, until `brief` or `plan` is ok) as an orchestrator with
   activity `starting` and `start: {action, goal, plan_first, until, steps: [{step, status, time, error?}]}`; its
   agent's dialog during the `trust` step has `kind: "trust"` and the folder as `cwd`. Questions carry `kind`
@@ -385,9 +402,7 @@ per-agent model.
   detached), `last_activity` (git index, HEAD or reflog, or a Claude transcript of the folder), `orchestrator`
   (`{pane, name}` of an active run there) and `trusted` (the folder or a parent is trusted in the `.claude.json` of
   the account a new agent would use). `q` filters on the path, `limit` is 1-200.
-- Not yet: answering the trust dialog from the app (so a start in a folder the account hasn't trusted waits for an
-  answer in the pane), retrying or cancelling a failed start, `Health.can_start`, closing the tab of a start whose
-  run stopped with no worker.
+- Not done: closing the tab of a run that stopped with no worker (on purpose), and `Health.capacity`.
 
 ### Pushes and the relay (orch_push.py)
 
@@ -483,8 +498,8 @@ All under `~/.claude/handoffs/`:
   relaunch flags) and its latest `report`.
 - `runs/<orchestrator pane>.json`: an `orch` run (end time, goal, workers, parked workers, questions with their ids,
   options and answers), and `runs/<pane>.seen.json`, the events its waits already reported.
-- `~/.claude/orch/new/<id>/`: one `orch new` or app start: `new.json` (its request and steps), `brief.md`, and
-  `start.log` (the detached run's output, for a start from the app).
+- `~/.claude/orch/new/<id>/`: one `orch new` or app start: `new.json` (its request, steps and retries),
+  `brief.md`, `start.log` (the detached run's output, for a start from the app) and `cancelled.json` once cancelled.
 - `accounts.json`: pending account switches, the default account, the spill rule and the account names.
 - `gateway-actions.json`: the gateway's actions of the last 24 h by id (result, status), and `decisions-seen.json`,
   the decisions the app marked as seen.

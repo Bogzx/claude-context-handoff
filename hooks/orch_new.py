@@ -20,7 +20,9 @@ kept in ~/.claude/orch/new/<id>/new.json; each step is `doing`, `ok` or `failed`
   brief    without --plan-first: the same prompt, ok once the agent works on it
 
 A second start with the same id starts nothing: it prints the first one's state. --dry-run
-prints the steps and the brief and changes nothing.
+prints the steps and the brief and changes nothing. From the app, retry() runs a failed start again
+from its failed step (Claude again with another account), cancel() ends one that isn't done, and
+trust_keys() answers the new agent's folder-trust question.
 """
 import importlib.util
 import json
@@ -37,6 +39,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import orch
 
 READY_WAIT = 90  # seconds for the new agent to come up, as a takeover's
+EXIT_WAIT = 15  # seconds for a Claude to quit (cancel, or a restart on another account)
 BLOCKED_POLLS = 3  # one-second polls at a dialog before it counts as waiting there
 WORD = re.compile(r"[A-Za-z0-9._\[\]-]{1,64}")  # model, effort, name: nothing for a shell
 
@@ -57,6 +60,38 @@ the run. Then:
    revise the plan, report it again and ask again the same way (that replaces the open
    question).
 """
+
+
+class Cancelled(Exception):
+    """The start was cancelled while it ran (cancel())."""
+
+
+OPTION = re.compile(r"^\s*(?P<cursor>[❯›>])?\s*(?P<n>\d)\.\s+(?P<label>\S.*?)\s*$")
+
+
+def trust_keys(lines, choice):
+    """The keys that pick "Yes" (allow) or "No" (deny) in Claude Code's folder-trust question
+    on a screen, or None when the screen shows something else: a question about trust whose
+    last numbered list has the cursor and both a Yes and a No option."""
+    if not lines or not any("trust" in line.lower() for line in lines):
+        return None
+    options, cursor = [], None
+    for line in lines:
+        m = OPTION.match(line)
+        if not m:
+            continue
+        if m["n"] == "1":  # a new list: only the last one counts
+            options, cursor = [], None
+        if m["cursor"]:
+            cursor = len(options)
+        options.append(m["label"])
+    want = [i for i, label in enumerate(options)
+            if label.startswith("Yes" if choice == "allow" else "No")]
+    if cursor is None or len(want) != 1 or not any(o.startswith("No") for o in options) \
+            or not any(o.startswith("Yes") for o in options):
+        return None
+    moves = want[0] - cursor
+    return ["down" if moves > 0 else "up"] * abs(moves) + ["enter"]
 
 
 def hook():
@@ -229,87 +264,119 @@ def main(args):
     return code
 
 
+def claude_acc():
+    return shutil.which("claude-acc") or str(Path.home() / ".local" / "bin" / "claude-acc")
+
+
 def start(rec, dry=False):
-    """Carry out a start; 0 when the orchestrator got its brief, 1 when a step failed."""
+    """Carry out a start, or resume a retried one at its first step that isn't ok; 0 when the
+    orchestrator got its brief, 1 when a step failed or the start was cancelled."""
     def step(name, status, text=""):
         if dry:
             print(f"would {name} {status}: {text}")
-        else:
-            print(f"{name} {status}: {text}", flush=True)
-            orch.start_step(rec, name, status, text,
-                            **({"folder": rec["folder"], "goal": rec["goal"], "by": rec["by"]}
-                               if name == "pane" else {}))
+            return
+        if orch.start_cancelled(rec):  # cancel() took over: no more steps
+            raise Cancelled
+        print(f"{name} {status}: {text}", flush=True)
+        orch.start_step(rec, name, status, text,
+                        **({"folder": rec["folder"], "goal": rec["goal"], "by": rec["by"]}
+                           if name == "pane" else {}))
 
+    ok = {s["step"] for s in rec.get("steps") or [] if s["status"] == "ok"}
+    restart = rec.pop("restart", False)  # a retry on another account: Claude again
     current = "pane"
     try:
-        if rec["worktree"]:
-            command = ["git", "-C", rec["folder"], "worktree", "add", rec["cwd"], "-b",
-                       f"orch/{rec['name']}"]
+        if "pane" in ok:
+            pane, h = rec["pane"], hook()
+        else:
+            if rec["worktree"] and not Path(rec["cwd"]).exists():
+                command = ["git", "-C", rec["folder"], "worktree", "add", rec["cwd"], "-b",
+                           f"orch/{rec['name']}"]
+                if dry:
+                    print("would run: " + " ".join(shlex.quote(a) for a in command))
+                else:
+                    out = subprocess.run(command, capture_output=True, text=True, timeout=120,
+                                         check=False)
+                    if out.returncode != 0:
+                        step("pane", "failed", "git worktree add failed: "
+                             + one_line(out.stderr or out.stdout)[:300])
+                        return 1
             if dry:
-                print("would run: " + " ".join(shlex.quote(a) for a in command))
+                pane = rec["pane"] = "<pane>"
             else:
-                out = subprocess.run(command, capture_output=True, text=True, timeout=120,
-                                     check=False)
-                if out.returncode != 0:
-                    step("pane", "failed", "git worktree add failed: "
-                         + one_line(out.stderr or out.stdout)[:300])
+                out = orch.herdr("tab", "create", "--cwd", rec["cwd"], "--label",
+                                 rec.get("name") or Path(rec["cwd"]).name, "--no-focus")
+                result = json.loads(out.stdout or "{}").get("result") or {}
+                pane = (result.get("root_pane") or {}).get("pane_id")
+                if out.returncode != 0 or not pane:
+                    step("pane", "failed", "herdr couldn't open a tab: "
+                         + one_line(out.stderr or out.stdout or "no answer")[:300])
                     return 1
-        if dry:
-            pane = rec["pane"] = "<pane>"
-        else:
-            out = orch.herdr("tab", "create", "--cwd", rec["cwd"], "--label",
-                             rec.get("name") or Path(rec["cwd"]).name, "--no-focus")
-            result = json.loads(out.stdout or "{}").get("result") or {}
-            pane = (result.get("root_pane") or {}).get("pane_id")
-            if out.returncode != 0 or not pane:
-                step("pane", "failed", "herdr couldn't open a tab: "
-                     + one_line(out.stderr or out.stdout or "no answer")[:300])
-                return 1
-            rec.update(tab=(result.get("tab") or {}).get("tab_id"), pane=pane)
-        h = hook()
-        base = orch.ROOT / rec["cwd"].strip("/").replace("/", "-").replace(":", "-")
-        if dry:
-            rec["lineage"] = str(base / f"{pane}-<time>-{rec['session'][:8]}")
-            print(brief_text(rec))
-        else:
-            lineage = h.new_lineage(base, rec["session"], pane)
-            with open(lineage / "decisions.md", "a") as f:
-                f.write(log_entries(rec["goal"], rec["rules"], rec["time"]))
-            h.seal(lineage)
-            rec["lineage"] = str(lineage)
-            Path(rec["brief"]).write_text(brief_text(rec))
-        step("pane", "ok", f"{pane} in a new tab in {rec['cwd']}; decision log "
-                           f"{rec['lineage']}/decisions.md; brief {rec['brief']}")
+                rec.update(tab=(result.get("tab") or {}).get("tab_id"), pane=pane)
+            h = hook()
+            base = orch.ROOT / rec["cwd"].strip("/").replace("/", "-").replace(":", "-")
+            if dry:
+                rec["lineage"] = str(base / f"{pane}-<time>-{rec['session'][:8]}")
+                print(brief_text(rec))
+            else:
+                lineage = h.new_lineage(base, rec["session"], pane)
+                with open(lineage / "decisions.md", "a") as f:
+                    f.write(log_entries(rec["goal"], rec["rules"], rec["time"]))
+                h.seal(lineage)
+                rec["lineage"] = str(lineage)
+                Path(rec["brief"]).write_text(brief_text(rec))
+            step("pane", "ok", f"{pane} in a new tab in {rec['cwd']}; decision log "
+                               f"{rec['lineage']}/decisions.md; brief {rec['brief']}")
 
         current = "claude"
-        acc = shutil.which("claude-acc") or str(Path.home() / ".local" / "bin" / "claude-acc")
-        args = ["--session-id", rec["session"]]
-        args += ["--model", rec["model"]] if rec["model"] else []
-        args += ["--effort", rec["effort"]] if rec["effort"] else []
-        command = (f"HANDOFF_LINEAGE={shlex.quote(rec['lineage'])} "
-                   + " ".join(shlex.quote(a) for a in [acc, rec["account"], *args]))
-        if not dry:
-            orch.herdr("pane", "run", pane, command)
-        step("claude", "doing", command)
-        if not dry:
-            how = ready(rec, pane, h.DIALOG_WAIT, step)
-            if how != "ready":
-                current = how
-                step(how, "failed", f"no ready agent in {pane} after running {command}"
-                     + (" (nobody answered the dialog)" if how == "trust" else ""))
-                return 1
-            if rec.get("name"):
-                orch.herdr("agent", "rename", pane, rec["name"])
-        step("claude", "ok", f"Claude is up in {pane} on account {rec['account']}")
+        if "claude" not in ok or restart:
+            here = not dry and pane in (orch.agents() or {})
+            if here and not restart:  # a retry: Claude is up already, maybe at a dialog
+                command = None
+                step("claude", "doing", f"waiting for Claude in {pane}")
+            else:
+                if here and not exit_agent(pane):
+                    step("claude", "failed", f"the Claude in {pane} did not quit for the restart")
+                    return 1
+                if any(s["step"] == "claude" for s in rec.get("steps") or []):
+                    rec["session"] = str(uuid.uuid4())  # the first one may be taken
+                args = ["--session-id", rec["session"]]
+                args += ["--model", rec["model"]] if rec["model"] else []
+                args += ["--effort", rec["effort"]] if rec["effort"] else []
+                command = (f"HANDOFF_LINEAGE={shlex.quote(rec['lineage'])} "
+                           + " ".join(shlex.quote(a) for a in [claude_acc(), rec["account"],
+                                                               *args]))
+                if not dry:
+                    orch.herdr("pane", "run", pane, command)
+                step("claude", "doing", command)
+            if not dry:
+                trust = any(s["step"] == "trust" and s["status"] == "doing"
+                            for s in rec.get("steps") or [])  # retried at the trust step
+                how = ready(rec, pane, h.DIALOG_WAIT, step, trust)
+                if how != "ready":
+                    current = how
+                    step(how, "failed", f"no ready agent in {pane}"
+                         + (f" after running {command}" if command else "")
+                         + (" (nobody answered the dialog)" if how == "trust" else ""))
+                    return 1
+                if rec.get("name"):
+                    orch.herdr("agent", "rename", pane, rec["name"])
+            step("claude", "ok", f"Claude is up in {pane} on account {rec['account']}")
 
         current = "run"
-        run = orch.new_run(pane, rec["until"], rec["goal"], {}, rec["cwd"], orch.now())
-        run["settings"] = {k: rec[k] for k in ("folder", "worktree", "model", "effort",
-                                               "worker_model", "max_workers", "plan_first",
-                                               "account")}
-        if not dry:
-            orch.save_run(pane, run, "start")
-        step("run", "ok", f"run {pane} until {orch.clock(rec['until'], True)}")
+        settings = {k: rec[k] for k in ("folder", "worktree", "model", "effort", "worker_model",
+                                        "max_workers", "plan_first", "account")}
+        if "run" in ok:
+            run = orch.load_run(pane)
+            if run and restart and not dry:
+                run["settings"] = settings
+                orch.save(orch.run_path(pane), run)
+        else:
+            run = orch.new_run(pane, rec["until"], rec["goal"], {}, rec["cwd"], orch.now())
+            run["settings"] = settings
+            if not dry:
+                orch.save_run(pane, run, "start")
+            step("run", "ok", f"run {pane} until {orch.clock(rec['until'], True)}")
 
         current = "read" if rec["plan_first"] else "brief"
         text = f"Read {rec['brief']} and do it."
@@ -320,16 +387,26 @@ def start(rec, dry=False):
              "reading the folder and writing the plan" if rec["plan_first"]
              else f"{pane} is working on the brief")
         return 0
+    except Cancelled:
+        print(f"{current}: cancelled", flush=True)
+        return 1
     except (OSError, ValueError, subprocess.SubprocessError) as e:
-        step(current, "failed", repr(e))
+        try:
+            step(current, "failed", repr(e))
+        except Cancelled:
+            pass
         return 1
 
 
-def ready(rec, pane, dialog_wait, step):
+def ready(rec, pane, dialog_wait, step, trust=False):
     """Wait for the new agent: "ready", or "claude"/"trust" for the step that timed out. Up to
-    READY_WAIT seconds, or dialog_wait once it sits at a dialog (the `trust` step)."""
-    blocked, deadline, trust = 0, orch.now() + READY_WAIT, False
+    READY_WAIT seconds, or dialog_wait once it sits at a dialog (the `trust` step; `trust`: it
+    was there already, a retry)."""
+    blocked = 0
+    deadline = orch.now() + (dialog_wait if trust else READY_WAIT)
     while orch.now() < deadline:
+        if orch.start_cancelled(rec):
+            raise Cancelled
         state = ((orch.agents() or {}).get(pane) or {}).get("agent_status")
         if state in ("idle", "done"):
             if trust:
@@ -366,5 +443,84 @@ def deliver(pane, text):
     return started()
 
 
-if __name__ == "__main__":  # spawn(): the gateway's start, saved by accept()
+
+def exit_agent(pane):
+    """Quit the Claude in the pane: "No" at the folder-trust question (that exits it), else Esc
+    at another dialog or while it works, then /exit. True once herdr lists no agent there."""
+    def state():
+        return ((orch.agents() or {}).get(pane) or {}).get("agent_status")
+
+    now = state()
+    keys = trust_keys(orch.screen_lines(pane, 40, "visible"), "deny") if now == "blocked" else None
+    if keys:
+        orch.herdr("agent", "send-keys", pane, *keys)
+    elif now:
+        if now in ("blocked", "working"):
+            orch.herdr("agent", "send-keys", pane, "esc")
+            orch.sleep(1)
+        orch.prompt(pane, "/exit")
+    deadline = orch.now() + EXIT_WAIT
+    while state() and orch.now() < deadline:
+        orch.sleep(1)
+    return not state()
+
+
+def cancel(rec, by):
+    """Cancel a start that isn't done: mark it (a start still running stops at its next step),
+    end its run, quit its Claude, then close the pane it opened; herdr drops the tab with its
+    last pane, and a tab someone else split stays. The worktree stays. Returns a sentence."""
+    orch.save(orch.STARTS / rec["id"] / "cancelled.json", {"time": orch.now(), "by": by})
+    pane, done = rec.get("pane"), []
+    run = orch.load_run(pane) if pane else {}
+    if orch.active(run):
+        run["ended"] = orch.now()
+        orch.save_run(pane, run, "stop")
+        done.append("run stopped")
+    if pane:
+        if not exit_agent(pane):
+            done.append(f"Claude didn't quit within {EXIT_WAIT} s")
+        orch.herdr("pane", "close", pane)
+        done.append(f"pane {pane} closed")
+        if rec.get("tab") and orch.herdr("tab", "get", rec["tab"]).returncode == 0:
+            done.append(f"tab {rec['tab']} kept: it has other panes")
+    text = "; ".join(done) or "nothing was open"
+    orch.emit("start-cancel", f"Start of {os.path.basename(rec.get('cwd') or '')} cancelled",
+              f"by {by}: {text}", pane, action=rec["id"], by=by)
+    return text
+
+
+def retry(rec, account, by):
+    """Run a failed start again from its failed step, detached; with `account`, Claude starts
+    again on that account. orch.Refused says why not."""
+    if orch.start_cancelled(rec):
+        orch.die(f"the start {rec['id']} was cancelled")
+    if rec.get("status") != "failed":
+        orch.die(f"the start {rec['id']} has not failed ({rec.get('step')} "
+                 f"{rec.get('status')}): nothing to retry")
+    failed = rec["step"]
+    if account is not None and str(account) != str(rec["account"]):
+        orch.check_account(str(account))
+        rec.update(account=str(account), restart="claude" in {s["step"] for s in rec["steps"]})
+        rec["steps"] = [s for s in rec["steps"] if s["step"] != "trust"]  # that account's own
+        if failed == "trust":
+            failed = "claude"
+    rec.setdefault("retries", []).append({"time": orch.now(), "by": by, "step": failed,
+                                          "account": rec["account"]})
+    orch.start_step(rec, failed, "doing", f"retry by {by}"
+                    + (f" on account {rec['account']}" if rec.get("restart") else ""))
+    spawn(rec["id"])
+
+
+def cannot_start(env):
+    """Why a start from the app can't work on this machine now, or None."""
+    if not paths(env.get("ORCH_START_ROOTS")):
+        return "starts from the app are off: ORCH_START_ROOTS is not set in ~/.config/orch/.env"
+    if orch.agents() is None:
+        return "herdr isn't running"
+    if not os.access(claude_acc(), os.X_OK):
+        return "claude-acc is not installed"
+    return None
+
+
+if __name__ == "__main__":  # spawn(): the gateway's start or retry, saved in new.json
     sys.exit(start(orch.load(orch.STARTS / sys.argv[1] / "new.json")))
