@@ -66,31 +66,34 @@ class Cancelled(Exception):
     """The start was cancelled while it ran (cancel())."""
 
 
-OPTION = re.compile(r"^\s*(?P<cursor>[❯›>])?\s*(?P<n>\d)\.\s+(?P<label>\S.*?)\s*$")
+OPTION = re.compile(r"^\s*(?P<cursor>[❯›>])?\s*(?:\d\.\s+)?(?P<label>(?:Yes|No)\b.*?)\s*$")
 
 
 def trust_keys(lines, choice):
     """The keys that pick "Yes" (allow) or "No" (deny) in Claude Code's folder-trust question
-    on a screen, or None when the screen shows something else: a question about trust whose
-    last numbered list has the cursor and both a Yes and a No option."""
-    if not lines or not any("trust" in line.lower() for line in lines):
+    on a screen, or None when the screen shows something else: a question about trust above a
+    last block of option lines (numbered or not) with the cursor, one Yes and one No. Claude
+    Code 2.x puts the cursor on "No, exit"."""
+    if not lines:
         return None
-    options, cursor = [], None
+    options, cursor, asked, after_text = [], None, False, True
     for line in lines:
+        if not line.strip():
+            continue
         m = OPTION.match(line)
         if not m:
+            asked, after_text = asked or "trust" in line.lower(), True
             continue
-        if m["n"] == "1":  # a new list: only the last one counts
-            options, cursor = [], None
+        if after_text:  # a new block of options: only the last one counts
+            options, cursor, after_text = [], None, False
         if m["cursor"]:
             cursor = len(options)
         options.append(m["label"])
-    want = [i for i, label in enumerate(options)
-            if label.startswith("Yes" if choice == "allow" else "No")]
-    if cursor is None or len(want) != 1 or not any(o.startswith("No") for o in options) \
-            or not any(o.startswith("Yes") for o in options):
+    yes = [i for i, label in enumerate(options) if label.startswith("Yes")]
+    no = [i for i, label in enumerate(options) if label.startswith("No")]
+    if not asked or cursor is None or len(yes) != 1 or len(no) != 1:
         return None
-    moves = want[0] - cursor
+    moves = (yes if choice == "allow" else no)[0] - cursor
     return ["down" if moves > 0 else "up"] * abs(moves) + ["enter"]
 
 

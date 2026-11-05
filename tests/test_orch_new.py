@@ -322,27 +322,35 @@ def test_a_phone_start_stays_inside_the_start_roots(world):
 
 
 TRUST_SCREEN = """\
- Do you trust the files in this folder?
+❯ Yes, a shell prompt that happens to start like an answer
+ Accessing workspace:
 
  /home/me/Repo/my-app
 
- 1. Earlier output that happens to be numbered
- 2. More of it
+ Quick safety check: Is this a project you created or one you trust? (Like your own code, a
+ well-known open source project, or work from your team).
 
- Claude Code may read, write, or execute files contained in this directory.
+ {a} No, exit
+ {b} Yes, I trust this folder
 
- {a} 1. Yes, proceed
- {b} 2. No, exit
+ Enter to confirm · Esc to cancel"""  # Claude Code 2.x, cursor on "No, exit" at first
+NUMBERED = """\
+ Do you trust the files in this folder?
 
- Enter to confirm · Esc to exit"""
+ ❯ 1. Yes, proceed
+   2. No, exit
+
+ Enter to confirm · Esc to exit"""  # an older Claude Code
 
 
 @pytest.mark.parametrize(("cursor", "choice", "keys"), [
-    (0, "allow", ["enter"]), (0, "deny", ["down", "enter"]),
-    (1, "allow", ["up", "enter"]), (1, "deny", ["enter"])])
+    (0, "allow", ["down", "enter"]), (0, "deny", ["enter"]),
+    (1, "allow", ["enter"]), (1, "deny", ["up", "enter"])])
 def test_trust_keys_move_from_the_cursor_to_yes_or_no(world, cursor, choice, keys):
     screen = TRUST_SCREEN.format(a="❯" if cursor == 0 else " ", b="❯" if cursor == 1 else " ")
     assert world.new.trust_keys(screen.split("\n"), choice) == keys
+    assert world.new.trust_keys(NUMBERED.split("\n"), choice) == (
+        ["enter"] if choice == "allow" else ["down", "enter"])
 
 
 @pytest.mark.parametrize("screen", [

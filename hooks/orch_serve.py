@@ -563,7 +563,8 @@ class Gateway:
     def folders(self, q, limit):
         """GET /v1/folders: the git checkouts a start may use (ORCH_START_ROOTS and their
         children, and the herdr panes' checkouts under them, never under ORCH_START_EXCLUDE),
-        newest work first, with the orchestrator working there and whether Claude trusts it."""
+        newest work first, with the orchestrator working there and whether Claude trusts it (that
+    folder itself: Claude Code asks again in a child of a trusted folder)."""
         env = read_env(self.config)
         roots = orch_new.paths(env.get("ORCH_START_ROOTS"))
         exclude = orch_new.paths(env.get("ORCH_START_EXCLUDE"))
@@ -595,7 +596,7 @@ class Gateway:
             out.append({"path": shown, "branch": branch_of(gd), "last_activity": last_work(path, gd),
                         "orchestrator": {"pane": lead, "name": lead_name(lead, run, ags.get(lead))}
                         if run else None,
-                        "trusted": any(t in trust for t in [path, *path.parents])})
+                        "trusted": path in trust})  # a trusted parent doesn't count
         out.sort(key=lambda f: -(f["last_activity"] or 0))
         return out[:limit]
 

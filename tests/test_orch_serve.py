@@ -20,17 +20,26 @@ HOOKS = Path(__file__).resolve().parent.parent / "hooks"
 BOSS, W1, W2, LOOSE = "w1:p0", "w1:p1", "w1:p2", "w1:p9"
 NEW = "w1:p5"  # the pane `herdr tab create` opens
 TRUST = """\
- Do you trust the files in this folder?
+my-app on  main
+❯ /home/me/.local/bin/claude-acc 2 --session-id 0e1f --model sonnet
+
+────────────────────────────────────────────────────────────────────
+ Accessing workspace:
 
  /home/me/Repo/my-app
 
- Claude Code may read, write, or execute files contained in this directory. This can pose
- security risks, so only use files from trusted sources.
+ Quick safety check: Is this a project you created or one you trust? (Like your own code, a
+ well-known open source project, or work from your team). If not, take a moment to review
+ what's in this folder first.
 
- ❯ 1. Yes, proceed
-   2. No, exit
+ Claude Code'll be able to read, edit, and execute files here.
 
- Enter to confirm · Esc to exit"""
+ Security guide
+
+ ❯ No, exit
+   Yes, I trust this folder
+
+ Enter to confirm · Esc to cancel"""  # Claude Code 2.x, as seen live on 2026-11-05
 T0 = datetime(2026, 11, 5, 10, 0).timestamp()  # noqa: DTZ001 orch works in local time
 TOKEN = "t0ken-for-tests"
 
@@ -81,9 +90,10 @@ class World:
             self.agent(args[2], "idle")
             self.agents[args[2]]["cwd"] = self.tab_cwd
         if args[:2] == ("agent", "send-keys") and args[-1] == "enter" and "trust" in self.screen:
-            lines = self.screen.split("\n")  # the cursor starts on option 1
-            first = next(i for i, line in enumerate(lines) if "1." in line)
-            if "No, exit" in lines[first + args.count("down") - args.count("up")]:
+            lines = self.screen.split("\n")
+            cursor = next(i for i, line in enumerate(lines)
+                          if line.strip().startswith("❯ No") or line.strip().startswith("❯ Yes"))
+            if "No, exit" in lines[cursor + args.count("down") - args.count("up")]:
                 self.agents.pop(args[2], None)  # Claude quits
             else:
                 self.agents[args[2]]["agent_status"] = "idle"
@@ -984,7 +994,7 @@ def test_retry_on_another_account_restarts_claude_after_nobody_trusted_the_folde
     rec = world.orch.load(world.orch.STARTS / "st1" / "new.json")
     assert [(s["step"], s["status"]) for s in rec["steps"]] == [
         ("pane", "ok"), ("claude", "ok"), ("run", "ok"), ("read", "doing")]
-    assert ("agent", "send-keys", NEW, "down", "enter") in world.herdr_calls  # "No, exit"
+    assert ("agent", "send-keys", NEW, "enter") in world.herdr_calls  # "No, exit", the default
     second = [c[3] for c in world.herdr_calls if c[:2] == ("pane", "run")][-1]
     assert f" 1 --session-id {rec['session']} " in second and rec["session"] != first
     assert world.orch.load_run(NEW)["settings"]["account"] == "1"
@@ -1026,7 +1036,7 @@ def test_the_app_answers_only_a_new_orchestrators_trust_question(world, monkeypa
     world.screen = TRUST
     assert not [c for c in world.herdr_calls if c[:2] == ("agent", "send-keys")]
     assert from_phone(world, gw, **answer)[0] == 202
-    assert ("agent", "send-keys", NEW, "enter") in world.herdr_calls
+    assert ("agent", "send-keys", NEW, "down", "enter") in world.herdr_calls  # from "No, exit"
     assert world.agents[NEW]["agent_status"] == "idle"
     [event] = [e for e in world.events() if e["kind"] == "trust"]
     assert event["pane"] == NEW and event["action"] == "st1" and event["choice"] == "allow"
@@ -1039,7 +1049,7 @@ def test_denying_the_trust_question_quits_claude_and_cancels_the_start(world, mo
     gw = world.serve.Gateway()
     world.orch.start_step(trust_step(world, gw), "trust", "doing")
     assert world.post(gw, kind="dialog", pane=NEW, change=4, choice="deny")[0] == 202
-    assert ("agent", "send-keys", NEW, "down", "enter") in world.herdr_calls
+    assert ("agent", "send-keys", NEW, "enter") in world.herdr_calls
     assert NEW not in world.agents and ("pane", "close", NEW) in world.herdr_calls
     assert world.orch.start_cancelled({"id": "st1"})["by"] == "the app"
     assert [e["kind"] for e in world.events()][-3:] == ["trust", "start-cancel", "action"]
@@ -1108,7 +1118,8 @@ def test_folders_lists_the_checkouts_under_the_roots_newest_work_first(world, tm
     start_run(world)  # BOSS ("Website") works in ~/Repo/app
     (world.home / ".claude.json").write_text(json.dumps({"projects": {
         str(repo / "app"): {"hasTrustDialogAccepted": True},
-        str(work): {"hasTrustDialogAccepted": True},  # trusts the folders under it
+        str(work): {"hasTrustDialogAccepted": True},  # not its children: Claude asks there again
+        str(work / "old"): {"hasTrustDialogAccepted": True},
         str(repo / "app-wt"): {"hasTrustDialogAccepted": False}}}))
     (world.home / ".claude-2" / ".claude.json").write_text(json.dumps({"projects": {}}))
     status, folders = world.get(gw, "/v1/folders")
@@ -1119,7 +1130,7 @@ def test_folders_lists_the_checkouts_under_the_roots_newest_work_first(world, tm
         ("~/work/old", "main", world.t - 60, True),
         ("~/Repo/app", "main", world.t - 3600, True),
         ("~/Repo/app-wt", "01234567", world.t - 7200, False),
-        ("~/work/deep/lib", "main", world.t - 9000, True)]
+        ("~/work/deep/lib", "main", world.t - 9000, False)]
     assert folders[1]["orchestrator"] == {"pane": BOSS, "name": "Website"}
     assert [f["orchestrator"] for f in folders if f["path"] != "~/Repo/app"] == [None] * 3
     assert [f["path"] for f in world.get(gw, "/v1/folders?q=APP&limit=1")[1]] == ["~/Repo/app"]
