@@ -232,8 +232,8 @@ ORCH_REPORT = {"time": NUM, "summary": str,
                "waiting_on?": [{"who": str, "what": str, "eta?": str}], "next?": [str],
                "roadmap?": [{"id?": str, "title": str, "owner?": str, "eta?": str, "why?": str,
                              "status": {"done", "doing", "next", "later", "blocked"}}],
-               "risks?": [str], "milestones?": [dict], "suggestions?": [str],
-               "source": {"report", "handoff"}}
+               "roadmap_time?": NUM, "risks?": [str], "milestones?": [dict],
+               "suggestions?": [str], "source": {"report", "handoff"}}
 WORKER_REPORT = {"time": NUM, "summary": str, "status?": {"done", "partial", "blocked"},
                  "tests?": [{"cmd": str, "passed?": int, "failed?": int}],
                  "changed_files?": [{"path": str, "added?": int, "removed?": int}],
@@ -706,6 +706,155 @@ def test_an_agent_herdr_cant_read_is_unknown_not_working(world):
     assert builder["state"] == "unknown" and builder["agent_status"] == "unknown"
     assert lead["agent"]["state"] == "unknown"
     assert lead["activity"] == "working" and lead["stall"] is None  # nothing shows it stopped
+
+
+def test_the_fleet_keeps_a_plan_across_reports_and_says_where_it_came_from(world):
+    """`source` says where the plan came from, so it goes with the plan and not with the report
+    that happens to be the latest."""
+    busy_fleet(world)
+    gw = world.serve.Gateway()
+    lead = lambda: gw.fleet()[1]["orchestrators"][0]["report"]
+    written = world.t - 400
+    assert lead()["roadmap_time"] == written and lead()["source"] == "report"
+    conforms(lead(), ORCH_REPORT)
+
+    world.t += 60
+    world.orch.write_report(BOSS, {"role": "orchestrator", "time": world.t, "summary": "5 of 9"})
+    assert [r["title"] for r in lead()["roadmap"]] == ["flaky test"]
+    assert lead()["roadmap_time"] == written and lead()["time"] == world.t
+    conforms(lead(), ORCH_REPORT)
+
+    path = world.root / "agents" / "w1-p0.json"
+    status = json.loads(path.read_text())
+    status["report"]["source"] = "handoff"
+    path.write_text(json.dumps(status))
+    world.orch.write_report(BOSS, {"role": "orchestrator", "time": world.t, "summary": "6 of 9"})
+    assert lead()["source"] == "handoff"
+
+    world.orch.write_report(BOSS, {"role": "orchestrator", "time": world.t, "summary": "7 of 9",
+                                   "roadmap": [{"title": "ship", "status": "next"}]})
+    assert lead()["source"] == "report" and lead()["roadmap_time"] == world.t
+
+
+PLAN = [{"title": "flaky test", "status": "next", "owner": "builder"}]
+
+
+def old_session_reports(w, pane, role="orchestrator", **fields):
+    """What the MCP server of a session started before plans were kept does: write_report as it
+    loaded it, the whole report over the last one, and the same report in the log."""
+    report = dict({"role": role, "time": w.t, "summary": "s"}, **fields)
+    path = w.root / "agents" / f"{pane.replace(':', '-')}.json"
+    w.orch.save(path, dict(w.orch.load(path) or {"pane": pane}, report=report))
+    w.orch.emit("report", "Orchestrator report", report["summary"], pane, report=report)
+
+
+def new_session_reports(w, pane, **fields):
+    w.orch.write_report(pane, dict({"role": "orchestrator", "time": w.t, "summary": "s"}, **fields))
+
+
+def lead_report(gw, pane=BOSS):
+    return next(o for o in gw.fleet()[1]["orchestrators"] if o["pane"] == pane)["report"]
+
+
+def test_the_fleet_gives_an_old_sessions_report_its_plan_back_from_the_log(world):
+    start_run(world)
+    gw = world.serve.Gateway()
+    written = world.t
+    old_session_reports(world, BOSS, roadmap=PLAN, next=["deploy"])
+    assert lead_report(gw)["roadmap_time"] == written  # a report with its own plan has it too
+    conforms(lead_report(gw), ORCH_REPORT)
+
+    world.t += 60
+    old_session_reports(world, BOSS, summary="no plan in this one")
+    stored = json.loads((world.root / "agents" / "w1-p0.json").read_text())["report"]
+    assert "roadmap" not in stored  # lost on disk, as on the machines today: nothing is rewritten
+
+    report = lead_report(gw)
+    assert report["roadmap"] == PLAN and report["roadmap_time"] == written
+    assert report["time"] == world.t and report["summary"] == "no plan in this one"
+    assert "next" not in report and report["source"] == "report"
+    conforms(report, ORCH_REPORT)
+    assert lead_report(world.serve.Gateway()) == report  # from the log: a restart changes nothing
+
+
+def test_an_old_session_clears_the_plan_with_an_empty_roadmap(world):
+    start_run(world)
+    gw = world.serve.Gateway()
+    old_session_reports(world, BOSS, roadmap=PLAN)
+    world.t += 60
+    cleared = world.t
+    old_session_reports(world, BOSS, roadmap=[])
+    assert lead_report(gw)["roadmap"] == [] and lead_report(gw)["roadmap_time"] == cleared
+    world.t += 60
+    old_session_reports(world, BOSS)
+    assert lead_report(gw)["roadmap"] == [] and lead_report(gw)["roadmap_time"] == cleared
+
+
+def test_old_and_new_sessions_on_a_pane_share_one_plan(world):
+    """A takeover can put a new session after an old one, in either order of the two writers."""
+    start_run(world)
+    gw = world.serve.Gateway()
+    first = world.t
+    old_session_reports(world, BOSS, roadmap=PLAN)
+    world.t += 60
+    old_session_reports(world, BOSS)
+    world.t += 60
+    new_session_reports(world, BOSS)  # nothing in its status file to keep: the log still has it
+    assert lead_report(gw)["roadmap"] == PLAN and lead_report(gw)["roadmap_time"] == first
+
+    world.t += 60
+    newer, second = [{"title": "ship", "status": "doing"}], world.t
+    new_session_reports(world, BOSS, roadmap=newer)
+    world.t += 60
+    new_session_reports(world, BOSS)
+    assert lead_report(gw)["roadmap"] == newer and lead_report(gw)["roadmap_time"] == second
+    world.t += 60
+    old_session_reports(world, BOSS)  # the whole report over the kept plan
+    assert lead_report(gw)["roadmap"] == newer and lead_report(gw)["roadmap_time"] == second
+
+    world.t += 60
+    new_session_reports(world, BOSS, roadmap=[])
+    world.t += 60
+    old_session_reports(world, BOSS)
+    assert lead_report(gw)["roadmap"] == []
+
+
+def test_a_plan_stays_with_its_pane_and_a_worker_gets_none(world):
+    busy_fleet(world)
+    gw = world.serve.Gateway()
+    old_session_reports(world, LOOSE)
+    old_session_reports(world, W1, role="worker", roadmap=PLAN)
+    old_session_reports(world, W1, role="worker", status="done")
+    _, fleet = gw.fleet()
+    assert not {"roadmap", "roadmap_time"} & set(lead_report(gw, LOOSE))
+    [boss] = [o for o in fleet["orchestrators"] if o["pane"] == BOSS]
+    [builder] = [w for w in boss["workers"] if w["pane"] == W1]
+    assert "roadmap" not in builder["report"]
+
+
+def test_a_lead_with_no_report_gets_no_plan_from_the_log(world):
+    start_run(world)
+    gw = world.serve.Gateway()
+    old_session_reports(world, BOSS, roadmap=PLAN)
+    (world.root / "agents" / "w1-p0.json").unlink()
+    assert lead_report(gw) is None
+
+
+def test_a_stall_fix_and_a_state_push_use_the_plan_from_the_log(world, cloud):
+    busy_fleet(world)
+    gw = world.serve.Gateway()
+    pair(world, gw)
+    world.t += 60
+    old_session_reports(world, BOSS, state="waiting_on_workers")
+
+    [boss] = [o for o in gw.fleet()[1]["orchestrators"] if o["pane"] == BOSS]
+    [idle] = [r for r in boss["stall"]["reasons"] if r.get("pane") == W1]
+    assert idle["fix"] == "Assign: flaky test"  # the next item of the plan, for the idle builder
+    cloud.pushes.clear()
+    gw.pusher.cycle()
+    [state] = [p for p in cloud.pushes if p["message"]["kind"] == "state"
+               and p["message"]["orchestrator"] == BOSS]
+    assert [r["title"] for r in state["message"]["body"]["report"]["roadmap"]] == ["flaky test"]
 
 
 def test_the_fleet_has_the_run_cost_from_the_background_pass_only(world, monkeypatch):

@@ -91,6 +91,30 @@ def run(hook, tmp_path, monkeypatch, capsys):
     return run
 
 
+def test_a_new_agents_first_report_keeps_the_plan_of_the_takeover(hook, run, monkeypatch):
+    """A takeover is a new session in the same pane: the hook rewrites the status file, then the
+    new agent reports, usually before it has a plan of its own to send."""
+    spec = importlib.util.spec_from_file_location("orch_for_takeover", HOOK.parent / "orch.py")
+    orch = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(orch)
+    monkeypatch.setattr(orch, "ROOT", hook.ROOT)
+    monkeypatch.setattr(hook, "IN_HERDR", True)
+    monkeypatch.setenv("HERDR_PANE_ID", PANE)
+    plan = [{"title": "Deploy 2.14", "status": "next"}]
+    run("SessionStart", session="s1", source="startup")
+    orch.write_report(PANE, {"role": "orchestrator", "time": 100, "summary": "old", "roadmap": plan})
+    run("Stop", session="s1")
+
+    run("SessionStart", session="s2", source="clear")
+    assert json.loads(hook.status_path(PANE).read_text())["session"] == "s2"
+    orch.write_report(PANE, {"role": "orchestrator", "time": 200, "summary": "took over"})
+    run("Stop", session="s2")
+
+    status = json.loads(hook.status_path(PANE).read_text())
+    assert status["session"] == "s2" and status["report"]["summary"] == "took over"
+    assert status["report"]["roadmap"] == plan and status["report"]["roadmap_time"] == 100
+
+
 def lineages(hook):
     return sorted((hook.ROOT / "work-proj").glob("*-*"))
 
