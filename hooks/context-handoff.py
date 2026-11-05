@@ -19,14 +19,21 @@ gen-NN.md (consumed handoffs). A takeover passes the folder on through HANDOFF_L
 /clear or compaction that consumes a pending handoff keeps it; any other start begins a new
 one at its first notice.
 
+Inside herdr, every turn end also records the agent's state in
+~/.claude/handoffs/agents/<pane>.json (background tasks still running, last message), which
+`orch` (hooks/orch.py) uses to tell a finished worker from one waiting on its own job.
+
 Thresholds can be overridden per project in that project's .claude/settings.local.json
-"env" block. Respawns are logged to ~/.claude/handoffs/respawn.log.
+"env" block. Respawns are logged to ~/.claude/handoffs/respawn.log, and failures also go to
+~/.claude/handoffs/events.jsonl and the owner's notify command (see orch.py).
 """
 import json
 import os
+import re
 import shlex
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import time
@@ -51,6 +58,10 @@ COMPACT = tokens_env("CLAUDE_CODE_AUTO_COMPACT_WINDOW", 633_000) - 33_000
 SOFT = tokens_env("HANDOFF_SOFT_TOKENS", 400_000)
 URGENT = tokens_env("HANDOFF_URGENT_TOKENS", COMPACT - 50_000)
 INLINE_LIMIT = 9_000  # Claude Code caps injected context at 10,000 characters
+FULL_LOG_LIMIT = 30_000  # a decision log up to this size is read in full at a takeover
+RECENT_LIMIT = 60_000  # past it, the index plus the latest generations, up to about this size
+INDEX_WIDTH = 160  # characters of each entry's first line kept in the index
+ENTRY = re.compile(r"\s{0,3}(?:[-*]\s+)?(?:\*\*)?D\d+\b")  # "- **D12** ...", "D12. ..."
 ROOT = Path.home() / ".claude" / "handoffs"
 SEALED = ".decisions.sealed"  # the log as of the last handoff, for the append-only check
 POLICY = "Context handoff policy (configured by the user in ~/.claude/settings.json)"
@@ -76,8 +87,9 @@ paraphrase; reference files instead of pasting large content.
 
 LOG_RULES = """\
 Decisions and ruled-out approaches go in the decision log at {log}, not in the handoff. The \
-log covers this piece of work across every agent that takes it over, and each new agent reads \
-it in full. It is append-only: earlier entries are never edited, shortened or removed, and a \
+log covers this piece of work across every agent that takes it over. Each new agent reads an \
+index of it (the first line of every entry) and the latest generations in full, so the first \
+line of an entry says on its own what was decided and by whom. It is append-only: earlier entries are never edited, shortened or removed, and a \
 decision that changes gets a new entry naming the one it replaces. One entry per decision, \
 numbered D1, D2, ... continuing from the last one: date and time, who decided (the user, \
 quoted verbatim, or the agent), what was chosen or ruled out, and why, with the evidence \
@@ -88,8 +100,9 @@ decisions, and the approaches ruled out."""
 LOG_HEADER = """\
 # Decision log
 
-Started {started}. It covers this piece of work across every agent that takes it over, and \
-each new agent reads it in full. Append-only: entries are never edited, shortened or removed, \
+Started {started}. It covers this piece of work across every agent that takes it over. Each \
+new agent reads its index (the first line of every entry) and the latest generations in full, \
+so an entry's first line says what was decided and by whom. Append-only: entries are never edited, shortened or removed, \
 and a decision that changes gets a new entry naming the one it replaces. Each entry: D<n>, \
 date and time, who decided (the user, quoted verbatim, or the agent), what was chosen or ruled \
 out, and why.
@@ -110,12 +123,15 @@ else:
              "continues.")
 
 NEXT_PROMPT = (
-    "Context handoff: the previous agent in this pane reached its context threshold. Read "
-    "the decision log {log} in full, then its handoff {path}. Re-check the claims in the "
-    "handoff's Verify first section, then continue from its next steps, adding entries to the "
-    "decision log as decisions are made (append-only; the rules are at its top). Continue "
-    "only work the user already asked for; if the work is complete or the next step needs "
-    "the user's decision, summarize where things stand and wait.")
+    "Context handoff: the previous agent in this pane reached its context threshold. With the "
+    "Read tool (cat cuts long output to a preview), read {reading}, then its handoff {path}. "
+    "Re-check the claims in the handoff's Verify first section, then continue from its next "
+    "steps, adding entries to the decision log {log} as decisions are made (append-only; the "
+    "rules are at its top). Continue only work the user already asked for; if the work is "
+    "complete or the next step needs the user's decision, summarize where things stand and "
+    "wait.{extra}")
+AGENTS = "agents"  # ROOT/agents/<pane>.json: each herdr agent's latest turn end, read by orch
+GOAL_OFF = {"", "clear", "off", "stop", "cancel", "none", "reset"}
 
 # claude flags dropped when relaunching: session identity, the old initial prompt, and the
 # model/effort, which are re-added from the live session.
@@ -263,6 +279,158 @@ def consume(lineage, how):
     return gen
 
 
+def write_index(lineage):
+    """decisions-index.md: the first line of every log entry, under its generation."""
+    log = lineage / "decisions.md"
+    out = [f"# Index of {log}", "",
+           (f"The first line of each entry, cut at {INDEX_WIDTH} characters, in log order. Look "
+            "an entry up in the log by its D-number before relying on it.")]
+    for line in log.read_text(errors="replace").splitlines():
+        if line.startswith("## Generation"):
+            out += ["", line]
+        elif ENTRY.match(line):
+            text = line.strip()
+            out.append(text if len(text) <= INDEX_WIDTH else text[:INDEX_WIDTH - 1] + "\u2026")
+    index = lineage / "decisions-index.md"
+    index.write_text("\n".join(out) + "\n")
+    return index
+
+
+def log_reading(lineage):
+    """What a new agent reads of the decision log: all of it while it is small, else its index
+    and the latest generations (the one just finished, and the one before it if that fits)."""
+    log = lineage / "decisions.md"
+    text = log.read_text(errors="replace")
+    if len(text.encode()) <= FULL_LOG_LIMIT:
+        return f"the decision log {log} in full"
+    lines = text.splitlines(keepends=True)
+    starts = [i for i, line in enumerate(lines) if line.startswith("## Generation")]
+    # The last header is the generation starting now; the one before it just finished.
+    candidates = starts[-3:-1] if len(starts) >= 2 else starts[:1] or [0]
+    start = candidates[-1]
+    for i in candidates:
+        if len("".join(lines[i:]).encode()) <= RECENT_LIMIT:
+            start = i
+            break
+    return (f"the decision log's index {write_index(lineage)} (the first line of every entry), "
+            f"then the log {log} from line {start + 1} to the end (the latest generations, in "
+            "full); look older entries up in the log by D-number when they bear on the work")
+
+
+def status_path(pane):
+    return ROOT / AGENTS / f"{pane.replace(':', '-')}.json"
+
+
+def last_text(transcript, limit=4000):
+    """The latest main-chain assistant text in the transcript (its first `limit` characters)."""
+    try:
+        with open(transcript, "rb") as f:
+            size = f.seek(0, os.SEEK_END)
+            f.seek(max(0, size - (4 << 20)))
+            lines = f.read().splitlines()
+    except OSError:
+        return ""
+    for line in reversed(lines):
+        if b'"assistant"' not in line or b'"text"' not in line:
+            continue
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue
+        if entry.get("type") != "assistant" or entry.get("isSidechain"):
+            continue
+        texts = [c.get("text") or "" for c in (entry.get("message") or {}).get("content") or []
+                 if isinstance(c, dict) and c.get("type") == "text"]
+        texts = [t.strip() for t in texts if t.strip()]
+        if texts:
+            return texts[-1][:limit]
+    return ""
+
+
+def write_status(data, event):
+    """Record this herdr agent's turn end for orch: the background tasks still running (then it
+    is waiting on its own job, not finished) and its last message."""
+    tasks = [t for t in data.get("background_tasks") or [] if isinstance(t, dict)]
+    status = {"pane": os.environ["HERDR_PANE_ID"], "session": data.get("session_id"),
+              "cwd": data.get("cwd"), "event": event, "time": time.time(),
+              "background_tasks": [
+                  {"type": t.get("type"), "id": t.get("id"),
+                   "what": (t.get("description") or t.get("command") or "")[:200]}
+                  for t in tasks]}
+    if event == "Stop":
+        last = data.get("last_assistant_message")
+        status["last"] = (last if isinstance(last, str) and last.strip()
+                          else last_text(data.get("transcript_path") or ""))[:4000]
+    path = status_path(status["pane"])
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}")
+    tmp.write_text(json.dumps(status))
+    os.replace(tmp, path)
+
+
+def active_goal(transcript):
+    """The condition of the session's /goal while it is set and unmet, else None."""
+    goal = None
+    try:
+        with open(transcript, "rb") as f:
+            for line in f:
+                if b"goal" not in line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except ValueError:
+                    continue
+                attachment = entry.get("attachment") or {}
+                if attachment.get("type") == "goal_status":
+                    goal = None if attachment.get("met") else attachment.get("condition")
+                    continue
+                content = (entry.get("message") or {}).get("content")
+                if entry.get("type") == "user" and isinstance(content, str):
+                    m = re.search(r"<command-name>/goal</command-name>.*?"
+                                  r"<command-args>(.*?)</command-args>", content, re.DOTALL)
+                    if m:
+                        args = m.group(1).strip()
+                        goal = None if args.lower() in GOAL_OFF else args
+    except OSError:
+        return None
+    return goal or None
+
+
+def emit(kind, title, body, pane=None, push=False):
+    """Append an event to ~/.claude/handoffs/events.jsonl and, with push, hand it to the
+    owner's notify command ($ORCH_NOTIFY_CMD, else an executable ~/.claude/handoffs/notify)
+    as `<command> <title> <body>`, with ORCH_EVENT_KIND set."""
+    event = {"time": time.time(), "host": socket.gethostname(), "kind": kind, "pane": pane,
+             "title": title, "body": body}
+    ROOT.mkdir(parents=True, exist_ok=True)
+    with open(ROOT / "events.jsonl", "a") as f:
+        f.write(json.dumps(event) + "\n")
+    notify = os.environ.get("ORCH_NOTIFY_CMD") or (
+        str(ROOT / "notify") if os.access(ROOT / "notify", os.X_OK) else "")
+    if push and notify:
+        try:
+            subprocess.run(shlex.split(notify) + [title, body], capture_output=True, timeout=20,
+                           env=dict(os.environ, ORCH_EVENT_KIND=kind), check=False)
+        except (OSError, subprocess.SubprocessError):
+            pass
+
+
+def takeover_notes(pane, goal):
+    """Extra lines for the takeover prompt: the pane's orch run and the user's /goal."""
+    notes = ""
+    run = load(ROOT / "runs" / f"{pane.replace(':', '-')}.json")
+    if run and not run.get("ended") and (run.get("until") or 0) > time.time():
+        until = time.strftime("%Y-%m-%d %H:%M", time.localtime(run["until"]))
+        notes += (f" This pane runs an orchestration that carries over (orch run, until {until}"
+                  f"{', goal: ' + json.dumps(run['goal']) if run.get('goal') else ''}): run "
+                  "`orch status`, give every idle worker its next task or park it, then keep one "
+                  "`orch wait` armed.")
+    if goal:
+        notes += (f" The previous agent worked under the user's /goal {json.dumps(goal)}; it is "
+                  "set again for you right after this prompt.")
+    return notes
+
+
 def claude_pid():
     """PID of the claude process that runs this hook (the nearest claude ancestor)."""
     pid = os.getppid()
@@ -307,7 +475,9 @@ def start_respawn(data, lineage, model):
     env = {k: os.environ[k] for k in ("CLAUDE_CONFIG_DIR",) if os.environ.get(k)}
     job = {"pane": os.environ["HERDR_PANE_ID"], "pid": pid, "dir": str(lineage),
            "args": relaunch_args([a.decode() for a in argv if a], model, effort),
-           "env": {"HANDOFF_LINEAGE": str(lineage), **env}}
+           "env": {"HANDOFF_LINEAGE": str(lineage), **env},
+           "session": data.get("session_id"), "transcript": data.get("transcript_path"),
+           "created": time.time()}
     subprocess.Popen([sys.executable, os.path.abspath(__file__), "--respawn", json.dumps(job)],
                      stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                      stderr=subprocess.DEVNULL, start_new_session=True)
@@ -338,16 +508,48 @@ def respawn(job):
         say("FAILED: " + text)
         herdr("notification", "show", "Handoff respawn failed",
               "--body", f"{pane}: {text} (see {log})")
+        emit("respawn-failed", "Handoff respawn failed", f"{pane}: {text}", pane, push=True)
+
+    def postpone(text):
+        """Leave the old agent be; its next turn end starts the takeover again."""
+        if job.get("session"):
+            state_path = ROOT / "state" / f"{job['session']}.json"
+            state = load(state_path)
+            for key in ("respawned", "stop_tasks"):
+                state.pop(key, None)
+            state_path.write_text(json.dumps(state))
+        say("postponed: " + text)
 
     def pane_agent():
         agents = json.loads(herdr("agent", "list").stdout)["result"]["agents"]
         return next((a for a in agents if a.get("pane_id") == pane), None)
 
+    def status():
+        return (pane_agent() or {}).get("agent_status")
+
+    def started():
+        return herdr("agent", "wait", pane, "--until", "working", "--timeout", "30000",
+                     timeout=60).returncode == 0
+
     try:
         agent = json.loads(herdr("agent", "get", pane).stdout)["result"]["agent"]
         name = agent.get("name")
         time.sleep(3)  # let the remaining Stop hooks and the turn finish
-        herdr("agent", "wait", pane, "--timeout", "60000")
+        # Another Stop hook (a /goal, for one) can keep the turn going after this one asked
+        # for the takeover. /exit typed into a working agent would cut it off mid-task.
+        for _ in range(30):
+            herdr("agent", "wait", pane, "--timeout", "60000", timeout=90)
+            if status() != "working":
+                break
+        else:
+            return postpone("the agent was still working 30 minutes after its handoff")
+        if status() == "blocked":
+            return postpone("the agent is waiting at an approval or question dialog")
+        last = load(status_path(pane))
+        if (last.get("session") == job.get("session") and last.get("background_tasks")
+                and (last.get("time") or 0) >= (job.get("created") or 0)):
+            return postpone(f"{len(last['background_tasks'])} background task(s) were started "
+                            "after the handoff")
         herdr("agent", "prompt", pane, "/exit")
         for sig, wait in ((None, 20), (signal.SIGTERM, 10), (signal.SIGKILL, 5)):
             if sig and alive():
@@ -384,9 +586,28 @@ def respawn(job):
         time.sleep(2)  # let the input box settle before prompting
         if name:
             herdr("agent", "rename", pane, name)
-        herdr("agent", "prompt", pane,
-              NEXT_PROMPT.format(log=lineage / "decisions.md", path=saved))
-        say(f"respawned {name or '(unnamed)'}: {command}; handoff {saved}")
+        goal = active_goal(job.get("transcript") or "")
+        prompt = NEXT_PROMPT.format(reading=log_reading(lineage), path=saved,
+                                    log=lineage / "decisions.md", extra=takeover_notes(pane, goal))
+        # A submitted prompt doesn't prove the agent started (2026-11-02: the takeover sat
+        # unstarted for 9 hours). Check, press Enter if the text is still in the input box,
+        # then send it once more before giving up loudly.
+        herdr("agent", "prompt", pane, prompt)
+        if not started():
+            herdr("agent", "send-keys", pane, "enter")
+            if not started():
+                if status() == "blocked":
+                    return fail("the new agent is at a dialog instead of starting on the takeover "
+                                f"prompt; handoff at {saved}")
+                herdr("agent", "prompt", pane, prompt)
+                if not started():
+                    return fail("the new agent did not start on the takeover prompt (sent "
+                                f"twice); handoff at {saved}")
+        if goal:  # queued while the agent works; Claude Code runs it as the /goal command
+            herdr("agent", "prompt", pane, "/goal " + goal)
+        say(f"respawned {name or '(unnamed)'}: {command}; handoff {saved}"
+            + ("; /goal set again" if goal else ""))
+        emit("respawn", "Handoff takeover", f"{pane}: {name or 'unnamed agent'} took over", pane)
     except Exception as e:  # never leave the pane silently empty
         fail(repr(e))
 
@@ -509,9 +730,9 @@ def session_start(source, base, state_path):
                  if source == "compact" else "")
         context = (f"Handoff from the previous context of this project, written {written}"
                    f"{after}. Its claims are re-checked before building on them. Archived "
-                   f"copy: {saved}. The decision log for this work, "
-                   f"{handoff.parent / 'decisions.md'}, is read in full too, and gets new "
-                   "entries as decisions are made (append-only; the rules are at its top).")
+                   f"copy: {saved}. Also read, with the Read tool, "
+                   f"{log_reading(handoff.parent)}. The log gets new entries as decisions are "
+                   "made (append-only; the rules are at its top).")
         if len(context) + len(text) + 2 <= INLINE_LIMIT:
             context += "\n\n" + text
         else:
@@ -528,6 +749,8 @@ def main():
     if data.get("agent_id"):  # subagents have their own context; this tracks the main one
         return
     event = data.get("hook_event_name")
+    if IN_HERDR and event in ("Stop", "SessionStart"):
+        write_status(data, event)
     project = os.environ.get("CLAUDE_PROJECT_DIR") or data.get("cwd") or os.getcwd()
     base = ROOT / project.strip("/").replace("/", "-").replace(":", "-")
     state_path = ROOT / "state" / f"{data.get('session_id') or 'unknown'}.json"
