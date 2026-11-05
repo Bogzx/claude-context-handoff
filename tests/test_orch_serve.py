@@ -2162,6 +2162,280 @@ def test_a_passing_failure_keeps_the_push_for_the_next_pass(world, cloud):
     assert question["message"]["seq"] == 1 and question["message"]["sent"] == world.t
 
 
+@pytest.fixture
+def watched(world, cloud, monkeypatch):
+    """A gateway past its first pass, its fleet reads counted in `reads`."""
+    gw = world.serve.Gateway()
+    pair(world, gw)
+    gw.pusher.cycle()
+    cloud.pushes.clear()
+    gw.reads = []
+    read = gw.fleet
+    monkeypatch.setattr(gw, "fleet", lambda: gw.reads.append(world.t) or read())
+    return gw
+
+
+def numbers(cloud):
+    return [(p["message"]["kind"], p["message"]["seq"]) for p in cloud.pushes]
+
+
+def test_a_question_goes_at_the_next_look_without_a_fleet_read(world, cloud, watched):
+    asked = world.t
+    qid = world.orch.ask(BOSS, "Ship?", [{"label": "Yes"}])
+    world.t += world.serve.orch_push.WATCH_EVERY
+    watched.pusher.watch()
+
+    [question] = cloud.pushes
+    assert question["message"]["kind"] == "question" and question["message"]["seq"] == 1
+    assert question["message"]["body"]["id"] == qid and question["message"]["orchestrator"] == BOSS
+    conforms(question["message"]["body"], QUESTION)
+    assert question["android"] == {"priority": "HIGH", "ttl": "86400s"}
+    assert question["message"]["sent"] - asked <= 2
+    assert watched.reads == []
+    cloud.pushes.clear()
+    watched.pusher.watch()
+    world.t += 20
+    watched.pusher.cycle()
+    assert "question" not in cloud.kinds()  # the pass doesn't send it again
+
+
+def test_a_failed_start_goes_at_the_next_look_and_the_other_steps_at_the_pass(world, cloud, watched):
+    world.orch.emit("start", "Start: pane ok", "", BOSS, action="a1", step="pane", status="ok")
+    watched.pusher.watch()
+    assert cloud.pushes == []
+    world.orch.emit("start", "Start: claude failed", "", BOSS, action="a1", step="claude",
+                    status="failed", error="no claude")
+    watched.pusher.watch()
+
+    [failed] = cloud.pushes
+    assert failed["android"]["priority"] == "HIGH" and watched.reads == []
+    assert failed["message"]["orchestrator"] == BOSS
+    assert failed["message"]["body"] == {"action": "a1", "pane": BOSS, "step": "claude",
+                                         "status": "failed", "error": "no claude",
+                                         "time": world.t}
+    cloud.pushes.clear()
+    watched.pusher.cycle()
+    [step] = [p for p in cloud.pushes if p["message"]["kind"] == "start"]
+    assert step["message"]["body"]["step"] == "pane" and step["message"]["seq"] == 2
+    assert step["android"]["priority"] == "NORMAL"
+
+
+def test_events_read_early_reach_the_next_pass_and_no_number_is_skipped(world, cloud, watched):
+    """The phone counts seq: an early push takes the next number, the pass the ones after it."""
+    world.orch.emit("spill", "Account 1 at 98%", "first", None)
+    world.orch.ask(BOSS, "Ship?", [])
+    world.orch.emit("spill", "Account 2 at 98%", "second", None)
+    watched.pusher.watch()
+    assert numbers(cloud) == [("question", 1)]
+    world.orch.emit("spill", "Account 1 back", "third", None)
+    world.orch.ask(BOSS, "Merge?", [])
+    watched.pusher.watch()
+    assert numbers(cloud) == [("question", 1), ("question", 2)]
+    world.orch.emit("spill", "Account 2 back", "fourth", None)
+
+    restarted = world.serve.Gateway()  # what the looks kept is in push-state.json
+    restarted.pusher.cycle()
+    assert [(k, s) for k, s in numbers(cloud) if k in ("question", "spill")] == [
+        ("question", 1), ("question", 2), ("spill", 3), ("spill", 4), ("spill", 5), ("spill", 6)]
+    assert [p["message"]["body"]["text"] for p in cloud.pushes
+            if p["message"]["kind"] == "spill"] == ["first", "second", "third", "fourth"]
+    sent = len(cloud.pushes)
+    restarted.pusher.cycle()
+    assert len(cloud.pushes) == sent  # each once
+
+
+def test_an_early_push_stays_behind_what_waits_for_a_retry(world, cloud, watched):
+    busy = (503, {"error": {"status": "UNAVAILABLE", "message": "try later"}})
+    cloud.fcm = [busy]
+    world.orch.emit("spill", "Account 1 at 98%", "", None)
+    watched.pusher.cycle()
+    assert cloud.pushes == []
+
+    cloud.fcm = [busy]  # still down when the question comes: it can't go ahead of number 1
+    sends = cloud.sends
+    world.orch.ask(BOSS, "Ship?", [])
+    watched.pusher.watch()
+    assert cloud.pushes == [] and cloud.sends == sends + 1  # number 1 tried, the question not
+
+    world.orch.ask(BOSS, "Merge?", [])
+    watched.pusher.watch()  # Google is back: the outbox goes in order
+    assert numbers(cloud) == [("spill", 1), ("question", 2), ("question", 3)]
+
+
+def test_a_look_is_one_stat_until_the_file_grows_and_other_events_change_nothing(
+        world, cloud, watched, monkeypatch):
+    state = world.root / "push-state.json"
+    watched.pusher.watch()
+    reads = []
+    load = world.orch.load
+    monkeypatch.setattr(world.orch, "load", lambda path: reads.append(path) or load(path))
+    for _ in range(100):
+        watched.pusher.watch()
+    assert reads == []
+
+    before = state.read_bytes()
+    world.orch.emit("report", "Report", "", BOSS)
+    watched.pusher.watch()
+    assert reads != [] and state.read_bytes() == before  # the pass reads it, as it always did
+    assert cloud.pushes == [] and watched.reads == []
+
+
+def test_an_early_push_holds_the_push_lock_but_never_the_fleets(world, cloud, watched, monkeypatch):
+    """seq is read and raised under the push lock. The app's reads don't wait for Google."""
+    during = []
+
+    def http(method, url, *args, **kw):
+        if url.endswith("/messages:send"):
+            during.append((watched.pusher.lock.locked(), watched.lock.locked(),
+                           None if watched.lock.locked() else watched.fleet()[0]))
+        return cloud(method, url, *args, **kw)
+
+    monkeypatch.setattr(world.serve.orch_push, "http", http)
+    world.orch.ask(BOSS, "Ship?", [])
+    watched.pusher.watch()
+    assert during == [(True, False, 200)]
+
+
+def test_a_look_after_the_pass_sent_it_sends_nothing(world, cloud, watched):
+    world.orch.ask(BOSS, "Ship?", [])
+    watched.pusher.cycle()
+    assert numbers(cloud)[:1] == [("question", 1)]
+    cloud.pushes.clear()
+    watched.pusher.watch()
+    assert cloud.pushes == []
+
+
+def test_a_look_at_a_half_written_line_waits_for_the_rest(world, cloud, watched):
+    world.orch.ask(BOSS, "Ship?", [])
+    events = world.root / "events.jsonl"
+    whole = events.read_bytes()
+    events.write_bytes(whole[:-10])
+    watched.pusher.watch()
+    assert cloud.pushes == []
+    events.write_bytes(whole)
+    watched.pusher.watch()
+    assert numbers(cloud) == [("question", 1)]
+
+
+def test_a_question_answered_before_the_look_takes_no_number(world, cloud, watched):
+    run = world.root / "runs" / "w1-p0.json"
+    start_run(world)
+    qid = world.orch.ask(BOSS, "Ship?", [])
+    record = json.loads(run.read_text())
+    [asked] = [q for q in record["questions"] if q["id"] == qid]
+    asked.update(answer="Yes", answered=world.t)
+    run.write_text(json.dumps(record))
+    watched.pusher.watch()
+    assert cloud.pushes == []
+    world.orch.ask(BOSS, "Merge?", [])
+    watched.pusher.watch()
+    assert numbers(cloud) == [("question", 1)]
+
+
+def test_the_very_first_look_pushes_nothing_old(world, cloud):
+    gw = world.serve.Gateway()
+    pair(world, gw)
+    cloud.pushes.clear()
+    world.orch.ask(BOSS, "Ship?", [])  # from before this gateway ever made a pass
+    gw.pusher.watch()
+    assert cloud.pushes == []
+
+
+def test_with_nothing_to_send_with_a_look_leaves_the_events_to_the_pass(world, cloud, watched):
+    push = world.serve.orch_push
+    key = push.SA_FILE.read_text()
+    push.SA_FILE.unlink()
+    watched.pusher.google = None
+    sends = cloud.sends
+    world.orch.ask(BOSS, "Ship?", [])
+    watched.pusher.watch()
+    assert cloud.sends == sends
+
+    phones = push.PHONES.read_text()
+    push.SA_FILE.write_text(key)
+    push.PHONES.write_text("{}")
+    watched.pusher.seen_size = None
+    watched.pusher.watch()
+    assert cloud.sends == sends
+
+    push.PHONES.write_text(phones)
+    watched.pusher.cycle()
+    assert numbers(cloud)[:1] == [("question", 1)]
+
+
+def test_questions_reach_fcm_within_a_look_and_a_pass_keeps_its_pace(world, cloud, monkeypatch):
+    """Two minutes of the real loops on a fake clock: tick() every 5 s, watch() every 0.5 s. The
+    fleet is read once per pass, 8 times, however many questions come."""
+    push = world.serve.orch_push
+    monkeypatch.setattr(push, "time", SimpleNamespace(monotonic=lambda: world.t,
+                                                      time=lambda: world.t))
+    gw = world.serve.Gateway()
+    pair(world, gw)
+    cloud.pushes.clear()
+    reads = []
+    read = gw.fleet
+    monkeypatch.setattr(gw, "fleet", lambda: reads.append(world.t) or read())
+    asked = {}
+    start = world.t
+    for step in range(240):
+        world.t = start + step * push.WATCH_EVERY
+        if step % 10 == 0:
+            gw.pusher.tick()
+        gw.pusher.watch()
+        if step % 31 == 7:  # just after a look, the longest wait for the next one
+            world.t += 0.01
+            asked[world.orch.ask(BOSS, f"Question {step}?", [])] = world.t
+
+    questions = [p["message"] for p in cloud.pushes if p["message"]["kind"] == "question"]
+    assert len(asked) == 8 and {m["body"]["id"] for m in questions} == set(asked)
+    assert max(m["sent"] - asked[m["body"]["id"]] for m in questions) <= push.WATCH_EVERY
+    assert [m["seq"] for m in questions] == list(range(1, 9))
+    assert [t - start for t in reads] == [15 * i for i in range(8)]
+
+
+def test_the_watcher_looks_at_its_pace_and_outlives_a_failed_look(world):
+    waits = []
+    looks = []
+
+    def watch():
+        looks.append(len(looks))
+        if len(looks) == 1:
+            raise OSError("the disk hiccupped")
+
+    def wait(timeout):
+        waits.append(timeout)
+        return len(waits) > 3
+
+    world.serve.watch_events(SimpleNamespace(pusher=SimpleNamespace(watch=watch)),
+                             SimpleNamespace(wait=wait))
+    assert looks == [0, 1, 2]
+    assert waits == [world.serve.orch_push.WATCH_EVERY] * 4
+
+
+def test_serve_runs_the_watcher_apart_from_the_background_loop(world, monkeypatch):
+    """The background jobs wait on the usage scan, Google and relay actions."""
+    started = []
+
+    class Thread:
+        def __init__(self, target, args, daemon):
+            self.target = target
+            assert daemon
+
+        def start(self):
+            started.append(self.target)
+
+    def serve_forever():
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(world.serve, "threading", SimpleNamespace(
+        Thread=Thread, Event=threading.Event, Lock=threading.Lock))
+    monkeypatch.setattr(world.serve, "tailscale_ip", lambda: "127.0.0.1")
+    monkeypatch.setattr(world.serve, "make_server", lambda gw, addr, port: SimpleNamespace(
+        serve_forever=serve_forever, server_close=lambda: None))
+    assert world.serve.serve(SimpleNamespace(allow_self=False)) == 0
+    assert started == [world.serve.background, world.serve.watch_events]
+
+
 def test_without_a_service_account_nothing_is_pushed_and_health_says_why(world, cloud):
     world.serve.orch_push.SA_FILE.unlink()
     gw = world.serve.Gateway()

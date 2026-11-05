@@ -6,6 +6,7 @@ import base64
 import json
 import random
 import sys
+import time
 import zlib
 from pathlib import Path
 
@@ -147,6 +148,20 @@ def test_a_send_uses_one_cached_token_and_the_android_options(sa, monkeypatch):
     google.send("tok", {}, "state", None)
     google.send("tok", {}, "state", None)
     assert len([c for c in net.calls if c["url"] == orch_push.TOKEN_URI]) == 2  # 401: new token
+
+
+def test_a_token_dropped_by_another_thread_during_the_check_is_still_returned(sa, monkeypatch):
+    """A 401 on one thread clears the token while another reads it (watch() sends beside the
+    relay poll). The answer is the token that was read, not a TypeError."""
+    google = orch_push.Google.load(sa[0])
+
+    class Dropped(tuple):
+        def __bool__(self):
+            google.access = None
+            return True
+
+    google.access = Dropped(("at1", time.time() + 3600))
+    assert google.token() == ("at1", None)
 
 
 def test_fcm_errors_say_whether_to_retry_drop_the_token_or_the_message():

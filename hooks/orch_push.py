@@ -53,7 +53,8 @@ STALL_AFTER = 5 * 60  # nudged by the watchdog this long ago and still stalled
 SAMPLES = 2 * 3600  # an accounts push carries the samples of the last 2 hours
 BACKLOG = 3600  # older events are not pushed when the gateway catches up
 KEEP_DONE = 8 * 86400  # what was pushed once is remembered longer than a week window
-PUSH_EVERY = 15
+PUSH_EVERY = 15  # a pass reads the fleet, so this is the load on a machine
+WATCH_EVERY = 0.5  # seconds between looks at events.jsonl: one stat, no fleet read
 RELAY_SLOW, RELAY_FAST, FAST_FOR = 30, 5, 600  # seconds; fast for 10 min after an actionable push
 ENDED = {"run-ended", "run-stop"}
 SYSTEM = {"respawn-failed", "account-failed", "respawn-dialog", "orch-missing", "orch-blocked",
@@ -189,8 +190,9 @@ class Google:
 
     def token(self):
         at = time.time()
-        if self.access and self.access[1] > at + 300:
-            return self.access[0], None
+        access = self.access  # the relay polls on another thread than early()'s sends
+        if access and access[1] > at + 300:
+            return access[0], None
         status, out = http("POST", TOKEN_URI, {
             "grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
             "assertion": self.assertion(at)}, form=True)
@@ -362,9 +364,25 @@ def digest(obj):
     return hashlib.sha256(dumps(obj).encode()).hexdigest()[:16]
 
 
+def events_size():
+    try:
+        return (orch.ROOT / "events.jsonl").stat().st_size
+    except OSError:
+        return 0
+
+
+def pressing(event):
+    """An event that can't wait for the next pass and needs no fleet to push: a question or a
+    failed start. A dialog is as urgent but is only seen in the fleet, so it waits for a pass."""
+    return bool((event.get("kind") == "ask" and event.get("id"))
+                or (event.get("kind") == "start" and event.get("action")
+                    and event.get("status") == "failed"))
+
+
 class Pusher:
     """What the gateway pushes, when, and the relay poller. `orch serve` calls tick() every 5 s
-    from its background loop; the HTTP side calls test() after a pairing."""
+    from its background loop and watch() every WATCH_EVERY seconds from a thread of its own; the
+    HTTP side calls test() after a pairing."""
 
     def __init__(self, gateway, machine=None):
         self.gw = gateway
@@ -374,6 +392,7 @@ class Pusher:
         self.error = None
         self.relay = {"last_poll": None, "error": None}
         self.next_push = self.next_poll = self.fast_until = 0.0
+        self.seen_size = None  # of events.jsonl, at the last look
 
     @property
     def machine(self):
@@ -417,7 +436,7 @@ class Pusher:
         at = orch.now() if at is None else at
         with self.lock:
             st = orch.load(self.path())
-            events = self.new_events(st)
+            events = (st.pop("held", None) or []) + self.new_events(st)
             phones = self.targets()
             try:
                 if not phones:
@@ -434,14 +453,41 @@ class Pusher:
             self.flush(st, google, key, phones)
             orch.save(self.path(), st)
 
+    def watch(self):
+        """One look at events.jsonl: a stat, and early() only when it grew."""
+        size = events_size()
+        if size != self.seen_size:
+            self.seen_size = size
+            self.early()
+
+    def early(self, at=None):
+        """Push a question or a failed start now rather than at the next pass. No fleet read,
+        and the same seq and outbox as a pass, so it goes out behind whatever waits for a retry
+        (with a heartbeat if one is due). The other events it read wait in `held` for the pass.
+        With nothing pressing, or nothing to send with, st isn't saved: the pass reads them."""
+        at = orch.now() if at is None else at
+        with self.lock:
+            st = orch.load(self.path())
+            events = self.new_events(st)
+            now_ = [e for e in events if pressing(e)]
+            phones = self.targets()
+            if not now_ or not phones:
+                return
+            try:
+                google, key = self.setup()
+            except Unavailable:
+                return
+            st["held"] = (st.get("held") or []) + [e for e in events if not pressing(e)]
+            for kind, lead, body in self.plan(st, now_, None, at):
+                self.queue(st, phones, kind, lead, body, at)
+            self.flush(st, google, key, phones)
+            orch.save(self.path(), st)
+
     @staticmethod
     def new_events(st):
         """events.jsonl lines added since the last pass (none on the very first one)."""
         path = orch.ROOT / "events.jsonl"
-        try:
-            size = path.stat().st_size
-        except OSError:
-            size = 0
+        size = events_size()
         start = st.get("offset")
         if start is None or start == size:
             st["offset"] = size
