@@ -270,7 +270,8 @@ ORCHESTRATOR = {"pane": str, "name": str, "machine": str, "cwd?": str,
 SPILL = {"from": str, "at": NUM, "to": str, "time": NUM,
          "active?": {"window": {"seven_day", "five_hour"}, "used": NUM, "since": NUM,
                      "resets_at?": NUM}}
-FLEET = {"version": int, "machine": str, "time": NUM, "orchestrators": [ORCHESTRATOR],
+FLEET = {"version": int, "machine": str, "time": NUM, "gaming": bool,
+         "orchestrators": [ORCHESTRATOR],
          "accounts": dict, "default_account": str, "actions": [ACTION_STATUS], "spill?": SPILL}
 DECISIONS = {"pane": str, "log": str, "decisions": [
     {"id": str, "generation": int, "line": int, "time?": str, "by": str, "who": {"user", "agent"},
@@ -1388,6 +1389,7 @@ HEALTH = {"machine": str, "version": str, "time": NUM, "addr?": str, "orchestrat
                                      "last_heartbeat?": NUM, "error?": str},
           "capacity?": {"agents": int, "mem_free_gb": NUM, "mem_total_gb": NUM,
                         "load_avg": [NUM], "cores": int},
+          "gaming": bool, "gaming_since?": NUM,
           "relay?": {"last_poll?": NUM, "error?": str}}
 PAIRED = {"machine": str, "version": str, "orchestrators": [str], "accounts": dict,
           "test_push": {"seq": int, "sent": NUM, "error?": str}}
@@ -1525,6 +1527,73 @@ def test_a_machine_without_a_readable_meminfo_has_no_capacity(world, cloud, tmp_
     status, health = world.get(world.serve.Gateway(), "/v1/health")
     assert status == 200 and health["capacity"] is None
     conforms(health, HEALTH)
+
+
+def gaming_events(world):
+    return [e for e in world.events() if e["kind"] == "gaming"]
+
+
+def test_the_gaming_flag_set_here_shows_in_health_and_the_fleet(world, cloud, capsys):
+    gw = world.serve.Gateway()
+    assert world.get(gw, "/v1/health")[1]["gaming"] is False
+    assert world.get(gw, "/v1/fleet")[1]["gaming"] is False
+    world.orch.main(["machine"])
+    assert capsys.readouterr().out == "not gaming\n"
+
+    world.orch.main(["machine", "--gaming", "on"])
+    capsys.readouterr()
+    health = world.get(gw, "/v1/health")[1]
+    conforms(health, HEALTH)
+    assert health["gaming"] is True and health["gaming_since"] == world.t
+    fleet = world.get(gw, "/v1/fleet")[1]
+    conforms(fleet, FLEET)
+    assert fleet["gaming"] is True
+    [event] = gaming_events(world)
+    assert event["gaming"] is True and event["by"] == "orch machine"
+    assert event["title"] == "Gaming on on box1"
+
+    world.t += 600  # on again: still the first time, and no second event
+    world.orch.main(["machine", "--gaming", "on"])
+    world.orch.main(["machine", "--json"])
+    capsys.readouterr()
+    assert world.get(gw, "/v1/health")[1]["gaming_since"] == world.t - 600
+    assert len(gaming_events(world)) == 1
+    world.orch.main(["machine"])
+    assert capsys.readouterr().out.startswith("gaming since 10:00, by orch machine")
+
+    world.orch.main(["machine", "--gaming", "off", "--json"])
+    assert json.loads(capsys.readouterr().out) == {"gaming": False, "gaming_since": None}
+    health = world.get(gw, "/v1/health")[1]
+    assert health["gaming"] is False and health["gaming_since"] is None
+    assert [e["gaming"] for e in gaming_events(world)] == [True, False]
+
+
+def test_the_phone_sets_the_gaming_flag_and_a_retry_changes_nothing(world, cloud):
+    gw = world.serve.Gateway()
+    pair(world, gw)
+    action = {"id": "g1", "time": world.t, "kind": "gaming", "on": True}
+    status, out = gw.route("POST", "/v1/actions", {}, action, "127.0.0.1")
+    assert status == 202 and out["status"] == "delivered"
+    assert world.get(gw, "/v1/health")[1]["gaming"] is True
+    [event] = gaming_events(world)
+    assert event["by"] == "phone (OnePlus 12)"
+
+    world.t += 60
+    assert gw.route("POST", "/v1/actions", {}, action, "127.0.0.1")[0] == 202
+    assert world.get(gw, "/v1/health")[1]["gaming_since"] == world.t - 60
+    assert len(gaming_events(world)) == 1
+
+    off = {"id": "g2", "time": world.t, "kind": "gaming", "on": False}
+    assert gw.route("POST", "/v1/actions", {}, off, "127.0.0.1")[0] == 202
+    assert world.get(gw, "/v1/health")[1]["gaming"] is False
+
+
+@pytest.mark.parametrize("on", [None, "on", 1])
+def test_the_gaming_action_needs_a_true_or_false(world, cloud, on):
+    gw = world.serve.Gateway()
+    status, out = world.post(gw, kind="gaming", **({} if on is None else {"on": on}))
+    assert status == 400 and out["error"] == "on is missing"
+    assert world.get(gw, "/v1/health")[1]["gaming"] is False
 
 
 def test_pairing_stores_the_token_and_sends_a_test_push(world, cloud):

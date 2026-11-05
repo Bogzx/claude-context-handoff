@@ -10,7 +10,7 @@ for a QR code. `orch serve --allow-self` also admits this machine's own node: fo
 Reads: GET /v1/health, /v1/fleet, /v1/usage, /v1/orchestrators/<pane>/decisions,
 /v1/orchestrators/<pane>/history, /v1/panes/<pane>/screen, /v1/actions/<id>.
 Writes: POST /v1/actions, one action per request (prompt, answer, interrupt, park, unpark, run,
-nudge, account, default_account, spill, ack, push_token). An action id runs once: a retry gets
+nudge, account, default_account, spill, ack, push_token, gaming). An action id runs once: a retry gets
 the first result. Every action is logged to events.jsonl (kind "action", source "app" or
 "relay"). POST /v1/pair registers the phone's FCM token (a node of the machine's own Tailscale
 user with the right token joins the allow-list); DELETE /v1/pair forgets it.
@@ -153,6 +153,11 @@ def capacity():
                 "load_avg": [round(x, 2) for x in os.getloadavg()], "cores": os.cpu_count()}
     except (OSError, KeyError, ValueError, IndexError):
         return None
+
+
+def gaming():
+    state = orch.machine_state()
+    return {"gaming": bool(state.get("gaming")), "gaming_since": state.get("gaming_since")}
 
 
 def state_of(v):
@@ -502,7 +507,7 @@ class Gateway:
         out = {"machine": self.machine(), "version": VERSION, "time": orch.now(),
                "addr": tailscale_ip(), "orchestrators": self.orchestrators(),
                "accounts": self.account_names(), "push": self.pusher.health(phone),
-               "capacity": capacity()}
+               "capacity": capacity(), **gaming()}
         why = orch_new.cannot_start(read_env(self.config))
         out.update(can_start=why is None, **({"cannot_start": why} if why else {}),
                    dialogs=["trust", "permission"])
@@ -579,7 +584,7 @@ class Gateway:
         starts = self.starts(at)
         leads += [(p, None) for p in sorted(starts) if p not in {lead for lead, _ in leads}]
         return 200, {
-            "version": 1, "machine": self.machine(), "time": at,
+            "version": 1, "machine": self.machine(), "time": at, "gaming": gaming()["gaming"],
             "orchestrators": [self.orchestrator(p, r, ags, at, watchdog.get(p) or {}, nudges,
                                                 starts.get(p))
                               for p, r in leads],
@@ -1039,6 +1044,10 @@ def act_spill(gw, body, rec):
     orch.set_spill(need(body, "rule"))
 
 
+def act_gaming(gw, body, rec):
+    orch.set_gaming(need(body, "on", bool), gw.who(rec.get("phone")))
+
+
 def act_ack(gw, body, rec):
     lead, ids = need(body, "orchestrator"), need(body, "decisions", list)
     path = orch.ROOT / "decisions-seen.json"
@@ -1234,7 +1243,7 @@ ACTIONS = {"prompt": act_prompt, "answer": act_answer, "interrupt": act_interrup
            "account": act_account, "default_account": act_default_account, "ack": act_ack,
            "spill": act_spill, "push_token": act_push_token, "test_push": act_test_push,
            "dialog": act_dialog, "start": act_start, "start_cancel": act_start_cancel,
-           "start_retry": act_start_retry}
+           "start_retry": act_start_retry, "gaming": act_gaming}
 
 
 # --- HTTP ----------------------------------------------------------------------------------------

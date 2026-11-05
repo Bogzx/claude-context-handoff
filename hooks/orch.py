@@ -20,6 +20,7 @@ at every turn end (background tasks still running, last message). From those two
                   when it is next idle (the watchdog does it) or at its next handoff.
   orch usage      account windows from the statusline and tokens per agent (orch_usage.py).
   orch new        a new orchestrator in a new herdr tab: brief, decision log, run (orch_new.py).
+  orch machine    this machine's gaming flag, for the app's New orchestrator form.
   orch serve      the HTTP gateway for the owner's phone app, on the tailnet only, and
   orch pair       its pairing token (orch_serve.py).
 
@@ -501,6 +502,35 @@ class OptionAction(argparse.Action):
         else:
             options.append({"label": value, "danger": "none"})
         namespace.options = options
+
+
+def machine_state():
+    """This machine's flags from the owner: {gaming, gaming_since, gaming_by}."""
+    return load(STARTS.parent / "machine.json")
+
+
+def set_gaming(on, by):
+    """Mark the machine as gaming (the owner plays on it: no heavy work there) or not. It only
+    informs: a start can still choose this machine. Logged when it changes."""
+    state = machine_state()
+    if bool(state.get("gaming")) != on:
+        state = {"gaming": on, "gaming_since": now() if on else None, "gaming_by": by}
+        save(STARTS.parent / "machine.json", state)
+        emit("gaming", f"Gaming {'on' if on else 'off'} on {machine_name()}", f"by {by}",
+             gaming=on, by=by)
+    return state
+
+
+def cmd_machine(args):
+    state = set_gaming(args.gaming == "on", "orch machine") if args.gaming else machine_state()
+    if args.json:
+        print(json.dumps({"gaming": bool(state.get("gaming")),
+                          "gaming_since": state.get("gaming_since")}, indent=1))
+    elif state.get("gaming"):
+        print(f"gaming since {clock(state['gaming_since'])}, by {state.get('gaming_by')}")
+    else:
+        print("not gaming")
+    return 0
 
 
 def cmd_ask(args):
@@ -1703,6 +1733,13 @@ def main(argv=None):
     nw.add_argument("--dry-run", action="store_true", help="print the steps, change nothing")
     nw.add_argument("--json", action="store_true")
     nw.set_defaults(func=cmd_new)
+
+    m = sub.add_parser("machine", help="show this machine's gaming flag, or set it")
+    m.add_argument("--gaming", choices=["on", "off"],
+                   help="on: the owner plays on this machine, the app says so and suggests "
+                        "another for a new orchestrator")
+    m.add_argument("--json", action="store_true")
+    m.set_defaults(func=cmd_machine)
 
     u = sub.add_parser("usage", help="account windows and tokens per agent")
     u.add_argument("action", nargs="?", choices=["capture"],
