@@ -50,7 +50,7 @@ FRESH = 10 * 60  # older actions are refused; the fleet lists the actions of thi
 RECENT_RUN = 86400  # a run that ended this long ago still shows in the fleet
 MAX_BODY = 64 * 1024
 WHOIS_TTL = 60
-EVENTS_TAIL = 8 << 20  # bytes of events.jsonl read for history and the last nudge
+EVENTS_TAIL = 8 << 20  # bytes of events.jsonl read for history, the last nudge and plan
 PANE_WAIT = 20  # seconds the start action waits for the new orchestrator's pane
 NOT_PAIRED = 3  # serve's exit status without a token; the unit counts it as a clean stop
 
@@ -179,6 +179,8 @@ def report_json(report, role):
     out = dict(report)
     if role == "orchestrator":
         out.setdefault("source", "report")
+        if "roadmap" in out:
+            out.setdefault("roadmap_time", out.get("time"))
     else:
         out["changed_files"] = [f if isinstance(f, dict) else {"path": f}
                                 for f in report.get("changed_files") or []]
@@ -584,7 +586,10 @@ class Gateway:
                 or (r.get("ended") or r.get("until") or 0) > at - RECENT_RUN]
         busy = {p for r in runs for p in r.get("workers") or {}} | {r["orchestrator"] for r in runs}
         watchdog = orch.load(orch.ROOT / "watchdog.json")
-        nudges = {e.get("pane"): e.get("time") for e in read_events() if e.get("kind") == "nudge"}
+        events = read_events()
+        nudges = {e.get("pane"): e.get("time") for e in events if e.get("kind") == "nudge"}
+        plans = {e.get("pane"): e["report"] for e in events
+                 if e.get("kind") == "report" and "roadmap" in (e.get("report") or {})}
         leads = [(r["orchestrator"], r) for r in runs] + [(p, None) for p in sorted(ags)
                                                           if p not in busy]
         starts = self.starts(at)
@@ -592,7 +597,7 @@ class Gateway:
         return 200, {
             "version": 1, "machine": self.machine(), "time": at, "gaming": gaming()["gaming"],
             "orchestrators": [self.orchestrator(p, r, ags, at, watchdog.get(p) or {}, nudges,
-                                                starts.get(p))
+                                                starts.get(p), plans.get(p))
                               for p, r in leads],
             "accounts": self.accounts(at), "default_account": self.default_account(),
             "spill": orch.spill_summary(orch.load(orch.ROOT / "accounts.json")),
@@ -611,10 +616,12 @@ class Gateway:
                 out[rec["pane"]] = rec
         return out
 
-    def orchestrator(self, pane, run, ags, at, ws, nudges, start=None):
+    def orchestrator(self, pane, run, ags, at, ws, nudges, start=None, plan=None):
         first = ws.get("first_seen") or {}
         agent = ags.get(pane)
         v = orch.view(pane, agent, None, at)
+        if v["report"] and plan:  # a session's MCP server keeps the write_report it started with
+            v["report"] = orch.keep_plan(v["report"], plan)
         lead = agent_json(v, agent, "orchestrator", first)
         workers = [agent_json(orch.view(p, ags.get(p), run, at), ags.get(p), "worker", first)
                    for p in (run or {}).get("workers") or {}]

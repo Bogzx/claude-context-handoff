@@ -215,7 +215,8 @@ as `orch`. It takes the agent's pane from `HERDR_PANE_ID` and offers no tools ou
   | worker | `status` (`done`, `partial`, `blocked`), `tests` [{`cmd`, `passed`, `failed`}], `changed_files`, `needs_live_test`, `issues_for_others` [text] |
 
   The plan outlives the turn. A report without `roadmap` keeps the last one, with `roadmap_time` (when it was written)
-  and its `source`; `roadmap: []` clears it. Every other field belongs to its own report.
+  and its `source`; `roadmap: []` clears it. Every other field belongs to its own report. A running session's MCP
+  server keeps the code it started with, so the gateway applies the same rule from events.jsonl when it reads a report.
 
   `role` is taken from the pane's run (orchestrator or worker) unless the call sets it. A report that doesn't fit the
   schema is refused with the reason, so the agent can fix it.
