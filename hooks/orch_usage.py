@@ -112,6 +112,13 @@ def last_response(path):
     return None
 
 
+def capture_began(root, account, at):
+    """When this account's capture began, for a first reading: its first history line (machines
+    capturing since before this was stored), else now."""
+    return min((h.get("time") or at for h in history(root, 0) if h.get("account") == account),
+               default=at)
+
+
 def capture(text, env, root, at):
     """Record the rate-limit windows of the statusline JSON `text` for the session's account."""
     try:
@@ -140,7 +147,8 @@ def capture(text, env, root, at):
         due = read - entry.get("history_time", 0) >= HISTORY_EVERY
         cur.setdefault("accounts", {})[account] = {
             "read_at": read, "windows": windows, "config_dir": env.get("CLAUDE_CONFIG_DIR") or "",
-            "history_time": read if due else entry.get("history_time", 0)}
+            "history_time": read if due else entry.get("history_time", 0),
+            "capture_since": entry.get("capture_since") or capture_began(root, account, at)}
         if due:
             root.mkdir(parents=True, exist_ok=True)
             line = json.dumps({"time": read, "account": account, "windows": windows}) + "\n"
@@ -216,6 +224,7 @@ def windows_report(root, at):
         out[account] = {
             "updated": read,
             "stale": at - read > STALE,
+            "capture_since": entry.get("capture_since"),
             "windows": {name: window_report(name, w, mine + [latest], at)
                         for name, w in (entry.get("windows") or {}).items()
                         if isinstance(w, dict)},
@@ -412,6 +421,11 @@ def account_at(info, when):
     return current
 
 
+def run_id(run):
+    started = time.strftime("%Y-%m-%d %H:%M", time.localtime(run.get("created") or 0))
+    return f"{run['orchestrator']}@{started}"
+
+
 def runs_of(root):
     out = []
     for path in sorted((root / "runs").glob("*.json")):
@@ -419,10 +433,19 @@ def runs_of(root):
             continue
         run = load(path)
         if run.get("orchestrator"):
-            started = time.strftime("%Y-%m-%d %H:%M", time.localtime(run.get("created") or 0))
-            run["id"] = f"{run['orchestrator']}@{started}"
+            run["id"] = run_id(run)
             out.append(run)
     return out
+
+
+def max_workers(run):
+    """What the run was started with (orch new), else the workers it has now."""
+    return (run.get("settings") or {}).get("max_workers") or len(run.get("workers") or {})
+
+
+def run_hours(run, at):
+    end = min(at, run.get("ended") or run.get("until") or at)
+    return round((end - (run.get("created") or end)) / 3600, 2)
 
 
 def role_in(run, pane, when):
@@ -443,7 +466,9 @@ def blank():
 def report(root, projects, agents, at, hours, known=None):
     """known: orch's accounts (number -> {name, ...}); one with no reading yet is listed with
     no windows. Each window's agents get their share of its points: the week so far
-    (estimated_points), the last hour and today (the window's points per USD x their cost)."""
+    (estimated_points), the last hour and today (the window's points per USD x their cost). A
+    window that opened before its account's capture began has none: the sessions before the
+    capture have no account, so their cost is missing here and the points per USD read high."""
     cache = scan(root, projects, at, agents)
     runs = runs_of(root)
     readings, known = windows_report(root, at), known or {}
@@ -493,6 +518,8 @@ def report(root, projects, agents, at, hours, known=None):
                                                        "created": run.get("created"),
                                                        "until": run.get("until"),
                                                        "ended": run.get("ended"),
+                                                       "hours": run_hours(run, at),
+                                                       "max_workers": max_workers(run),
                                                        "orchestrator_tokens": blank(),
                                                        "worker_tokens": blank(), **blank()})
                     targets += [r, r[f"{role}_tokens"]]
@@ -511,12 +538,17 @@ def report(root, projects, agents, at, hours, known=None):
     for (acc, w), per in in_window.items():
         total = sum(c[0] for c in per.values())
         win = accounts[acc]["windows"][w]
+        began = accounts[acc].get("capture_since")
+        win["points_known"] = bool(began) and began <= window_start[acc, w]
         points = (win["used_percentage"] or 0) / (total or 1)  # per USD of this machine's cost
+
+        def worth(cost, digits, known=win["points_known"], points=points):
+            return round(cost * points, digits) if known else None
         win["machine_cost_usd"] = round(total, 2)
         win["agents"] = {k: {"share": round(c[0] / (total or 1), 3),
-                             "estimated_points": round(c[0] * points, 1),
-                             "points_last_hour": round(c[1] * points, 2),
-                             "points_today": round(c[2] * points, 2)}
+                             "estimated_points": worth(c[0], 1),
+                             "points_last_hour": worth(c[1], 2),
+                             "points_today": worth(c[2], 2)}
                          for k, c in sorted(per.items(), key=lambda kv: -kv[1][0])}
     for v in [machine, *per_agent.values(), *per_day.values(), *per_account.values()] + [
             t for r in per_run.values() for t in (r, r["orchestrator_tokens"], r["worker_tokens"])]:

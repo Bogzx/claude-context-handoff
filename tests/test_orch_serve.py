@@ -217,7 +217,7 @@ def start_run(w):
 # A key ending in "?" may be missing or null. A set is an enum, a list holds items of one shape.
 
 NUM = (int, float)
-STATE = {"working", "blocked", "idle", "own-job", "parked", "missing"}
+STATE = {"working", "blocked", "idle", "own-job", "parked", "missing", "unknown"}
 AGENT = {"pane": str, "label": str, "state": STATE,
          "agent_status?": {"working", "idle", "done", "blocked", "unknown"}, "since?": NUM,
          "session?": str, "account?": str, "model?": str, "context_tokens?": int,
@@ -238,9 +238,11 @@ WORKER_REPORT = {"time": NUM, "summary": str, "status?": {"done", "partial", "bl
                  "tests?": [{"cmd": str, "passed?": int, "failed?": int}],
                  "changed_files?": [{"path": str, "added?": int, "removed?": int}],
                  "needs_live_test?": [str], "issues_for_others?": [str]}
+EVIDENCE = {"kind": {"pr", "branch", "files", "tests"}, "label": str, "pane?": str,
+            "tab?": {"report", "diff"}, "ok?": bool}
 QUESTION = {"id": str, "pane": str, "time": NUM, "text": str,
             "options": [{"label": str, "danger": {"none", "deploy", "prod", "destructive"}}],
-            "evidence": [dict], "rule?": str, "kind?": {"plan"}, "answer?": str,
+            "evidence": [EVIDENCE], "rule?": str, "kind?": {"plan"}, "answer?": str,
             "answered?": NUM, "default?": str, "default_at?": NUM, "by_default": bool}
 DIALOG = {"pane": str, "label": str, "since?": NUM, "change": int, "tool?": str,
           "command?": str, "cwd?": str, "doing?": str, "danger": bool, "text": str,
@@ -259,7 +261,7 @@ ORCHESTRATOR = {"pane": str, "name": str, "machine": str, "cwd?": str,
                 "activity": {"working", "waiting", "stalled", "done", "offline", "starting"},
                 "activity_since?": NUM, "agent": AGENT,
                 "run?": {"goal": str, "created": NUM, "until": NUM, "ended?": NUM,
-                         "settings?": dict},
+                         "settings?": dict, "cost_usd?": NUM, "week_points?": NUM},
                 "report?": ORCH_REPORT, "questions": [QUESTION], "dialogs": [DIALOG],
                 "stall?": STALL, "workers": [AGENT], "lanes?": dict,
                 "start?": {"action": str, "goal": str, "plan_first": bool, "until": NUM,
@@ -270,7 +272,8 @@ ORCHESTRATOR = {"pane": str, "name": str, "machine": str, "cwd?": str,
 SPILL = {"from": str, "at": NUM, "to": str, "time": NUM,
          "active?": {"window": {"seven_day", "five_hour"}, "used": NUM, "since": NUM,
                      "resets_at?": NUM}}
-FLEET = {"version": int, "machine": str, "time": NUM, "orchestrators": [ORCHESTRATOR],
+FLEET = {"version": int, "machine": str, "time": NUM, "gaming": bool,
+         "orchestrators": [ORCHESTRATOR],
          "accounts": dict, "default_account": str, "actions": [ACTION_STATUS], "spill?": SPILL}
 DECISIONS = {"pane": str, "log": str, "decisions": [
     {"id": str, "generation": int, "line": int, "time?": str, "by": str, "who": {"user", "agent"},
@@ -286,9 +289,11 @@ USAGE = {"time": NUM, "machine": str, "accounts": dict, "default_account": str,
                      "tokens": {"input": int, "output": int, "cache_read": int,
                                 "cache_write": int},
                      "cost_usd": NUM, "costly?": str}],
-         "other": [{"label": str, "account": str, "points_last_hour?": NUM,
+         "other": [{"label": str, "account?": str, "cost_usd": NUM, "points_last_hour?": NUM,
                     "points_today?": NUM, "points_7d?": NUM, "note": str}],
          "runs": dict}
+RUN_USAGE = {"orchestrator": str, "cost": NUM, "week_points?": NUM, "account?": str, "hours": NUM,
+             "max_workers": int}
 
 
 def conforms(value, spec, where="$"):
@@ -447,8 +452,8 @@ def busy_fleet(w):
     (w.root / "watchdog.json").write_text(json.dumps(
         {BOSS: {"first_seen": {f"{W2}:blocked:s-{W2}:1": w.t - 11 * 60}}}))
     (w.root / "usage.json").write_text(json.dumps({"accounts": {"1": {
-        "read_at": w.t - 30, "windows": {"seven_day": {"used_percentage": 80,
-                                                    "resets_at": w.t + 86400}}}}}))
+        "read_at": w.t - 30, "capture_since": w.t - 30 * 86400,
+        "windows": {"seven_day": {"used_percentage": 80, "resets_at": w.t + 86400}}}}}))
     with open(w.root / "usage-history.jsonl", "w") as f:
         f.writelines(json.dumps({"time": w.t - 3600 + i * 900, "account": "1", "windows": {
                 "seven_day": {"used_percentage": 77 + i, "resets_at": w.t + 86400}}}) + "\n" for i in range(4))
@@ -597,8 +602,26 @@ def test_screen(world):
 def test_the_background_loop_keeps_the_usage_scan_warm(world):
     assert (300, world.serve.warm_usage) in world.serve.BACKGROUND
     assert (5, world.serve.push_and_relay) in world.serve.BACKGROUND
-    world.serve.warm_usage(None)
+    world.serve.warm_usage(world.serve.Gateway())
     assert (world.root / "usage-cache.json").exists()
+
+
+def assistant(at, mid, out_tokens):  # opus 5.5: $4 / $20 per million in / out
+    stamp = datetime.fromtimestamp(at, timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    return json.dumps({"type": "assistant", "timestamp": stamp, "message": {
+        "id": mid, "model": "claude-opus-5-5",
+        "usage": {"input_tokens": 1000, "output_tokens": out_tokens}}}) + "\n"
+
+
+def spend(world, session, *lines):
+    project = world.home / ".claude" / "projects" / "-work-proj"
+    project.mkdir(parents=True, exist_ok=True)
+    (project / f"{session}.jsonl").write_text("".join(lines))
+
+
+def change_run(world, **fields):
+    path = world.root / "runs" / "w1-p0.json"
+    path.write_text(json.dumps(dict(json.loads(path.read_text()), **fields)))
 
 
 def test_usage_has_the_api_shape_and_points_per_period(world):
@@ -606,20 +629,10 @@ def test_usage_has_the_api_shape_and_points_per_period(world):
     usage = json.loads((world.root / "usage.json").read_text())
     usage["sessions"] = {"s-other": {"account": "1", "time": world.t}}
     (world.root / "usage.json").write_text(json.dumps(usage))
-    project = world.home / ".claude" / "projects" / "-work-proj"
-    project.mkdir(parents=True)
-
-    def assistant(at, mid, out_tokens):  # opus 5.5: $4 / $20 per million in / out
-        stamp = datetime.fromtimestamp(at, timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
-        return json.dumps({"type": "assistant", "timestamp": stamp, "message": {
-            "id": mid, "model": "claude-opus-5-5",
-            "usage": {"input_tokens": 1000, "output_tokens": out_tokens}}}) + "\n"
-    (project / f"s-{W1}.jsonl").write_text(assistant(world.t - 1800, "m1", 1_000_000)
-                                           + assistant(world.t - 3 * 86400, "m2", 3_000_000))
-    (project / "s-other.jsonl").write_text(assistant(world.t - 600, "m3", 500_000))
-    run = json.loads((world.root / "runs" / "w1-p0.json").read_text())
-    run["created"] = world.t - 4 * 86400
-    (world.root / "runs" / "w1-p0.json").write_text(json.dumps(run))
+    spend(world, f"s-{W1}", assistant(world.t - 1800, "m1", 1_000_000),
+          assistant(world.t - 3 * 86400, "m2", 3_000_000))
+    spend(world, "s-other", assistant(world.t - 600, "m3", 500_000))
+    change_run(world, created=world.t - 4 * 86400)
     status, out = world.get(world.serve.Gateway(), "/v1/usage?hours=168")
     assert status == 200
     conforms(out, USAGE)
@@ -634,10 +647,189 @@ def test_usage_has_the_api_shape_and_points_per_period(world):
     assert other["account"] == "1" and other["points_7d"] == pytest.approx(10.004 * week,
                                                                            abs=0.05)
     assert builder["points_7d"] + other["points_7d"] == pytest.approx(80, abs=0.1)  # never more
+    assert other["cost_usd"] == 10.0  # rounded per agent; $10.004 in all
     assert other["note"].startswith("1 sessions outside a run")
     [run] = out["runs"].values()
+    conforms(run, RUN_USAGE)
     assert run["week_points"] is None  # the orchestrator itself spent nothing here
+    assert run["account"] is None and run["max_workers"] == 2  # builder and tester
+    assert run["hours"] == 96
     assert out["accounts"]["1"]["windows"]["seven_day"]["machine_cost_usd"] == 90.01
+
+
+def test_sessions_from_before_the_account_capture_have_no_account_and_their_cost(world):
+    busy_fleet(world)
+    spend(world, "s-old", assistant(world.t - 600, "m1", 1_000_000))
+    spend(world, "s-older", assistant(world.t - 700, "m2", 2_000_000))
+    out = world.get(world.serve.Gateway(), "/v1/usage?hours=168")[1]
+    conforms(out, USAGE)
+    [other] = out["other"]
+    assert other["account"] is None and other["cost_usd"] == 60.0  # each rounded to cents
+    assert other["note"].startswith("2 sessions outside a run")
+
+
+def test_a_runs_hours_stop_at_its_end_and_max_workers_comes_from_its_settings(world):
+    costly_run(world)
+    change_run(world, settings={"max_workers": 5}, ended=world.t - 2 * 86400)
+    spend(world, f"s-{BOSS}", assistant(world.t - 3 * 86400, "m1", 1_000_000))
+    [run] = world.get(world.serve.Gateway(), "/v1/usage?hours=168")[1]["runs"].values()
+    conforms(run, RUN_USAGE)
+    assert run["hours"] == 48 and run["max_workers"] == 5 and run["account"] == "1"
+    assert run["cost"] == 20.0
+
+
+def test_a_running_runs_hours_count_to_now_not_its_end(world):
+    costly_run(world)
+    world.t += 3600
+    [run] = world.get(world.serve.Gateway(), "/v1/usage?hours=168")[1]["runs"].values()
+    assert run["hours"] == 97 and run["ended"] is None
+
+
+def costly_run(world):
+    """The run's orchestrator and builder spent $20.004 each, all of this machine's week so far
+    (80%): the run has cost $40.01 and 80 points."""
+    busy_fleet(world)
+    spend(world, f"s-{BOSS}", assistant(world.t - 1800, "m1", 1_000_000))
+    spend(world, f"s-{W1}", assistant(world.t - 600, "m2", 1_000_000))
+    change_run(world, created=world.t - 4 * 86400)
+
+
+def test_an_agent_herdr_cant_read_is_unknown_not_working(world):
+    busy_fleet(world)
+    world.agent(W1, "unknown", change=8)
+    world.agent(BOSS, "unknown", name="Website")
+    status, fleet = world.get(world.serve.Gateway(), "/v1/fleet")
+    assert status == 200
+    conforms(fleet, FLEET)
+    lead = fleet["orchestrators"][0]
+    builder = next(w for w in lead["workers"] if w["pane"] == W1)
+    assert builder["state"] == "unknown" and builder["agent_status"] == "unknown"
+    assert lead["agent"]["state"] == "unknown"
+    assert lead["activity"] == "working" and lead["stall"] is None  # nothing shows it stopped
+
+
+def test_the_fleet_has_the_run_cost_from_the_background_pass_only(world, monkeypatch):
+    costly_run(world)
+    gw = world.serve.Gateway()
+    assert "cost_usd" not in gw.fleet()[1]["orchestrators"][0]["run"]  # no pass yet
+    world.serve.warm_usage(gw)
+
+    def no_scan(*args, **kwargs):
+        raise AssertionError("a fleet read scanned the transcripts")
+    monkeypatch.setattr(world.serve.orch_usage, "report", no_scan)
+    monkeypatch.setattr(world.serve.orch_usage, "scan", no_scan)
+    status, fleet = world.get(gw, "/v1/fleet")
+    assert status == 200
+    conforms(fleet, FLEET)
+    run = fleet["orchestrators"][0]["run"]
+    assert run["cost_usd"] == 40.01 and run["week_points"] == pytest.approx(80, abs=0.01)
+    assert run["goal"] == "ship the fixes"  # next to the run's own fields
+
+
+def test_a_run_whose_lead_spent_long_before_the_default_period_still_has_week_points(world):
+    costly_run(world)
+    spend(world, f"s-{BOSS}", assistant(world.t - 3 * 86400, "m1", 1_000_000))
+    gw = world.serve.Gateway()
+    world.serve.warm_usage(gw)
+    assert gw.fleet()[1]["orchestrators"][0]["run"]["week_points"] == pytest.approx(80, abs=0.01)
+    assert gw.usage(1)["runs"][next(iter(gw.run_costs))]["week_points"] is None  # why: not 1 h
+
+
+def test_a_questions_evidence_and_rule_reach_the_fleet_and_its_push(world, cloud):
+    start_run(world)
+    gw = world.serve.Gateway()
+    pair(world, gw)
+    gw.pusher.cycle()
+    cloud.pushes.clear()
+    chip = {"kind": "pr", "label": "#12 checks 14/14", "pane": W1, "tab": "diff", "ok": True}
+    qid = world.orch.ask(W1, "Merge #12?", [{"label": "Merge"}], evidence=[chip], rule="D27")
+    q = gw.fleet()[1]["orchestrators"][0]["questions"][0]
+    conforms(q, QUESTION)
+    assert q["id"] == qid and q["evidence"] == [chip] and q["rule"] == "D27"
+    gw.pusher.cycle()
+    [push] = [p["message"] for p in cloud.pushes if p["message"]["kind"] == "question"]
+    assert push["body"]["evidence"] == [chip] and push["body"]["rule"] == "D27"
+
+
+def test_an_earlier_session_with_no_account_doesnt_hide_the_agents_account(world):
+    costly_run(world)
+    # the orchestrator's previous generation: known from its lineage folder, not by an account
+    spend(world, "zzzzzzzz-old", assistant(world.t - 7200, "m3", 1_000_000))
+    (world.root / "w1-p0" / "w1-p0-20261105-080000-zzzzzzzz").mkdir(parents=True)
+    out = world.get(world.serve.Gateway(), "/v1/usage?hours=168")[1]
+    [lead] = [a for a in out["agents"] if a["pane"] == BOSS]
+    assert lead["accounts"] == ["1", "unknown"]
+    assert lead["account"] == "1" and lead["points_7d"] is not None
+    [run] = out["runs"].values()
+    assert run["account"] == "1" and run["week_points"] is not None
+
+
+def set_reading(world, **fields):
+    path = world.root / "usage.json"
+    usage = json.loads(path.read_text())
+    usage["accounts"]["1"].update(fields)
+    path.write_text(json.dumps(usage))
+
+
+def test_points_are_null_while_the_window_opened_before_the_capture_began(world):
+    costly_run(world)
+    spend(world, "s-other", assistant(world.t - 600, "m4", 500_000))
+    usage = json.loads((world.root / "usage.json").read_text())
+    usage["sessions"] = {"s-other": {"account": "1", "time": world.t}}
+    (world.root / "usage.json").write_text(json.dumps(usage))
+    set_reading(world, capture_since=world.t - 3600)  # the window opened 6 days ago
+    gw = world.serve.Gateway()
+    world.serve.warm_usage(gw)
+
+    status, out = world.get(gw, "/v1/usage?hours=168")
+    assert status == 200
+    conforms(out, USAGE)
+    periods = ("points_last_hour", "points_today", "points_7d")
+    for row in [*out["agents"], *out["other"]]:
+        assert [row[k] for k in periods] == [None, None, None]
+    assert out["other"][0]["cost_usd"] == 10.0  # the dollars are still right
+    for agent in out["accounts"]["1"]["windows"]["seven_day"]["agents"].values():
+        assert agent["estimated_points"] is None
+    run = next(iter(out["runs"].values()))
+    assert run["week_points"] is None and run["cost"] == 40.01 and run["account"] == "1"
+    fleet = gw.fleet()[1]
+    conforms(fleet, FLEET)
+    assert fleet["orchestrators"][0]["run"]["week_points"] is None
+    assert fleet["orchestrators"][0]["run"]["cost_usd"] == 40.01
+
+
+def test_points_come_back_with_the_first_window_opened_after_the_capture_began(world):
+    costly_run(world)
+    set_reading(world, capture_since=world.t - 3600)
+    gw = world.serve.Gateway()
+    assert gw.usage(168)["agents"][0]["points_7d"] is None
+    set_reading(world, windows={"seven_day": {"used_percentage": 10,  # opened 30 minutes ago
+                                              "resets_at": world.t + 7 * 86400 - 1800}})
+    spend(world, f"s-{BOSS}", assistant(world.t - 1800, "m1", 1_000_000),
+          assistant(world.t - 60, "m5", 1_000_000))
+    [lead] = [a for a in gw.usage(168)["agents"] if a["pane"] == BOSS]
+    assert lead["points_7d"] == pytest.approx(6.7, abs=0.05)  # 2 of its 3 messages' cost
+
+
+def test_a_reading_with_no_capture_time_has_no_points(world):
+    costly_run(world)
+    set_reading(world, capture_since=None)
+    out = world.serve.Gateway().usage(168)
+    assert out["agents"][0]["points_7d"] is None
+    assert next(iter(out["runs"].values()))["week_points"] is None
+
+
+def test_a_state_push_carries_the_run_cost(world, cloud):
+    costly_run(world)
+    gw = world.serve.Gateway()
+    pair(world, gw)
+    world.serve.warm_usage(gw)
+    cloud.pushes.clear()
+    gw.pusher.cycle()
+    [state] = [p["message"] for p in cloud.pushes
+               if p["message"]["kind"] == "state" and p["message"]["orchestrator"] == BOSS]
+    assert state["body"]["run"]["cost_usd"] == 40.01
+    assert state["body"]["run"]["week_points"] == pytest.approx(80, abs=0.01)
 
 
 # --- actions ----------------------------------------------------------------------------------------
@@ -1386,6 +1578,9 @@ HEALTH = {"machine": str, "version": str, "time": NUM, "addr?": str, "orchestrat
           "can_start": bool, "cannot_start?": str,
           "accounts": dict, "push": {"registered": bool, "seq": int, "last_sent?": NUM,
                                      "last_heartbeat?": NUM, "error?": str},
+          "capacity?": {"agents": int, "mem_free_gb": NUM, "mem_total_gb": NUM,
+                        "load_avg": [NUM], "cores": int},
+          "gaming": bool, "gaming_since?": NUM,
           "relay?": {"last_poll?": NUM, "error?": str}}
 PAIRED = {"machine": str, "version": str, "orchestrators": [str], "accounts": dict,
           "test_push": {"seq": int, "sent": NUM, "error?": str}}
@@ -1465,18 +1660,131 @@ def test_health_and_the_server_header(world, cloud):
     try:
         with pytest.raises(urllib.error.HTTPError) as refused:
             urllib.request.urlopen(url, timeout=10)
-        assert refused.value.code == 401 and refused.value.headers["Server"] == "orch/1.0.0"
+        assert refused.value.code == 401 and refused.value.headers["Server"] == "orch/1.1.0"
         req = urllib.request.Request(url, headers={"Authorization": f"Bearer {TOKEN}"})
         with urllib.request.urlopen(req, timeout=10) as r:
-            assert r.headers["Server"] == "orch/1.0.0"
+            assert r.headers["Server"] == "orch/1.1.0"
             health = json.loads(r.read())
     finally:
         server.shutdown()
         server.server_close()
     conforms(health, HEALTH)
-    assert health["version"] == "1.0.0" and health["addr"] == "100.64.0.1"
+    assert health["version"] == "1.1.0" and health["addr"] == "100.64.0.1"
     assert health["accounts"] == {"1": "main", "2": "spare"} and "relay" not in health
     assert health["push"]["registered"] is False and health["push"]["seq"] == 0
+
+
+def fake_proc(tmp_path, monkeypatch, serve, meminfo, comms):
+    proc = tmp_path / "proc"
+    proc.mkdir()
+    if meminfo is not None:
+        (proc / "meminfo").write_text(meminfo)
+    for pid, comm in comms.items():
+        (proc / pid).mkdir()
+        if comm:
+            (proc / pid / "comm").write_text(comm + "\n")
+    (proc / "sys").mkdir()  # no pid: never counted
+    (proc / "sys" / "comm").write_text("claude\n")
+    monkeypatch.setattr(serve.orch, "PROC", proc)
+    monkeypatch.setattr(serve.os, "getloadavg", lambda: (1.234, 0.5, 0.25))
+    monkeypatch.setattr(serve.os, "cpu_count", lambda: 16)
+
+
+MEMINFO = """MemTotal:       31457280 kB
+MemFree:         1048576 kB
+MemAvailable:    9961472 kB
+HugePages_Total:       0
+"""
+
+
+def test_health_says_how_full_the_machine_is(world, cloud, tmp_path, monkeypatch):
+    # 1048576 kB is 1 GiB. MemAvailable, not MemFree: the page cache can be given back.
+    fake_proc(tmp_path, monkeypatch, world.serve, MEMINFO,
+              {"10": "claude", "11": "claude", "12": "bash", "13": ""})
+    gw = world.serve.Gateway()
+    status, health = world.get(gw, "/v1/health")
+    assert status == 200
+    conforms(health, HEALTH)
+    assert health["capacity"] == {"agents": 2, "mem_free_gb": 9.5, "mem_total_gb": 30.0,
+                                  "load_avg": [1.23, 0.5, 0.25], "cores": 16}
+
+
+@pytest.mark.parametrize("meminfo", [None, "MemTotal: 31457280 kB\n",
+                                     "MemTotal: x kB\nMemAvailable: y kB\n",
+                                     "MemTotal:\nMemAvailable:\n", "no colon here\n"])
+def test_a_machine_without_a_readable_meminfo_has_no_capacity(world, cloud, tmp_path, monkeypatch,
+                                                              meminfo):
+    fake_proc(tmp_path, monkeypatch, world.serve, meminfo, {"10": "claude"})
+    status, health = world.get(world.serve.Gateway(), "/v1/health")
+    assert status == 200 and health["capacity"] is None
+    conforms(health, HEALTH)
+
+
+def gaming_events(world):
+    return [e for e in world.events() if e["kind"] == "gaming"]
+
+
+def test_the_gaming_flag_set_here_shows_in_health_and_the_fleet(world, cloud, capsys):
+    gw = world.serve.Gateway()
+    assert world.get(gw, "/v1/health")[1]["gaming"] is False
+    assert world.get(gw, "/v1/fleet")[1]["gaming"] is False
+    world.orch.main(["machine"])
+    assert capsys.readouterr().out == "not gaming\n"
+
+    world.orch.main(["machine", "--gaming", "on"])
+    capsys.readouterr()
+    health = world.get(gw, "/v1/health")[1]
+    conforms(health, HEALTH)
+    assert health["gaming"] is True and health["gaming_since"] == world.t
+    fleet = world.get(gw, "/v1/fleet")[1]
+    conforms(fleet, FLEET)
+    assert fleet["gaming"] is True
+    [event] = gaming_events(world)
+    assert event["gaming"] is True and event["by"] == "orch machine"
+    assert event["title"] == "Gaming on on box1"
+
+    world.t += 600  # on again: still the first time, and no second event
+    world.orch.main(["machine", "--gaming", "on"])
+    world.orch.main(["machine", "--json"])
+    capsys.readouterr()
+    assert world.get(gw, "/v1/health")[1]["gaming_since"] == world.t - 600
+    assert len(gaming_events(world)) == 1
+    world.orch.main(["machine"])
+    assert capsys.readouterr().out.startswith("gaming since 10:00, by orch machine")
+
+    world.orch.main(["machine", "--gaming", "off", "--json"])
+    assert json.loads(capsys.readouterr().out) == {"gaming": False, "gaming_since": None}
+    health = world.get(gw, "/v1/health")[1]
+    assert health["gaming"] is False and health["gaming_since"] is None
+    assert [e["gaming"] for e in gaming_events(world)] == [True, False]
+
+
+def test_the_phone_sets_the_gaming_flag_and_a_retry_changes_nothing(world, cloud):
+    gw = world.serve.Gateway()
+    pair(world, gw)
+    action = {"id": "g1", "time": world.t, "kind": "gaming", "on": True}
+    status, out = gw.route("POST", "/v1/actions", {}, action, "127.0.0.1")
+    assert status == 202 and out["status"] == "delivered"
+    assert world.get(gw, "/v1/health")[1]["gaming"] is True
+    [event] = gaming_events(world)
+    assert event["by"] == "phone (OnePlus 12)"
+
+    world.t += 60
+    assert gw.route("POST", "/v1/actions", {}, action, "127.0.0.1")[0] == 202
+    assert world.get(gw, "/v1/health")[1]["gaming_since"] == world.t - 60
+    assert len(gaming_events(world)) == 1
+
+    off = {"id": "g2", "time": world.t, "kind": "gaming", "on": False}
+    assert gw.route("POST", "/v1/actions", {}, off, "127.0.0.1")[0] == 202
+    assert world.get(gw, "/v1/health")[1]["gaming"] is False
+
+
+@pytest.mark.parametrize("on", [None, "on", 1])
+def test_the_gaming_action_needs_a_true_or_false(world, cloud, on):
+    gw = world.serve.Gateway()
+    status, out = world.post(gw, kind="gaming", **({} if on is None else {"on": on}))
+    assert status == 400 and out["error"] == "on is missing"
+    assert world.get(gw, "/v1/health")[1]["gaming"] is False
 
 
 def test_pairing_stores_the_token_and_sends_a_test_push(world, cloud):
@@ -1484,10 +1792,10 @@ def test_pairing_stores_the_token_and_sends_a_test_push(world, cloud):
     status, paired = pair(world, gw)
     assert status == 200
     conforms(paired, PAIRED)
-    assert paired["test_push"] == {"seq": 1, "sent": world.t}
+    assert paired["test_push"] == {"seq": 0, "sent": world.t}
     [push] = cloud.pushes
     assert push["token"] == "fcm-1" and push["android"] == {"priority": "NORMAL", "ttl": "300s"}
-    assert push["message"] == {"seq": 1, "sent": world.t, "kind": "test", "orchestrator": None,
+    assert push["message"] == {"seq": 0, "sent": world.t, "kind": "test", "orchestrator": None,
                                "body": None}
     phones = world.serve.orch_push.PHONES
     assert stat.S_IMODE(os.stat(phones).st_mode) == 0o600
@@ -1496,11 +1804,11 @@ def test_pairing_stores_the_token_and_sends_a_test_push(world, cloud):
         "token_error": None, "device": "OnePlus 12", "app_version": "0.3.0", "relay_uid": "uid1"}
     health = gw.route("GET", "/v1/health", {}, None, "127.0.0.1")[1]
     conforms(health, HEALTH)
-    assert health["push"] == {"registered": True, "seq": 1, "last_sent": world.t,
+    assert health["push"] == {"registered": True, "seq": 0, "last_sent": world.t,
                               "last_heartbeat": None}
     assert health["relay"] == {"last_poll": None, "error": None}
     world.t += 60
-    assert pair(world, gw, token="fcm-2")[1]["test_push"]["seq"] == 2  # a new token replaces it
+    assert pair(world, gw, token="fcm-2")[1]["test_push"]["seq"] == 0  # a new token replaces it
     assert json.loads(phones.read_text())["nPHONE"]["fcm_token"] == "fcm-2"
     assert cloud.pushes[-1]["token"] == "fcm-2"
 
@@ -1524,13 +1832,39 @@ def test_a_test_push_goes_once_to_the_phone_that_asks_at_normal_priority(world, 
                            "picked_at": None, "error": None})
     [push] = cloud.pushes
     assert push["token"] == "fcm-1" and push["android"] == {"priority": "NORMAL", "ttl": "300s"}
-    assert push["message"] == {"seq": 2, "sent": world.t, "kind": "test", "orchestrator": None,
+    assert push["message"] == {"seq": 0, "sent": world.t, "kind": "test", "orchestrator": None,
                                "body": None}
 
     assert from_the_phone(world, gw, **action) == first  # a retry: same answer, no second push
     assert len(cloud.pushes) == 1
     assert from_the_phone(world, gw, id="t2", time=world.t)[0] == 202  # a new tap, a new action
-    assert [p["message"]["seq"] for p in cloud.pushes] == [2, 3]
+    assert [p["message"]["seq"] for p in cloud.pushes] == [0, 0]
+
+
+def test_a_test_push_leaves_no_number_for_another_phone_to_wait_for(world, cloud):
+    """A gap in seq is a lost push to the app, and a `test` reaches one phone only."""
+    gw = world.serve.Gateway()
+    pair(world, gw)
+    phones = world.serve.orch_push.load_phones()
+    phones["nOTHER"] = {"fcm_token": "fcm-other", "token_error": None}
+    world.serve.orch_push.save_phones(phones)
+    gw.pusher.cycle()
+    cloud.pushes.clear()
+
+    world.orch.emit("spill", "Account 1 at 98%: moving to 2", "its week reached 98%", None)
+    gw.pusher.cycle()
+    assert from_the_phone(world, gw, id="t1", time=world.t)[0] == 202
+    assert pair(world, gw, token="fcm-2")[1]["test_push"]["seq"] == 1  # the current number
+    world.t += 1
+    world.orch.emit("spill", "Account 1 back under 98%", "its week reset", None)
+    gw.pusher.cycle()
+
+    other = [(p["message"]["kind"], p["message"]["seq"]) for p in cloud.pushes
+             if p["token"] == "fcm-other"]
+    assert other == [("spill", 1), ("spill", 2), ("actions", 3)]  # no number missing
+    mine = [(p["message"]["kind"], p["message"]["seq"]) for p in cloud.pushes
+            if p["token"] != "fcm-other"]
+    assert mine == [("spill", 1), ("test", 1), ("test", 1), ("spill", 2), ("actions", 3)]
 
 
 def test_a_test_push_from_a_phone_that_never_paired_is_refused(world, cloud):
@@ -1642,9 +1976,9 @@ def test_the_push_loop_sends_what_the_phone_needs_once(world, cloud):
     # in the order queued; collapsible kinds carry the current seq without raising it, and
     # account 1 burns 4 %/h, so it runs out before its reset: a `usage` alert
     assert [(p["message"]["kind"], p["message"]["orchestrator"], p["message"]["seq"])
-            for p in cloud.pushes] == [("state", BOSS, 1), ("state", LOOSE, 1),
-                                       ("usage", None, 2), ("accounts", None, 2),
-                                       ("heartbeat", None, 2)]
+            for p in cloud.pushes] == [("state", BOSS, 0), ("state", LOOSE, 0),
+                                       ("usage", None, 1), ("accounts", None, 1),
+                                       ("heartbeat", None, 1)]
     states = {p["message"]["orchestrator"]: p for p in cloud.pushes if p["message"]["kind"] == "state"}
     assert states[BOSS]["android"] == {"priority": "NORMAL", "ttl": "86400s",
                                        "collapse_key": f"{MACHINE}:state:{BOSS}"}
@@ -1657,14 +1991,14 @@ def test_the_push_loop_sends_what_the_phone_needs_once(world, cloud):
     world.t += 31  # the tester's dialog has been open for 30 s now
     gw.pusher.cycle()
     [dialog] = cloud.pushes
-    assert dialog["message"]["kind"] == "dialog" and dialog["message"]["seq"] == 3
+    assert dialog["message"]["kind"] == "dialog" and dialog["message"]["seq"] == 2
     assert dialog["android"] == {"priority": "HIGH", "ttl": "86400s"}
     assert dialog["message"]["orchestrator"] == BOSS and dialog["message"]["body"]["pane"] == W2
     cloud.pushes.clear()
     qid = world.orch.ask(W1, "Merge #12?", [{"label": "Merge"}, {"label": "Not yet"}])
     gw.pusher.cycle()
     [question] = cloud.pushes
-    assert question["message"]["kind"] == "question" and question["message"]["seq"] == 4
+    assert question["message"]["kind"] == "question" and question["message"]["seq"] == 3
     assert question["android"]["priority"] == "HIGH"
     assert question["message"]["orchestrator"] == BOSS
     conforms(question["message"]["body"], QUESTION)
@@ -1674,17 +2008,17 @@ def test_the_push_loop_sends_what_the_phone_needs_once(world, cloud):
     gw.pusher.cycle()
     assert sorted(cloud.kinds()) == ["stall", "state"]
     [stall] = [p for p in cloud.pushes if p["message"]["kind"] == "stall"]
-    assert stall["message"]["seq"] == 5 and stall["message"]["orchestrator"] == BOSS
+    assert stall["message"]["seq"] == 4 and stall["message"]["orchestrator"] == BOSS
     conforms(stall["message"]["body"], STALL)
     cloud.pushes.clear()
     world.t += 600
     gw.pusher.cycle()
     [beat] = [p for p in cloud.pushes if p["message"]["kind"] == "heartbeat"]
     assert beat["android"]["collapse_key"] == f"{MACHINE}:heartbeat:"
-    assert beat["message"]["seq"] == 5 and set(beat["message"]["body"]["states"]) == {BOSS, LOOSE}
+    assert beat["message"]["seq"] == 4 and set(beat["message"]["body"]["states"]) == {BOSS, LOOSE}
     assert "dialog" not in cloud.kinds() and "stall" not in cloud.kinds()  # each went once
     health = gw.route("GET", "/v1/health", {}, None, "127.0.0.1")[1]["push"]
-    assert health["seq"] == 5 and health["last_heartbeat"] == world.t
+    assert health["seq"] == 4 and health["last_heartbeat"] == world.t
 
 
 def test_events_become_pushes_and_old_ones_are_skipped(world, cloud):
@@ -1698,7 +2032,7 @@ def test_events_become_pushes_and_old_ones_are_skipped(world, cloud):
     world.orch.emit("report", "Worker report", "...", W1)  # not a push
     gw.pusher.cycle()
     assert [(p["message"]["kind"], p["message"]["orchestrator"], p["message"]["seq"])
-            for p in cloud.pushes] == [("system", BOSS, 2), ("spill", None, 3)]
+            for p in cloud.pushes] == [("system", BOSS, 1), ("spill", None, 2)]
     assert cloud.pushes[0]["message"]["body"] == {
         "time": world.t, "kind": "respawn-failed", "title": "Handoff takeover failed",
         "body": "w1:p1: at a dialog", "pane": W1}
@@ -1768,7 +2102,7 @@ def test_the_relay_runs_each_action_once_and_pushes_its_status(world, cloud):
     assert acts["message"]["body"] == [{"id": "r1", "status": "delivered",
                                         "delivered_at": world.t, "picked_at": None,
                                         "error": None}]
-    assert acts["message"]["seq"] == 3 and acts["android"]["priority"] == "NORMAL"
+    assert acts["message"]["seq"] == 2 and acts["android"]["priority"] == "NORMAL"
     prompts = len(world.prompts)
     cloud.write("uid1", answer)  # the same message again (a replay, or a failed delete)
     cloud.write("uid1", dict(answer, id="r2", text="Merge"))  # the question is closed now
@@ -1825,7 +2159,7 @@ def test_a_passing_failure_keeps_the_push_for_the_next_pass(world, cloud):
     world.t += 20
     gw.pusher.cycle()
     [question] = cloud.pushes
-    assert question["message"]["seq"] == 2 and question["message"]["sent"] == world.t
+    assert question["message"]["seq"] == 1 and question["message"]["sent"] == world.t
 
 
 def test_without_a_service_account_nothing_is_pushed_and_health_says_why(world, cloud):

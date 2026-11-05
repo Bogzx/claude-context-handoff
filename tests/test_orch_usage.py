@@ -49,6 +49,13 @@ def reading(u, t, session="s1", env=None, root=None, **limits):
               root or u.root, t)
 
 
+def set_capture_since(u, when, account="1"):
+    path = u.root / "usage.json"
+    data = json.loads(path.read_text())
+    data["accounts"][account]["capture_since"] = when
+    path.write_text(json.dumps(data))
+
+
 def refresh(u, at, session="s1", **limits):
     """The statusline of a session that got no new API response repeats its limits at `at`."""
     u.capture(statusline(session=session, transcript=str(transcript_of(u, session)), **limits),
@@ -56,6 +63,37 @@ def refresh(u, at, session="s1", **limits):
 
 
 # --- capture --------------------------------------------------------------------------------------
+
+def entry_of(u, account="1"):
+    return json.loads((u.root / "usage.json").read_text())["accounts"][account]
+
+
+def test_capture_keeps_when_the_accounts_capture_began(u):
+    reading(u, T0)
+    reading(u, T0 + 600, week=61.0)
+    assert entry_of(u)["read_at"] == T0 + 600 and entry_of(u)["capture_since"] == T0
+    assert u.windows_report(u.root, T0 + 600)["1"]["capture_since"] == T0
+
+
+def test_capture_began_when_it_ran_not_when_the_reading_was_made(u):
+    write(transcript_of(u, "s1"), assistant("m1", T0))
+    refresh(u, T0 + 5 * HOUR)  # an idle session's first statusline
+    assert entry_of(u)["read_at"] == T0 and entry_of(u)["capture_since"] == T0 + 5 * HOUR
+
+
+def test_a_machine_capturing_before_this_was_kept_dates_it_from_its_history(u):
+    u.root.mkdir(parents=True, exist_ok=True)
+    (u.root / "usage-history.jsonl").write_text(
+        json.dumps({"time": T0 - 900, "account": "2", "windows": {}}) + "\n"
+        + '{"time": 17, "account": "1", "wind\n'  # cut short by a killed capture
+        + json.dumps({"time": T0 - 600, "account": "1", "windows": {}}) + "\n"
+        + json.dumps({"time": T0 - 300, "account": "1", "windows": {}}) + "\n")
+    reading(u, T0)
+    assert entry_of(u)["capture_since"] == T0 - 600
+    set_capture_since(u, T0 - 700)  # stored: the history isn't read again
+    reading(u, T0 + 60, week=61.0)
+    assert entry_of(u)["capture_since"] == T0 - 700
+
 
 def test_capture_keeps_the_latest_per_account_and_history_every_5_minutes(u):
     reading(u, T0, five=20.0)
@@ -325,6 +363,7 @@ def test_report_per_agent_run_day_and_window_share(u):
     write(u.projects / "p" / "loose.jsonl", assistant("l1", T0 - HOUR, model="claude-x-1",
                                                       read=0, w1=0))
     reading(u, T0, session="boss", five=30.0)
+    set_capture_since(u, T0 - 30 * 86400)
     agents = {"w1:p1": {"name": "builder-agent", "agent_session": {"value": "work"}}}
 
     rep = u.report(u.root, u.projects, agents, T0, 24)
@@ -359,6 +398,30 @@ def utc(monkeypatch):
     time.tzset()
 
 
+WEEK = 7 * 86400
+
+
+@pytest.mark.parametrize(("began", "known"), [(-1, True), (0, True), (1, False), (None, False)])
+def test_points_need_a_capture_from_before_the_window_opened(u, utc, began, known):
+    """Sessions from before the capture have no account, so their cost is missing from the
+    window's and the points per USD read too high: no number rather than a wrong one."""
+    status_file(u, "w1:p0", "boss")
+    write(u.projects / "p" / "boss.jsonl",
+          assistant("h", T0 - HOUR / 2, inp=0, out=1000, read=0, w1=0))
+    reading(u, T0, session="boss", week=60.0, week_reset=T0 + 86400)
+    opened = T0 + 86400 - WEEK
+    set_capture_since(u, None if began is None else opened + began)
+
+    rep = u.report(u.root, u.projects, {}, T0, 24)
+
+    week = rep["accounts"]["1"]["windows"]["seven_day"]
+    assert week["points_known"] is known and week["machine_cost_usd"] == 0.02
+    agent = week["agents"]["w1:p0"]
+    assert agent["share"] == 1.0  # of the cost it can see, either way
+    points = [agent[k] for k in ("estimated_points", "points_last_hour", "points_today")]
+    assert points == ([60.0, 60.0, 60.0] if known else [None, None, None])
+
+
 def test_report_lists_every_known_account_and_points_of_the_last_hour_and_today(u, utc):
     status_file(u, "w1:p0", "boss")
     write(u.projects / "p" / "boss.jsonl",
@@ -366,6 +429,7 @@ def test_report_lists_every_known_account_and_points_of_the_last_hour_and_today(
           + assistant("t", T0 - 3 * HOUR, inp=0, out=3000, read=0, w1=0)  # $0.06, today
           + assistant("y", T0 - 20 * HOUR, inp=0, out=6000, read=0, w1=0))  # $0.12, yesterday
     reading(u, T0, session="boss", week=60.0)  # 60 points for $0.20
+    set_capture_since(u, T0 - 30 * 86400)
 
     rep = u.report(u.root, u.projects, {}, T0, 24, {"1": {"name": "main", "login": "abc"},
                                                     "2": {"name": "spare"}})

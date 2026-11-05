@@ -10,7 +10,7 @@ for a QR code. `orch serve --allow-self` also admits this machine's own node: fo
 Reads: GET /v1/health, /v1/fleet, /v1/usage, /v1/orchestrators/<pane>/decisions,
 /v1/orchestrators/<pane>/history, /v1/panes/<pane>/screen, /v1/actions/<id>.
 Writes: POST /v1/actions, one action per request (prompt, answer, interrupt, park, unpark, run,
-nudge, account, default_account, spill, ack, push_token). An action id runs once: a retry gets
+nudge, account, default_account, spill, ack, push_token, gaming). An action id runs once: a retry gets
 the first result. Every action is logged to events.jsonl (kind "action", source "app" or
 "relay"). POST /v1/pair registers the phone's FCM token (a node of the machine's own Tailscale
 user with the right token joins the allow-list); DELETE /v1/pair forgets it.
@@ -42,7 +42,7 @@ import orch_new
 import orch_push
 import orch_usage
 
-VERSION = "1.0.0"  # the gateway's, in the Server header and /v1/health
+VERSION = "1.1.0"  # the gateway's, in the Server header and /v1/health
 PORT = 7433
 CONFIG = orch.CONFIG
 KEEP = 86400  # action results kept for retries
@@ -56,8 +56,12 @@ NOT_PAIRED = 3  # serve's exit status without a token; the unit counts it as a c
 
 
 def warm_usage(gateway):
-    """Keep the transcript scan current, so /v1/usage doesn't pay for a long first scan."""
-    orch_usage.scan(orch.ROOT, Path.home() / ".claude" / "projects", orch.now(), orch.agents())
+    """Keep the transcript scan current, so /v1/usage doesn't pay for a long first scan, and the
+    runs' cost for the fleet, whose every read and push can't wait for a scan. The whole
+    retention: a run's account is found from its orchestrator's use in the period."""
+    runs = gateway.usage(orch_usage.RETENTION / 3600)["runs"]
+    gateway.run_costs = {rid: {"cost_usd": r["cost"], "week_points": r["week_points"]}
+                         for rid, r in runs.items()}
 
 
 def push_and_relay(gateway):
@@ -142,12 +146,31 @@ def read_events(limit=EVENTS_TAIL):
     return out
 
 
+def capacity():
+    """What the New orchestrator form shows of this machine, or None without /proc: every claude
+    process counts, in a herdr pane or not, because they all share the memory (in GiB)."""
+    try:
+        mem = dict(x.split(":", 1) for x in (orch.PROC / "meminfo").read_text().splitlines())
+        free, total = (int(mem[k].split()[0]) / 2**20 for k in ("MemAvailable", "MemTotal"))
+        return {"agents": sum(1 for _ in orch.claude_processes()),
+                "mem_free_gb": round(free, 1), "mem_total_gb": round(total, 1),
+                "load_avg": [round(x, 2) for x in os.getloadavg()], "cores": os.cpu_count()}
+    except (OSError, KeyError, ValueError, IndexError):
+        return None
+
+
+def gaming():
+    state = orch.machine_state()
+    return {"gaming": bool(state.get("gaming")), "gaming_since": state.get("gaming_since")}
+
+
 def state_of(v):
-    """The six agent states of the app (as in `orch status`'s table)."""
+    """The seven agent states of the app (as in `orch status`'s table, and `unknown`: the agent
+    is there, but herdr can't say what it's doing)."""
     s = v["state"]
     if s in ("idle", "done"):
         return "parked" if v["park"] else "own-job" if v["bg"] else "idle"
-    return s if s in ("working", "blocked", "missing") else "working"  # herdr "unknown"
+    return s if s in ("working", "blocked", "missing") else "unknown"
 
 
 def report_json(report, role):
@@ -389,6 +412,7 @@ class Gateway:
         me = whois(tailscale_ip() or "") if allow_self else None
         self.self_names = (me or {}).get("names", set())
         self.pusher = orch_push.Pusher(self)
+        self.run_costs = {}  # run id -> {cost_usd, week_points}, from warm_usage
 
     # auth
 
@@ -488,7 +512,8 @@ class Gateway:
     def health(self, phone):
         out = {"machine": self.machine(), "version": VERSION, "time": orch.now(),
                "addr": tailscale_ip(), "orchestrators": self.orchestrators(),
-               "accounts": self.account_names(), "push": self.pusher.health(phone)}
+               "accounts": self.account_names(), "push": self.pusher.health(phone),
+               "capacity": capacity(), **gaming()}
         why = orch_new.cannot_start(read_env(self.config))
         out.update(can_start=why is None, **({"cannot_start": why} if why else {}),
                    dialogs=["trust", "permission"])
@@ -565,7 +590,7 @@ class Gateway:
         starts = self.starts(at)
         leads += [(p, None) for p in sorted(starts) if p not in {lead for lead, _ in leads}]
         return 200, {
-            "version": 1, "machine": self.machine(), "time": at,
+            "version": 1, "machine": self.machine(), "time": at, "gaming": gaming()["gaming"],
             "orchestrators": [self.orchestrator(p, r, ags, at, watchdog.get(p) or {}, nudges,
                                                 starts.get(p))
                               for p, r in leads],
@@ -598,8 +623,8 @@ class Gateway:
             activity, since = "done", run.get("ended") or run.get("until")
         elif lead["state"] == "missing":
             activity, since = "offline", None
-        elif lead["state"] in ("working", "blocked"):
-            activity, since = ("working" if lead["state"] == "working" else "waiting"), None
+        elif lead["state"] in ("working", "blocked", "unknown"):  # unknown: no stall to claim
+            activity, since = ("waiting" if lead["state"] == "blocked" else "working"), None
         else:
             reasons = orch.nudge_reasons(run, ags, at, copy.deepcopy(ws)) if run else {}
             activity, since = ("stalled" if reasons else "waiting"), lead["since"]
@@ -624,7 +649,8 @@ class Gateway:
             "cwd": (agent or {}).get("cwd") or (run or {}).get("cwd") or (start or {}).get("cwd"),
             "activity": activity, "activity_since": since, "agent": lead,
             "run": dict({k: run.get(k) for k in ("goal", "created", "until", "ended")},
-                        **({"settings": run["settings"]} if run.get("settings") else {}))
+                        **({"settings": run["settings"]} if run.get("settings") else {}),
+                        **self.run_costs.get(orch_usage.run_id(run), {}))
                    if run else None,
             "report": lead["report"],
             "questions": [question_json(q) for q in orch.shown_questions(run, at)],
@@ -718,11 +744,13 @@ class Gateway:
             if acc in accounts and "seven_day" in accounts[acc]["windows"]:
                 accounts[acc]["windows"]["seven_day"].update(
                     agents=week.get("agents") or {}, machine_cost_usd=week.get("machine_cost_usd"))
-            if week.get("machine_cost_usd") and week.get("used_percentage") is not None:
+            if (week.get("points_known") and week.get("machine_cost_usd")
+                    and week.get("used_percentage") is not None):
                 ratio[acc] = week["used_percentage"] / week["machine_cost_usd"]
         agents, other = [], {}
         for a in rep["agents"]:
-            account = a["accounts"][-1] if a["accounts"] else None
+            known = [x for x in a["accounts"] if x != "unknown"]  # older sessions may have none
+            account = (known or a["accounts"] or [None])[-1]
             a.update(account=account, model=a["models"][-1] if a["models"] else None,
                      orchestrator=(a["run"] or "").split("@")[0] or None,
                      tokens={k: a[k] for k in ("input", "output", "cache_read", "cache_write")},
@@ -733,9 +761,11 @@ class Gateway:
             if a["role"]:
                 agents.append(a)
                 continue
-            o = other.setdefault(account, {"label": "Other sessions", "account": account,
-                                           "sessions": 0, **{k: 0 for k in periods}})
+            o = other.setdefault(account, {
+                "label": "Other sessions", "account": None if account == "unknown" else account,
+                "sessions": 0, "cost_usd": 0, **{k: 0 for k in periods}})
             o["sessions"] += len(a["sessions"])
+            o["cost_usd"] = round(o["cost_usd"] + a["cost"], 2)
             for k in periods:
                 o[k] = None if a[k] is None or o[k] is None else round(o[k] + a[k], 2)
         for o in other.values():
@@ -743,6 +773,7 @@ class Gateway:
         for run in rep["runs"].values():
             lead = next((a for a in agents if a["pane"] == run["orchestrator"]), None)
             account = (lead or {}).get("account")
+            run["account"] = account
             run["week_points"] = (round(run["cost"] * ratio[account], 2) if account in ratio
                                   else None)
         rep.update(machine=self.machine(), accounts=accounts, agents=agents,
@@ -1025,6 +1056,10 @@ def act_spill(gw, body, rec):
     orch.set_spill(need(body, "rule"))
 
 
+def act_gaming(gw, body, rec):
+    orch.set_gaming(need(body, "on", bool), gw.who(rec.get("phone")))
+
+
 def act_ack(gw, body, rec):
     lead, ids = need(body, "orchestrator"), need(body, "decisions", list)
     path = orch.ROOT / "decisions-seen.json"
@@ -1220,7 +1255,7 @@ ACTIONS = {"prompt": act_prompt, "answer": act_answer, "interrupt": act_interrup
            "account": act_account, "default_account": act_default_account, "ack": act_ack,
            "spill": act_spill, "push_token": act_push_token, "test_push": act_test_push,
            "dialog": act_dialog, "start": act_start, "start_cancel": act_start_cancel,
-           "start_retry": act_start_retry}
+           "start_retry": act_start_retry, "gaming": act_gaming}
 
 
 # --- HTTP ----------------------------------------------------------------------------------------

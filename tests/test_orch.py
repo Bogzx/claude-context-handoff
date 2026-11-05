@@ -401,6 +401,51 @@ def test_ask_with_options_gives_the_push_its_buttons(world, tmp_path, monkeypatc
     assert q["id"] in capsys.readouterr().out
 
 
+CHIP = {"kind": "tests", "label": "212 passed", "pane": W1, "tab": "report", "ok": True}
+
+
+def test_ask_keeps_what_backs_the_question_and_the_rule_it_touches(world, tmp_path, monkeypatch):
+    pushed = event_log(tmp_path, monkeypatch)
+    start_run(world)
+
+    world.run("ask", "Merge?", "--option", "Merge", "--evidence", json.dumps(CHIP),
+              "--evidence", '{"kind": "pr", "label": "#12"}', "--rule", "D27")
+
+    [q] = json.loads((world.root / "runs" / "w1-p0.json").read_text())["questions"]
+    assert q["evidence"] == [CHIP, {"kind": "pr", "label": "#12"}] and q["rule"] == "D27"
+    [event] = pushed()
+    assert event["evidence"] == q["evidence"] and event["rule"] == "D27"
+
+
+def test_a_question_outside_a_run_keeps_them_too(world):
+    qid = world.orch.ask(BOSS, "Merge?", evidence=[CHIP], rule="D27")
+    run, q = world.orch.find_question(qid)
+    assert run is None and q["evidence"] == [CHIP] and q["rule"] == "D27"
+
+
+@pytest.mark.parametrize(("flags", "why"), [
+    (["--evidence", "{not json"], "takes JSON"),
+    (["--evidence", "[]"], "needs a kind"),
+    (["--evidence", '{"label": "#12"}'], "needs a kind"),
+    (["--evidence", '{"kind": "chart", "label": "#12"}'], "needs a kind"),
+    (["--evidence", '{"kind": "pr"}'], "needs a label"),
+    (["--evidence", '{"kind": "pr", "label": " "}'], "needs a label"),
+    (["--evidence", '{"kind": "pr", "label": "#12", "url": "x"}'], "the fields are"),
+    (["--evidence", '{"kind": "pr", "label": "#12", "tab": "log"}'], "tab is report or diff"),
+    (["--evidence", '{"kind": "pr", "label": "#12", "pane": 3}'], "pane is a pane id"),
+    (["--evidence", '{"kind": "pr", "label": "#12", "ok": "yes"}'], "ok is true or false"),
+    (["--rule", "be careful"], "isn't a decision id"),
+    (["--rule", "D27 and D28"], "isn't a decision id"),
+])
+def test_ask_refuses_what_the_app_could_not_show(world, capsys, flags, why):
+    start_run(world)
+    with pytest.raises(SystemExit):
+        world.run("ask", "Merge?", *flags)
+    assert why in capsys.readouterr().err
+    run = json.loads((world.root / "runs" / "w1-p0.json").read_text())
+    assert not run.get("questions")  # nothing was asked
+
+
 def test_danger_needs_an_option_before_it(world):
     with pytest.raises(SystemExit):
         world.run("ask", "x?", "--danger", "prod", "--option", "Yes")

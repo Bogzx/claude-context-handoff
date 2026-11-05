@@ -20,6 +20,7 @@ at every turn end (background tasks still running, last message). From those two
                   when it is next idle (the watchdog does it) or at its next handoff.
   orch usage      account windows from the statusline and tokens per agent (orch_usage.py).
   orch new        a new orchestrator in a new herdr tab: brief, decision log, run (orch_new.py).
+  orch machine    this machine's gaming flag, for the app's New orchestrator form.
   orch serve      the HTTP gateway for the owner's phone app, on the tailnet only, and
   orch pair       its pairing token (orch_serve.py).
 
@@ -56,9 +57,12 @@ NUDGE_EVERY = 15 * 60
 NUDGE_BACKOFF = 60 * 60  # after IGNORED nudges in a row on the same problem
 IGNORED = 3
 DANGER = ("none", "deploy", "prod", "destructive")  # what saying yes to an option does
+EVIDENCE = ("pr", "branch", "files", "tests")  # what backs a question: the app's chips
+EVIDENCE_TABS = ("report", "diff")  # where a chip with a pane opens that agent
 ANSWERED_SHOWN = 10 * 60  # an answered question stays in status this long (other devices)
 HOOK = Path(__file__).resolve().parent / "context-handoff.py"
 PROJECTS = Path.home() / ".claude" / "projects"  # the transcripts
+PROC = Path("/proc")
 STARTS = Path.home() / ".claude" / "orch" / "new"  # orch new: <id>/new.json and <id>/brief.md
 START_SHOWN = 86400  # an unfinished start shows in the fleet this long
 SMALL_CONTEXT = 60_000  # a switching agent with less context is resumed, not handed off
@@ -453,12 +457,35 @@ def default_answer(run, options, kind, default, by):
     return default, at
 
 
-def ask(pane, text, options=(), kind=None, default=None, by=None):
+def check_evidence(evidence, rule):
+    """Refuse what the app couldn't show: evidence is a list of {kind, label, pane?, tab?, ok?},
+    rule a decision id."""
+    for e in evidence:
+        if not isinstance(e, dict) or e.get("kind") not in EVIDENCE:
+            die(f"evidence {e!r} needs a kind: {', '.join(EVIDENCE)}")
+        if not isinstance(e.get("label"), str) or not e["label"].strip():
+            die(f"evidence {e!r} needs a label")
+        if set(e) - {"kind", "label", "pane", "tab", "ok"}:
+            die(f"evidence {e!r}: the fields are kind, label, pane, tab and ok")
+        if e.get("tab") not in (None, *EVIDENCE_TABS):
+            die(f"evidence {e!r}: tab is {' or '.join(EVIDENCE_TABS)}")
+        if not isinstance(e.get("pane"), (str, type(None))):
+            die(f"evidence {e!r}: pane is a pane id")
+        if not isinstance(e.get("ok"), (bool, type(None))):
+            die(f"evidence {e!r}: ok is true or false")
+    if rule is not None and not re.fullmatch(r"D\d+", rule):
+        die(f"rule {rule!r} isn't a decision id like D27")
+
+
+def ask(pane, text, options=(), kind=None, default=None, by=None, evidence=(), rule=None):
     """Log a question for the owner in the pane's run and events.jsonl and push it; returns its
     id. options: [{"label", "danger"}], the answers the owner's app offers as buttons. kind
     "plan": the plan of a new orchestrator (`orch new --plan-first`), drawn from its report.
-    default, by: the option it goes to with no reply by that time (default_answers)."""
+    default, by: the option it goes to with no reply by that time (default_answers). evidence,
+    rule: what backs it and the owner rule it touches, shown on the card (check_evidence)."""
     options = [{"label": o["label"], "danger": o.get("danger") or "none"} for o in options]
+    evidence = list(evidence)
+    check_evidence(evidence, rule)
     run, _ = run_of(pane)
     default, default_at = default_answer(run, options, kind, default, by)
     qid = "q" + os.urandom(4).hex()
@@ -470,7 +497,7 @@ def ask(pane, text, options=(), kind=None, default=None, by=None):
         run["questions"].append(
             {"id": qid, "time": now(), "pane": pane, "text": text, "options": options,
              "kind": kind, "answer": None, "answered": None, "default": default,
-             "default_at": default_at})
+             "default_at": default_at, "evidence": evidence, "rule": rule})
         save(run_path(run["orchestrator"]), run)
     body = text
     if options:
@@ -480,7 +507,7 @@ def ask(pane, text, options=(), kind=None, default=None, by=None):
         body += f"\nGoes to {default!r} at {clock(default_at)} unless you answer"
     emit("ask", f"Question from {pane} on {machine_name()}", body, pane, push=True, id=qid,
          question=text, options=options, question_kind=kind, default=default,
-         default_at=default_at)
+         default_at=default_at, evidence=evidence, rule=rule)
     start = start_of(pane) if kind == "plan" else {}
     if start.get("plan_first"):
         start_step(start, "read", "ok")
@@ -502,8 +529,42 @@ class OptionAction(argparse.Action):
         namespace.options = options
 
 
+def machine_state():
+    """This machine's flags from the owner: {gaming, gaming_since, gaming_by}."""
+    return load(STARTS.parent / "machine.json")
+
+
+def set_gaming(on, by):
+    """Mark the machine as gaming (the owner plays on it: no heavy work there) or not. It only
+    informs: a start can still choose this machine. Logged when it changes."""
+    state = machine_state()
+    if bool(state.get("gaming")) != on:
+        state = {"gaming": on, "gaming_since": now() if on else None, "gaming_by": by}
+        save(STARTS.parent / "machine.json", state)
+        emit("gaming", f"Gaming {'on' if on else 'off'} on {machine_name()}", f"by {by}",
+             gaming=on, by=by)
+    return state
+
+
+def cmd_machine(args):
+    state = set_gaming(args.gaming == "on", "orch machine") if args.gaming else machine_state()
+    if args.json:
+        print(json.dumps({"gaming": bool(state.get("gaming")),
+                          "gaming_since": state.get("gaming_since")}, indent=1))
+    elif state.get("gaming"):
+        print(f"gaming since {clock(state['gaming_since'])}, by {state.get('gaming_by')}")
+    else:
+        print("not gaming")
+    return 0
+
+
 def cmd_ask(args):
-    qid = ask(orchestrator(args), args.text, args.options or [], args.kind, args.default, args.by)
+    try:
+        evidence = [json.loads(e) for e in args.evidence or []]
+    except ValueError as e:
+        die(f"--evidence takes JSON: {e}")
+    qid = ask(orchestrator(args), args.text, args.options or [], args.kind, args.default, args.by,
+              evidence, args.rule)
     print(f"sent to the owner as {qid}; keep the rest of the fleet working while you wait for the "
           "answer")
     return 0
@@ -532,6 +593,7 @@ def find_question(qid):
                     found = {"id": qid, "time": e.get("time"), "pane": e.get("pane"),
                              "text": e.get("question") or e.get("body"),
                              "options": e.get("options") or [], "kind": e.get("question_kind"),
+                             "evidence": e.get("evidence") or [], "rule": e.get("rule"),
                              "answer": None, "answered": None}
                 elif e.get("kind") == "answer" and found:
                     found.update(answer=e.get("body"), answered=e.get("time"))
@@ -1083,18 +1145,24 @@ def set_name(account, name):
     return account_name(account, names)
 
 
+def claude_processes():
+    """The /proc folder of every claude process on this machine, in a herdr pane or not."""
+    for proc in PROC.iterdir():
+        try:
+            if proc.name.isdigit() and (proc / "comm").read_text().strip() == "claude":
+                yield proc
+        except OSError:
+            continue
+
+
 def pane_claudes():
     """herdr pane -> (pid, account) of the claude processes running in herdr panes, from
     /proc (the account is the process's CLAUDE_CONFIG_DIR, as claude-acc sets it)."""
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     import orch_usage
     out = {}
-    for proc in Path("/proc").iterdir():
-        if not proc.name.isdigit():
-            continue
+    for proc in claude_processes():
         try:
-            if (proc / "comm").read_text().strip() != "claude":
-                continue
             env = dict(x.split("=", 1) for x in
                        (proc / "environ").read_bytes().decode(errors="replace").split("\0")
                        if "=" in x)
@@ -1611,6 +1679,12 @@ def main(argv=None):
     a.add_argument("--default", help="the option this goes to with no reply by --by; not a "
                                      "dangerous option, not for a plan")
     a.add_argument("--by", help="when: HH:MM, 'YYYY-MM-DD HH:MM' or +30m")
+    a.add_argument("--evidence", action="append", metavar="JSON",
+                   help="what backs the question, a chip on its card (repeatable): "
+                        "'{\"kind\": \"pr\", \"label\": \"#12 checks 14/14\", \"pane\": \"w1:p2\", "
+                        "\"tab\": \"diff\", \"ok\": true}'; kind is pr, branch, files or tests; "
+                        "label and kind are required")
+    a.add_argument("--rule", help="the owner rule it touches: a decision id like D27")
     a.set_defaults(func=cmd_ask)
 
     ans = sub.add_parser("answer", help="record the owner's answer and prompt the asker")
@@ -1696,6 +1770,13 @@ def main(argv=None):
     nw.add_argument("--dry-run", action="store_true", help="print the steps, change nothing")
     nw.add_argument("--json", action="store_true")
     nw.set_defaults(func=cmd_new)
+
+    m = sub.add_parser("machine", help="show this machine's gaming flag, or set it")
+    m.add_argument("--gaming", choices=["on", "off"],
+                   help="on: the owner plays on this machine, the app says so and suggests "
+                        "another for a new orchestrator")
+    m.add_argument("--json", action="store_true")
+    m.set_defaults(func=cmd_machine)
 
     u = sub.add_parser("usage", help="account windows and tokens per agent")
     u.add_argument("action", nargs="?", choices=["capture"],

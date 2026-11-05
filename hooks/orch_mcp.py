@@ -61,6 +61,13 @@ ASK = obj({
     "default": {"type": "string", "description": "the option this goes to with no reply by `by`; "
                                                  "not one with a danger"},
     "by": {"type": "string", "description": "when: HH:MM, 'YYYY-MM-DD HH:MM' or +30m"},
+    "evidence": {"type": "array", "items": obj({
+        "kind": {"enum": list(orch.EVIDENCE)}, "label": STR,
+        "pane": {"type": "string", "description": "the agent whose report backs it"},
+        "tab": {"enum": list(orch.EVIDENCE_TABS)},
+        "ok": {"type": "boolean", "description": "true for passing tests"}}, ["kind", "label"]),
+        "description": "what backs the question: chips on its card"},
+    "rule": {"type": "string", "description": "the owner rule it touches: a decision id like D27"},
 }, ["question"])
 TOOLS = [
     {"name": "report",
@@ -85,6 +92,8 @@ def check(schema, value, where="arguments"):
     kind = schema.get("type")
     if kind == "string":
         return [] if isinstance(value, str) else [f"{where} must be a string"]
+    if kind == "boolean":
+        return [] if isinstance(value, bool) else [f"{where} must be true or false"]
     if kind == "integer":
         ok = isinstance(value, int) and not isinstance(value, bool) and value >= 0
         return [] if ok else [f"{where} must be a whole number >= 0"]
@@ -112,7 +121,8 @@ def report(args, pane):
 
 def ask_owner(args, pane):
     qid = orch.ask(pane, args["question"], args.get("options") or [],
-                   default=args.get("default"), by=args.get("by"))
+                   default=args.get("default"), by=args.get("by"),
+                   evidence=args.get("evidence") or [], rule=args.get("rule"))
     return (f"Sent to the owner as {qid}. Keep everything else going; the answer comes back as a "
             "prompt.")
 

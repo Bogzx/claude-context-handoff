@@ -39,7 +39,9 @@ SCOPES = "https://www.googleapis.com/auth/firebase.messaging https://www.googlea
 FIRESTORE = "https://firestore.googleapis.com/v1"
 DATA_LIMIT = 4000  # FCM data messages hold 4096 bytes of keys and values
 HIGH = {"question", "dialog"}  # pushes that post an alerting notification (and a failed start)
-COLLAPSIBLE = {"state", "accounts", "heartbeat"}  # carry the current value; don't raise seq
+COLLAPSIBLE = {"state", "accounts", "heartbeat"}  # a newer value replaces one not yet sent
+SAME_SEQ = COLLAPSIBLE | {"test"}  # carry the current seq: `test` reaches one phone, another
+# paired phone would owe the number for good
 ACTIONABLE = {"question", "dialog", "stall", "usage", "test"}  # an answer may follow soon
 TTL = {"heartbeat": 900, "test": 300, "actions": 3600}
 DEFAULT_TTL = 86400
@@ -545,7 +547,7 @@ class Pusher:
         return out
 
     def queue(self, st, phones, kind, lead, body, at):
-        if kind not in COLLAPSIBLE:
+        if kind not in SAME_SEQ:
             st["seq"] = (st.get("seq") or 0) + 1
         message = fit(self.machine, {"seq": st.get("seq") or 0, "kind": kind,
                                      "orchestrator": lead, "body": body})
@@ -626,7 +628,7 @@ class Pusher:
                 orch.save(self.path(), st)
                 return {"seq": None, "sent": None, "error": str(e)}
             self.queue(st, phones, "test", None, None, at)
-            seq = st["seq"]
+            seq = st.get("seq") or 0
             sent = self.flush(st, google, key, self.targets(), only=pid)
             orch.save(self.path(), st)
         return {"seq": seq, "sent": sent, **({} if sent else {"error": self.error})}
