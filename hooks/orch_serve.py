@@ -608,11 +608,12 @@ class Gateway:
         name = lead_name(pane, run, agent, (start or {}).get("cwd"))
         if start:  # a new orchestrator: its start's steps until the brief or the plan's OK
             activity, since, stall = "starting", start.get("time"), None
-            trust = next((s for s in start["steps"]
-                          if s["step"] == "trust" and s["status"] == "doing"), None)
-            for d in dialogs if trust else ():
-                if d["pane"] == pane:  # a new agent has no label, turn or report yet
-                    d.update(kind="trust", cwd=start.get("cwd"), since=d["since"] or trust["time"],
+            doing = {s["step"]: s["time"] for s in start["steps"] if s["status"] == "doing"}
+            for d in dialogs:
+                if d["pane"] == pane and at_trust(start, d["text"].split("\n")):
+                    # a new agent has no label, turn or report yet
+                    d.update(kind="trust", cwd=start.get("cwd"),
+                             since=d["since"] or doing.get("trust") or doing.get("claude"),
                              label=d["label"] or name,
                              doing=d["doing"] or orch.first_line(start.get("goal") or "", 160))
         return {
@@ -1108,8 +1109,8 @@ def act_dialog(gw, body, rec):
     Every other dialog is answered in the pane."""
     pane, choice = need(body, "pane"), need(body, "choice")
     start = orch.start_of(pane)
-    if not start or orch.start_cancelled(start) or not any(
-            s["step"] == "trust" and s["status"] == "doing" for s in start.get("steps") or []):
+    lines = orch.screen_lines(pane, 40, "visible")
+    if not start or not at_trust(start, lines):
         return act_permission(gw, body, rec, pane, choice)
     if choice not in ("allow", "deny"):
         raise Reject(f"choice {choice!r}: allow or deny for the folder-trust question", 400)
@@ -1118,7 +1119,7 @@ def act_dialog(gw, body, rec):
         raise Reject(f"{pane} is not at the folder-trust question any more")
     if body.get("change") is not None and body["change"] != agent.get("state_change_seq"):
         raise Reject("the dialog changed since the app showed it: refresh")
-    keys = orch_new.trust_keys(orch.screen_lines(pane, 40, "visible"), choice)
+    keys = orch_new.trust_keys(lines, choice)
     if keys is None:
         raise Reject(f"{pane} doesn't show Claude Code's folder-trust question")
     by = gw.who(rec.get("phone"))
@@ -1131,6 +1132,17 @@ def act_dialog(gw, body, rec):
     if choice == "deny":  # "No" quits Claude: the start is cancelled
         out["wait"] = lambda: {"result": orch_new.cancel(start, by)}
     return out
+
+
+def at_trust(start, lines):
+    """Whether a start's own Claude is at its folder-trust question: during the trust step, or
+    from the moment the question shows while Claude starts (the trust step begins a few
+    seconds later, once the start has seen it blocked)."""
+    if orch.start_cancelled(start):
+        return False
+    steps = {s["step"]: s["status"] for s in start.get("steps") or []}
+    return steps.get("trust") == "doing" or (
+        steps.get("claude") == "doing" and orch_new.trust_keys(lines, "allow") is not None)
 
 
 def act_permission(gw, body, rec, pane, choice):

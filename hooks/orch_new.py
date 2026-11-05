@@ -526,6 +526,9 @@ def cancel(rec, by):
     run = orch.load_run(pane) if pane else {}
     if orch.active(run):
         run["ended"] = orch.now()
+        for q in run.get("questions") or []:  # the plan question: nobody is left to answer
+            if not q.get("answered"):
+                q.update(answer=f"(the start was cancelled by {by})", answered=orch.now())
         orch.save_run(pane, run, "stop")
         done.append("run stopped")
     if pane:
@@ -535,10 +538,35 @@ def cancel(rec, by):
         done.append(f"pane {pane} closed")
         if rec.get("tab") and orch.herdr("tab", "get", rec["tab"]).returncode == 0:
             done.append(f"tab {rec['tab']} kept: it has other panes")
+    if rec.get("lineage") and drop_unused_log(Path(rec["lineage"])):
+        done.append("its unused decision log removed")
     text = "; ".join(done) or "nothing was open"
     orch.emit("start-cancel", f"Start of {os.path.basename(rec.get('cwd') or '')} cancelled",
               f"by {by}: {text}", pane, action=rec["id"], by=by)
     return text
+
+
+def drop_unused_log(lineage):
+    """Remove the decision log folder a start made, and its cwd's folder if that is empty now,
+    when it holds only what orch new wrote (the log and its sealed copy, unchanged); True if
+    removed. A log the agent wrote to stays."""
+    sealed = hook().SEALED
+    try:
+        names = {p.name for p in lineage.iterdir()}
+        log = (lineage / "decisions.md").read_bytes()
+        if names != {"decisions.md", sealed} or log != (lineage / sealed).read_bytes():
+            return False
+        (lineage / "decisions.md").unlink()
+        (lineage / sealed).unlink()
+        lineage.rmdir()
+    except OSError:
+        return False
+    if lineage.parent.parent == orch.ROOT:
+        try:
+            lineage.parent.rmdir()  # only when no other lineage of that folder is left
+        except OSError:
+            pass
+    return True
 
 
 def retry(rec, account, by):

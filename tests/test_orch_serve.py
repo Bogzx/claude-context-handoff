@@ -1094,6 +1094,9 @@ def test_cancel_quits_the_new_orchestrator_and_closes_only_its_pane(world, monke
     world.serve.orch_push.save_phones({"nPHONE": {"node": "phone", "device": "OnePlus 12"}})
     gw = world.serve.Gateway()
     world.post(gw, **start_action(id="st1"))  # plan first: it reads, the run is registered
+    qid = world.orch.ask(NEW, "Plan ready", [{"label": "Approve and start workers"}], "plan")
+    lineage = Path(world.orch.load(world.orch.STARTS / "st1" / "new.json")["lineage"])
+    assert lineage.is_dir()
     status, out = from_phone(world, gw, id="c1", kind="start_cancel", action="st1")
     assert status == 202 and out["status"] == "picked" and out["picked_at"] == world.t
     assert (NEW, "/exit") in world.prompts and NEW not in world.agents
@@ -1104,7 +1107,12 @@ def test_cancel_quits_the_new_orchestrator_and_closes_only_its_pane(world, monke
     assert lead["activity"] == "done" and lead["start"] is None
     [event] = [e for e in world.events() if e["kind"] == "start-cancel"]
     assert event["pane"] == NEW and event["action"] == "st1" and event["by"] == "phone (OnePlus 12)"
-    assert event["body"] == f"by phone (OnePlus 12): run stopped; pane {NEW} closed"
+    assert event["body"] == (f"by phone (OnePlus 12): run stopped; pane {NEW} closed; "
+                             "its unused decision log removed")
+    assert not lineage.exists() and not lineage.parent.exists()  # nothing was written to it
+    [plan] = world.orch.load_run(NEW)["questions"]
+    assert (plan["id"], plan["answer"], plan["answered"]) == (
+        qid, "(the start was cancelled by phone (OnePlus 12))", world.t)
     again = world.post(gw, id="c2", kind="start_cancel", action="st1")
     assert again[0] == 409 and again[1]["error"] == "the start st1 was cancelled already"
     assert world.post(gw, id="c3", kind="start_cancel", action="nope")[0] == 404
@@ -1211,8 +1219,10 @@ def test_the_app_answers_only_a_new_orchestrators_trust_question(world, monkeypa
     gw = world.serve.Gateway()
     rec = trust_step(world, gw)
     answer = {"kind": "dialog", "pane": NEW, "change": 4, "choice": "allow"}
-    early = from_phone(world, gw, **answer)  # the start isn't at its trust step yet
-    assert early[0] == 400 and "answer this dialog in the pane" in early[1]["error"]
+    world.orch.start_step(rec, "claude", "ok")  # the start is past its trust question
+    late = from_phone(world, gw, **answer)
+    assert late[0] == 400 and "answer this dialog in the pane" in late[1]["error"]
+    world.orch.start_step(rec, "claude", "doing")
     world.orch.start_step(rec, "trust", "doing")
     world.agent(W2, "blocked", change=2)
     assert from_phone(world, gw, **dict(answer, pane=W2, change=2))[0] == 400  # not a start's
@@ -1231,6 +1241,21 @@ def test_the_app_answers_only_a_new_orchestrators_trust_question(world, monkeypa
     assert event["pane"] == NEW and event["action"] == "st1" and event["choice"] == "allow"
     assert event["by"] == "phone (OnePlus 12)" and event["source"] == "app"
     assert event["body"] == "~/Repo/my-app on account 2, by phone (OnePlus 12)"
+
+
+def test_the_trust_question_is_marked_and_answerable_as_soon_as_it_shows(world, monkeypatch):
+    allow_starts(world, monkeypatch, run_it=False)
+    gw = world.serve.Gateway()
+    rec = trust_step(world, gw)  # Claude starts; the start hasn't seen it blocked for 3 s yet
+    world.agents[NEW]["cwd"] = str(world.home / "Repo" / "my-app")
+    claude_at = next(s["time"] for s in rec["steps"] if s["step"] == "claude")
+    [dialog] = lead_of(world, gw, NEW)["dialogs"]
+    assert (dialog["kind"], dialog["since"], dialog["label"]) == ("trust", claude_at, "my-app")
+    world.screen = BASH  # another dialog of that pane is not the trust question
+    assert lead_of(world, gw, NEW)["dialogs"][0]["kind"] == "permission"
+    world.screen = TRUST
+    assert world.post(gw, kind="dialog", pane=NEW, change=4, choice="allow")[0] == 202
+    assert ("agent", "send-keys", NEW, "down", "enter") in world.herdr_calls
 
 
 def test_denying_the_trust_question_quits_claude_and_cancels_the_start(world, monkeypatch):
