@@ -241,7 +241,7 @@ WORKER_REPORT = {"time": NUM, "summary": str, "status?": {"done", "partial", "bl
 QUESTION = {"id": str, "pane": str, "time": NUM, "text": str,
             "options": [{"label": str, "danger": {"none", "deploy", "prod", "destructive"}}],
             "evidence": [dict], "rule?": str, "kind?": {"plan"}, "answer?": str,
-            "answered?": NUM}
+            "answered?": NUM, "default?": str, "default_at?": NUM, "by_default": bool}
 DIALOG = {"pane": str, "label": str, "since?": NUM, "change": int, "tool?": str,
           "command?": str, "cwd?": str, "doing?": str, "danger": bool, "text": str,
           "kind?": {"trust"}}
@@ -697,6 +697,28 @@ def test_actions_are_refused_with_a_reason(world):
     assert again[0] == 409 and "already answered" in again[1]["error"]
     rejected = [e for e in world.events() if e["kind"] == "action" and e["status"] != "delivered"]
     assert len(rejected) == 11 and all(e["source"] == "app" for e in rejected)
+
+
+def test_the_fleet_shows_a_questions_default_and_that_it_was_taken(world):
+    world.orch.main(["--orch", BOSS, "run", "start", "--until", "+8h", "--goal", "x"])
+    qid = world.orch.ask(BOSS, "Both OK?", [{"label": "Yes"}, {"label": "No"}], default="Yes",
+                         by="+30m")
+    gw = world.serve.Gateway()
+
+    def question():
+        [lead] = world.get(gw, "/v1/fleet")[1]["orchestrators"]
+        return next(q for q in lead["questions"] if q["id"] == qid)
+
+    open_one = question()
+    assert open_one["default"] == "Yes" and open_one["default_at"] == world.t + 1800
+    assert open_one["by_default"] is False and open_one["answered"] is None
+
+    world.t += 1800
+    world.orch.default_answers(world.orch.agents(), False)
+
+    closed = question()
+    assert closed["by_default"] is True and closed["answer"] == "Yes"
+    assert closed["answered"] == world.t
 
 
 def test_an_answered_question_stays_in_the_fleet_for_10_minutes(world):

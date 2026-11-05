@@ -128,7 +128,7 @@ the whole fleet overnight (11.8 h), and "today's work is done" with three worker
 | `orch run start --until 09:00 --goal "..." --workers w17:pB7=builder,...` | Registers the run of the orchestrator in this pane (`--until` takes `HH:MM`, `YYYY-MM-DD HH:MM` or `+4h`). `run set`, `run stop` and `run show` change, end or show it. |
 | `orch wait` | The orchestrator's one background watcher. It returns when a worker's turn ended with nothing left running, a worker is blocked at a dialog, a pane lost its agent (3 min), a worker has waited 90 min on its own job, a `--check '<cmd>'` exits 0, or after the 30 min heartbeat. It prints one line per worker. An event is reported once: the next wait doesn't repeat it (`--reset` does). |
 | `orch park <pane> --reason "..." [--until HH:MM]` | Standby with a reason. It ends at the worker's next turn end or at `--until`. `orch unpark` ends it. |
-| `orch ask "<question>" [--option "Deploy" --danger deploy --option "Not yet"]` | Logs a question for the owner in the run and pushes it, with an id and the options the owner's app shows as buttons. `--danger` (`none`, `deploy`, `prod`, `destructive`) applies to the option before it. `--kind plan` marks a new orchestrator's plan question (see orch new); it replaces the pane's open plan question. |
+| `orch ask "<question>" [--option "Deploy" --danger deploy --option "Not yet"]` | Logs a question for the owner in the run and pushes it, with an id and the options the owner's app shows as buttons. `--danger` (`none`, `deploy`, `prod`, `destructive`) applies to the option before it. `--kind plan` marks a new orchestrator's plan question (see orch new); it replaces the pane's open plan question. `--default "<option>" --by <time>` says what you go ahead with: see below. |
 | `orch answer <id> "<text>"` | Records the owner's answer and prompts the agent that asked. An answered question can't be answered again. |
 | `orch status [--json]`, `orch last <pane>` | The fleet, and a worker's last message and background tasks. `--json` also has the open questions, each agent's latest report and account, and pending account switches. |
 | `orch decisions [--pane P] [--json]` | The pane's newest decision log, parsed: id, time, who (user or agent), the user's quote, what, why (only from an explicit "Why:" or "because"; everything else stays in what), and `superseded_by` when a later entry says "replaces D7", "instead of D7" or "supersedes D7". In log order. |
@@ -155,6 +155,12 @@ It prompts at most every 15 minutes. After three prompts in a row about the same
 slows down to hourly. It also alerts the owner, without prompting, when the orchestrator pane has had no agent for 5
 minutes or has been at a dialog for 10. When the run's end time passes, it marks the run ended and alerts once.
 
+A question asked with `--default "<option>" --by <time>` says what the agent goes ahead with. The owner can answer
+until then. With no answer, the watchdog's next pass closes the question with that option, marks it `by_default` and
+prompts the asker with the answer marked "(default, no reply by HH:MM)". An asker that is gone or at a dialog gets it
+at a later pass. The default has to be one of the question's options with no `--danger`, and a plan has none: silence
+never approves a deploy or a plan. A default needs a run.
+
 ### Alerts
 
 Everything goes to `~/.claude/handoffs/events.jsonl`, one JSON object per line: `time`, `host` (the hostname; the
@@ -168,8 +174,8 @@ plus the fields of its kind:
 | `orch-missing`, `orch-blocked` | the orchestrator pane has no agent, or sits at a dialog | orchestrator | | yes |
 | `nudge` | the watchdog prompts an idle orchestrator | orchestrator | | |
 | `orch-not-acting` | the same problem after several nudges, or the nudge could not be sent | orchestrator | | yes |
-| `ask` | `orch ask` or the MCP `ask_owner` | the agent that asks | `id`, `question`, `options` (`label`, `danger`), `question_kind` (`plan` or null) | yes |
-| `answer` | `orch answer` or the app answers | the agent that asked | `id` | |
+| `ask` | `orch ask` or the MCP `ask_owner` | the agent that asks | `id`, `question`, `options` (`label`, `danger`), `question_kind` (`plan` or null), `default`, `default_at` | yes |
+| `answer` | `orch answer`, the app, or the watchdog taking a question's default | the agent that asked | `id`, `by_default` | |
 | `report` | the MCP `report` tool | the agent | `report` | |
 | `account` | a switch is queued, asked, resumed or done, or the default changes | the agent; null for the default | `account`; `when` (`handoff`, `idle`, `now`); `how` (`handoff`, `resume`) when a switch starts; `reason` (`spill`, `limit`) when the spill rule queued it; `session` after a resume | |
 | `account-failed`, `respawn-failed` | a switch or takeover failed | the agent | | yes |
@@ -208,8 +214,9 @@ as `orch`. It takes the agent's pane from `HERDR_PANE_ID` and offers no tools ou
 
   `role` is taken from the pane's run (orchestrator or worker) unless the call sets it. A report that doesn't fit the
   schema is refused with the reason, so the agent can fix it.
-- `ask_owner`: `question` and `options` [{`label`, `danger`}], the same as `orch ask` with options. It returns the
-  question id; the answer comes back as a prompt once `orch answer` runs.
+- `ask_owner`: `question` and `options` [{`label`, `danger`}], the same as `orch ask` with options, and `default` and
+  `by`, the same as `--default` and `--by`. It returns the question id; the answer comes back as a prompt once
+  `orch answer` runs.
 
 The Stop hook asks for the report. When an agent is the orchestrator or a worker of an active run, its turn used
 tools, and that turn didn't call `mcp__orch__report`, the hook blocks the turn's end once with a one-line reason.

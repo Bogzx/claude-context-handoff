@@ -431,13 +431,37 @@ def cmd_park(args):
     return 0
 
 
-def ask(pane, text, options=(), kind=None):
+def default_answer(run, options, kind, default, by):
+    """(default, default_at) of a question: what it goes to with no reply by `by`, or (None,
+    None) without one. Silence never picks a dangerous option or approves a plan."""
+    if default is None and by is None:
+        return None, None
+    if not default or not by:
+        die("--default and --by go together")
+    if kind == "plan":
+        die("a plan waits for the owner's OK: it has no --default")
+    if not run:
+        die("a question outside a run has no --default: the watchdog carries it out from the run")
+    option = next((o for o in options if o["label"] == default), None)
+    if not option:
+        die(f"--default {default!r} isn't one of the question's options")
+    if option["danger"] != "none":
+        die(f"--default {default!r} is a {option['danger']} option: the owner has to pick it")
+    at = parse_until(by, now())
+    if at <= now():
+        die(f"--by {by!r} has passed")
+    return default, at
+
+
+def ask(pane, text, options=(), kind=None, default=None, by=None):
     """Log a question for the owner in the pane's run and events.jsonl and push it; returns its
     id. options: [{"label", "danger"}], the answers the owner's app offers as buttons. kind
-    "plan": the plan of a new orchestrator (`orch new --plan-first`), drawn from its report."""
+    "plan": the plan of a new orchestrator (`orch new --plan-first`), drawn from its report.
+    default, by: the option it goes to with no reply by that time (default_answers)."""
     options = [{"label": o["label"], "danger": o.get("danger") or "none"} for o in options]
-    qid = "q" + os.urandom(4).hex()
     run, _ = run_of(pane)
+    default, default_at = default_answer(run, options, kind, default, by)
+    qid = "q" + os.urandom(4).hex()
     if run:
         for q in run.setdefault("questions", []):  # a revised plan replaces the open one
             if kind == "plan" and q.get("kind") == "plan" and q.get("pane") == pane \
@@ -445,14 +469,18 @@ def ask(pane, text, options=(), kind=None):
                 q.update(answer=f"(replaced by {qid})", answered=now())
         run["questions"].append(
             {"id": qid, "time": now(), "pane": pane, "text": text, "options": options,
-             "kind": kind, "answer": None, "answered": None})
+             "kind": kind, "answer": None, "answered": None, "default": default,
+             "default_at": default_at})
         save(run_path(run["orchestrator"]), run)
     body = text
     if options:
         body += "\nOptions: " + " / ".join(
             o["label"] + (f" [{o['danger']}]" if o["danger"] != "none" else "") for o in options)
+    if default:
+        body += f"\nGoes to {default!r} at {clock(default_at)} unless you answer"
     emit("ask", f"Question from {pane} on {machine_name()}", body, pane, push=True, id=qid,
-         question=text, options=options, question_kind=kind)
+         question=text, options=options, question_kind=kind, default=default,
+         default_at=default_at)
     start = start_of(pane) if kind == "plan" else {}
     if start.get("plan_first"):
         start_step(start, "read", "ok")
@@ -475,7 +503,7 @@ class OptionAction(argparse.Action):
 
 
 def cmd_ask(args):
-    qid = ask(orchestrator(args), args.text, args.options or [], args.kind)
+    qid = ask(orchestrator(args), args.text, args.options or [], args.kind, args.default, args.by)
     print(f"sent to the owner as {qid}; keep the rest of the fleet working while you wait for the "
           "answer")
     return 0
@@ -512,23 +540,26 @@ def find_question(qid):
     return None, found
 
 
-def answer(qid, text):
+def answer(qid, text, by_default=False):
     """Record the owner's answer to question qid and prompt the agent that asked; returns its
-    pane. A closed question or a failed prompt is refused and nothing is recorded."""
+    pane. A closed question or a failed prompt is refused and nothing is recorded. by_default:
+    nobody answered and the question went to its default."""
     run, q = find_question(qid)
     if not q:
         die(f"no question {qid}")
     if q.get("answered"):
         die(f"{qid} was already answered at {clock(q['answered'], True)}: {q.get('answer')!r}")
     pane = q.get("pane") or (run or {}).get("orchestrator")
-    message = (f"The owner answered your question {qid} "
-               f"({first_line(q.get('text') or '', 160)!r}): {text}")
+    asked = first_line(q.get("text") or "", 160)
+    message = (f"Your question {qid} ({asked!r}) went to its default: {text} (default, no reply "
+               f"by {clock(q['default_at'])})" if by_default
+               else f"The owner answered your question {qid} ({asked!r}): {text}")
     if not prompt(pane, message):
         die(f"could not prompt {pane}; the answer is not recorded")
-    q.update(answer=text, answered=now())
+    q.update(answer=text, answered=now(), by_default=by_default)
     if run:
         save(run_path(run["orchestrator"]), run)
-    emit("answer", f"Answer to {qid}", text, pane, id=qid)
+    emit("answer", f"Answer to {qid}", text, pane, id=qid, by_default=by_default)
     start = start_of(pane) if q.get("kind") == "plan" else {}
     if any(s["step"] == "plan" for s in start.get("steps") or []):
         start_step(start, "plan", "ok", f"answered: {first_line(text, 160)}")
@@ -584,6 +615,27 @@ def cmd_answer(args):
     pane = answer(args.id, args.text)
     print(f"answered {args.id}; prompted {pane}")
     return 0
+
+
+def default_answers(ags, dry_run):
+    """Watchdog: an open question past its `--by` goes to its default. An asker that is gone or
+    at a dialog, where typing would answer it, gets it at a later pass; the question stays open
+    for the owner until then."""
+    at = now()
+    for run in all_runs():
+        for q in [] if run.get("ended") else run.get("questions") or []:
+            pane = q.get("pane") or run.get("orchestrator")
+            if (q.get("answered") or not q.get("default_at") or q["default_at"] > at
+                    or (ags.get(pane) or {}).get("agent_status") not in ("idle", "done",
+                                                                         "working")):
+                continue
+            if dry_run:
+                print(f"would answer {q['id']} with its default {q['default']!r}")
+                continue
+            try:
+                answer(q["id"], q["default"], by_default=True)
+            except Refused as e:  # one bad pane doesn't end the pass: the next one tries again
+                print(f"{q['id']}: {e.text}", file=sys.stderr)
 
 
 def write_report(pane, report):
@@ -794,6 +846,7 @@ def cmd_watchdog(args):
     claudes = pane_claudes()
     spill_pass(ags, claudes, args.dry_run)
     idle_switches(ags, claudes, args.dry_run)
+    default_answers(ags, args.dry_run)  # first: the loop below may save the runs it loads
     state_path = ROOT / "watchdog.json"
     state = load(state_path)
     at = now()
@@ -1538,6 +1591,9 @@ def main(argv=None):
                    help="what the option before it does when picked (default none)")
     a.add_argument("--kind", choices=["plan"],
                    help="plan: a new orchestrator's plan (orch new --plan-first), for approval")
+    a.add_argument("--default", help="the option this goes to with no reply by --by; not a "
+                                     "dangerous option, not for a plan")
+    a.add_argument("--by", help="when: HH:MM, 'YYYY-MM-DD HH:MM' or +30m")
     a.set_defaults(func=cmd_ask)
 
     ans = sub.add_parser("answer", help="record the owner's answer and prompt the asker")

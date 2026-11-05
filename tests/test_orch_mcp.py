@@ -118,6 +118,38 @@ def test_ask_owner_logs_a_question_with_options(mcp):
                                 {"label": "Not yet", "danger": "none"}]
 
 
+def in_a_run(mcp):
+    runs = mcp.root / "runs"
+    runs.mkdir(parents=True, exist_ok=True)
+    (runs / f"{PANE.replace(':', '-')}.json").write_text(json.dumps(
+        {"orchestrator": PANE, "until": time.time() + 3600, "goal": "x", "workers": {}}))
+    return runs / f"{PANE.replace(':', '-')}.json"
+
+
+def test_ask_owner_takes_a_default_and_a_time(mcp):
+    run = in_a_run(mcp)
+
+    [resp] = mcp(call(1, "ask_owner", {"question": "Both OK?", "default": "Yes", "by": "+30m",
+                                       "options": [{"label": "Yes"}, {"label": "No"}]}))
+
+    assert not resp["result"]["isError"]
+    [q] = json.loads(run.read_text())["questions"]
+    assert q["default"] == "Yes" and q["default_at"] > time.time() + 1700
+
+
+def test_a_refused_ask_is_a_tool_error_and_the_server_stays_up(mcp):
+    in_a_run(mcp)
+
+    first, second = mcp(
+        call(1, "ask_owner", {"question": "Ship?", "default": "Deploy", "by": "+30m",
+                              "options": [{"label": "Deploy", "danger": "prod"}]}),
+        call(2, "ask_owner", {"question": "Ship?", "options": [{"label": "Later"}]}))
+
+    assert first["result"]["isError"] is True
+    assert "the owner has to pick it" in first["result"]["content"][0]["text"]
+    assert second["result"]["isError"] is False
+
+
 @pytest.mark.parametrize("arguments, error", [
     ({"status": "done"}, "arguments.summary is required"),
     ({"summary": "x", "status": "finished"}, "arguments.status must be one of"),

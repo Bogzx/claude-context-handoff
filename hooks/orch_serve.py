@@ -184,7 +184,9 @@ def question_json(q):
     return {"id": q.get("id"), "pane": q.get("pane"), "time": q.get("time"),
             "text": q.get("text") or "", "options": q.get("options") or [],
             "evidence": q.get("evidence") or [], "rule": q.get("rule"), "kind": q.get("kind"),
-            "answer": q.get("answer"), "answered": q.get("answered")}
+            "answer": q.get("answer"), "answered": q.get("answered"),
+            "default": q.get("default"), "default_at": q.get("default_at"),
+            "by_default": bool(q.get("by_default"))}
 
 
 ASKED = re.compile(r"^\s*(Do you want to .+\?)\s*$")

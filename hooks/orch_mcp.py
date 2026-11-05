@@ -58,6 +58,9 @@ ASK = obj({
     "question": STR,
     "options": {"type": "array", "items": obj({"label": STR, "danger": {"enum": list(orch.DANGER)}},
                                               ["label"])},
+    "default": {"type": "string", "description": "the option this goes to with no reply by `by`; "
+                                                 "not one with a danger"},
+    "by": {"type": "string", "description": "when: HH:MM, 'YYYY-MM-DD HH:MM' or +30m"},
 }, ["question"])
 TOOLS = [
     {"name": "report",
@@ -69,7 +72,8 @@ TOOLS = [
     {"name": "ask_owner",
      "description": ("Ask the owner a question, with options shown as buttons (danger: what "
                      "picking it does). Returns the question id; the answer arrives later as a "
-                     "prompt. Keep working on everything else meanwhile."),
+                     "prompt. Keep working on everything else meanwhile. If you go ahead anyway "
+                     "without a reply, say with what: default and by."),
      "inputSchema": ASK},
 ]
 
@@ -107,7 +111,8 @@ def report(args, pane):
 
 
 def ask_owner(args, pane):
-    qid = orch.ask(pane, args["question"], args.get("options") or [])
+    qid = orch.ask(pane, args["question"], args.get("options") or [],
+                   default=args.get("default"), by=args.get("by"))
     return (f"Sent to the owner as {qid}. Keep everything else going; the answer comes back as a "
             "prompt.")
 
@@ -125,6 +130,8 @@ def call(params, pane):
         return {"content": [{"type": "text", "text": "; ".join(errors)}], "isError": True}
     try:
         text = handler(args, pane)
+    except orch.Refused as e:  # a SystemExit: it would end the server
+        return {"content": [{"type": "text", "text": e.text}], "isError": True}
     except Exception as e:  # noqa: BLE001 the agent sees the error instead of a dead server
         return {"content": [{"type": "text", "text": f"failed: {e!r}"}], "isError": True}
     return {"content": [{"type": "text", "text": text}], "isError": False}

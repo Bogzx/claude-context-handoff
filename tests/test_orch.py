@@ -426,6 +426,133 @@ def test_answer_prompts_the_asker_once(world, capsys):
     assert len(world.prompts) == 1
 
 
+def ask_with_default(world, by="+30m"):
+    start_run(world)
+    world.agent(BOSS, "idle")
+    world.run("ask", "Both defaults OK?", "--option", "Both OK", "--option", "Only the first",
+              "--default", "Both OK", "--by", by)
+    return json.loads((world.root / "runs" / "w1-p0.json").read_text())["questions"][0]
+
+
+def question_now(world):
+    return json.loads((world.root / "runs" / "w1-p0.json").read_text())["questions"][0]
+
+
+def default_prompts(world, q):
+    return [text for _, text in world.prompts if q["id"] in text]
+
+
+def test_a_question_goes_to_its_default_at_its_time_and_the_asker_is_told(world, capsys):
+    q = ask_with_default(world)
+    assert q["default"] == "Both OK" and q["default_at"] == T0 + 1800
+    [asked] = [e for e in world.events() if e["kind"] == "ask"]
+    assert asked["default"] == "Both OK" and asked["default_at"] == T0 + 1800
+    assert "Goes to 'Both OK' at" in asked["body"]
+
+    world.t = T0 + 1799
+    world.run("watchdog")
+    assert default_prompts(world, q) == [] and not question_now(world)["answered"]
+
+    world.t = T0 + 1800
+    world.run("watchdog")
+
+    [text] = default_prompts(world, q)
+    by = world.orch.clock(T0 + 1800)
+    assert text.endswith(f"went to its default: Both OK (default, no reply by {by})")
+    assert "owner answered" not in text  # nobody did
+    closed = question_now(world)
+    assert closed["answer"] == "Both OK" and closed["answered"] == T0 + 1800
+    assert closed["by_default"] is True
+    [event] = [e for e in world.events() if e["kind"] == "answer"]
+    assert event["id"] == q["id"] and event["by_default"] is True
+
+    world.t += 600  # once only, and a late answer finds it closed
+    world.run("watchdog")
+    assert len(default_prompts(world, q)) == 1
+    with pytest.raises(SystemExit):
+        world.run("answer", q["id"], "Only the first")
+
+
+def test_the_owner_can_answer_before_the_default(world, capsys):
+    q = ask_with_default(world)
+    world.t = T0 + 600
+
+    world.run("answer", q["id"], "Only the first")
+    world.t = T0 + 3600
+    world.run("watchdog")
+
+    closed = question_now(world)
+    assert closed["answer"] == "Only the first" and closed["answered"] == T0 + 600
+    assert closed["by_default"] is False and len(default_prompts(world, q)) == 1
+    assert capsys.readouterr().err == ""  # a closed question isn't tried at every pass
+
+
+@pytest.mark.parametrize("state", ["blocked", None], ids=["at a dialog", "gone"])
+def test_a_default_waits_for_an_asker_it_can_reach(world, state):
+    q = ask_with_default(world)
+    if state:
+        world.agent(BOSS, state)  # typing would answer the dialog
+    else:
+        world.agents.pop(BOSS)
+    world.t = T0 + 3600
+
+    world.run("watchdog")
+
+    assert default_prompts(world, q) == [] and not question_now(world)["answered"]
+    world.agent(BOSS, "idle")
+    world.run("watchdog")
+    assert len(default_prompts(world, q)) == 1 and question_now(world)["by_default"] is True
+
+
+def test_a_failed_default_prompt_leaves_the_question_open_and_the_watchdog_running(
+        world, monkeypatch):
+    ask_with_default(world)
+    world.t = T0 + 3600
+    monkeypatch.setattr(world.orch, "prompt", lambda pane, text: False)
+
+    assert world.run("watchdog") == 0
+
+    assert not question_now(world)["answered"]
+    assert [e for e in world.events() if e["kind"] == "answer"] == []
+
+
+def test_a_default_is_taken_in_the_pass_that_ends_the_run_and_survives_its_save(world):
+    ask_with_default(world)
+    world.t = T0 + 9 * 3600  # past the default and the run's end: this pass saves the run too
+
+    world.run("watchdog")
+
+    run = json.loads((world.root / "runs" / "w1-p0.json").read_text())
+    assert run["ended"] == world.t and run["questions"][0]["answer"] == "Both OK"
+
+
+@pytest.mark.parametrize("argv, error", [
+    (["--default", "Merge"], "go together"),
+    (["--by", "+30m"], "go together"),
+    (["--default", "Later", "--by", "+30m"], "isn't one of the question's options"),
+    (["--default", "Deploy", "--by", "+30m"], "the owner has to pick it"),
+    (["--default", "Merge", "--by", "soon"], "can't read the time"),
+    (["--default", "Merge", "--by", "2020-01-01 10:00"], "has passed"),
+    (["--default", "Merge", "--by", "+30m", "--kind", "plan"], "a plan waits"),
+], ids=["no by", "no default", "not an option", "dangerous", "bad time", "past", "plan"])
+def test_a_default_silence_could_not_be_trusted_with_is_refused(world, argv, error):
+    start_run(world)
+
+    with pytest.raises(world.orch.Refused) as refused:
+        world.run("ask", "Ship?", "--option", "Merge", "--option", "Deploy", "--danger", "deploy",
+                  *argv)
+
+    assert error in refused.value.text
+    assert world.events() == [] or all(e["kind"] != "ask" for e in world.events())
+    assert not json.loads((world.root / "runs" / "w1-p0.json").read_text()).get("questions")
+
+
+def test_a_default_needs_a_run_for_the_watchdog_to_find_it_in(world):
+    with pytest.raises(world.orch.Refused) as refused:
+        world.orch.ask(W1, "Ship?", [{"label": "Merge"}], default="Merge", by="+30m")
+    assert "outside a run" in refused.value.text
+
+
 def test_a_question_asked_outside_a_run_can_be_answered(world):
     world.run("ask", "Which branch?")
     [ask] = [e for e in world.events() if e["kind"] == "ask"]
