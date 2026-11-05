@@ -155,6 +155,14 @@ def test_an_empty_roadmap_clears_the_plan_and_it_stays_cleared(reports):
     assert later["roadmap"] == [] and later["roadmap_time"] == 200
 
 
+def test_a_plan_is_as_old_as_its_roadmap_time_not_its_last_report(mcp):
+    keep = mcp.module.orch.keep_plan
+    kept = {"time": 300, "roadmap": PLAN, "roadmap_time": 100}
+    assert "roadmap" not in keep({"time": 400}, kept, since=200)
+    assert keep({"time": 400}, kept, since=100)["roadmap"] == PLAN  # from the run's first moment
+    assert keep({"time": 400}, {"time": 300, "roadmap": PLAN}, since=200)["roadmap_time"] == 300
+
+
 def test_a_report_with_no_plan_before_it_has_no_plan_fields(reports):
     assert not {"roadmap", "roadmap_time"} & set(reports(100, status="done"))
 

@@ -431,6 +431,7 @@ def busy_fleet(w):
     """A run whose orchestrator is stalled: builder idle 20 min, tester at a dialog, the
     orchestrator idle 6 min with nothing to wake it; plus an agent outside any run."""
     start_run(w)
+    change_run(w, created=w.t - 3600)
     w.agent(W1, "idle", seq=3, change=7)
     w.agent(W2, "blocked", change=9)
     w.agent(LOOSE, "working")
@@ -817,6 +818,60 @@ def test_old_and_new_sessions_on_a_pane_share_one_plan(world):
     world.t += 60
     old_session_reports(world, BOSS)
     assert lead_report(gw)["roadmap"] == []
+
+
+def new_goal_on_the_pane(world):
+    world.t += 60
+    world.orch.main(["--orch", BOSS, "run", "start", "--until", "+8h", "--goal", "a new goal"])
+    world.t += 60
+
+
+def test_a_new_run_drops_the_plan_of_the_one_before_from_an_old_session(world):
+    start_run(world)
+    gw = world.serve.Gateway()
+    old_session_reports(world, BOSS, roadmap=PLAN)
+    new_goal_on_the_pane(world)
+    old_session_reports(world, BOSS)
+    assert not {"roadmap", "roadmap_time"} & set(lead_report(gw))
+
+    written = world.t
+    old_session_reports(world, BOSS, roadmap=[{"title": "ship", "status": "next"}])
+    world.t += 60
+    old_session_reports(world, BOSS)
+    assert lead_report(gw)["roadmap_time"] == written  # the new run's own plan is kept
+
+
+def test_a_new_run_drops_the_plan_of_the_one_before_from_a_new_session(world):
+    start_run(world)
+    gw = world.serve.Gateway()
+    new_session_reports(world, BOSS, roadmap=PLAN)
+    world.t += 60
+    new_session_reports(world, BOSS)  # kept: the same run
+    assert lead_report(gw)["roadmap"] == PLAN
+    new_goal_on_the_pane(world)
+    new_session_reports(world, BOSS)
+    stored = json.loads((world.root / "agents" / "w1-p0.json").read_text())["report"]
+    assert "roadmap" not in stored
+    assert not {"roadmap", "roadmap_time"} & set(lead_report(gw))
+
+
+def test_a_reports_own_roadmap_stays_whatever_the_run(world):
+    """Only a kept plan is dropped: this one is what the last report said."""
+    start_run(world)
+    gw = world.serve.Gateway()
+    new_session_reports(world, BOSS, roadmap=PLAN)
+    new_goal_on_the_pane(world)
+    assert lead_report(gw)["roadmap"] == PLAN
+
+
+def test_a_takeover_in_the_same_run_keeps_the_plan_however_long_it_ran(world):
+    start_run(world)
+    gw = world.serve.Gateway()
+    old_session_reports(world, BOSS, roadmap=PLAN)
+    world.t += 3 * 86400
+    world.orch.main(["--orch", BOSS, "run", "set", "--until", "+8h"])  # extended, not a new run
+    old_session_reports(world, BOSS)
+    assert lead_report(gw)["roadmap"] == PLAN
 
 
 def test_a_plan_stays_with_its_pane_and_a_worker_gets_none(world):
