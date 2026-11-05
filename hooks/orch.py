@@ -700,12 +700,26 @@ def default_answers(ags, dry_run):
                 print(f"{q['id']}: {e.text}", file=sys.stderr)
 
 
+def keep_plan(report, last):
+    """`report`, with the plan of `last` (an earlier report) if it has no `roadmap` of its own:
+    the plan outlives the turn, with the time it was written and its `source`. `roadmap: []` is
+    a plan too, the empty one. Everything else in a report belongs to its turn."""
+    if "roadmap" in report or "roadmap" not in last:
+        return report
+    return dict(report, roadmap=last["roadmap"],
+                roadmap_time=last.get("roadmap_time") or last.get("time"),
+                **({"source": last["source"]} if "source" in last else {}))
+
+
 def write_report(pane, report):
-    """Store an agent's turn-end report in its status file (keeping the Stop hook's fields)
-    and log it."""
+    """Store an agent's turn-end report in its status file (keeping the Stop hook's fields and
+    the last plan) and log it. The log has what the agent sent, not a copy of the plan each
+    time."""
     path = ROOT / "agents" / f"{slug(pane)}.json"
     st = load(path) or {"pane": pane}
-    st["report"] = report
+    if "roadmap" in report:
+        report = dict(report, roadmap_time=report.get("time") or now())
+    st["report"] = keep_plan(report, st.get("report") or {})
     save(path, st)
     emit("report", f"{report.get('role', 'agent').capitalize()} report: {pane}",
          report.get("summary") or "", pane, report=report)

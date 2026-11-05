@@ -73,7 +73,8 @@ TOOLS = [
     {"name": "report",
      "description": ("End-of-turn status for the owner's app; call once at the end of each working "
                      "turn. Orchestrator: summary, state, progress, waiting_on, next, roadmap (the "
-                     "plan), risks, milestones, suggestions. Worker: summary, status, tests, changed_files, "
+                     "plan: left out it stays as it is, [] clears it), risks, milestones, "
+                     "suggestions. Worker: summary, status, tests, changed_files, "
                      "needs_live_test, issues_for_others."),
      "inputSchema": REPORT},
     {"name": "ask_owner",
