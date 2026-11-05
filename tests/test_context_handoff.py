@@ -212,6 +212,34 @@ def test_state_from_the_flat_layout_gets_a_fresh_notice(hook, run):
     assert str(lineage / "handoff.md") in out["hookSpecificOutput"]["additionalContext"]
 
 
+@pytest.mark.parametrize("accounts, env", [
+    ({}, {"HANDOFF_LINEAGE": "L", "CLAUDE_CONFIG_DIR": "/home/u/.claude-2"}),  # no rule: kept
+    ({"spill": {"from": "1", "at": 98, "to": "2", "active": {"used": 98}}},
+     {"HANDOFF_LINEAGE": "L", "CLAUDE_CONFIG_DIR": "ACC2"}),  # spilling: the target
+    ({"spill": {"from": "1", "at": 98, "to": "2", "active": None}},
+     {"HANDOFF_LINEAGE": "L"}),  # after the reset: the default account, 1
+    ({"spill": {"from": "1", "at": 98, "to": "2", "active": None}, "default": "2"},
+     {"HANDOFF_LINEAGE": "L", "CLAUDE_CONFIG_DIR": "ACC2"}),
+    ({"switch": {PANE: {"account": "1", "when": "handoff"}},
+      "spill": {"from": "1", "at": 98, "to": "2", "active": {"used": 98}}},
+     {"HANDOFF_LINEAGE": "L"}),  # a queued switch wins
+])
+def test_the_takeover_account_follows_the_switch_then_the_spill_rule(hook, monkeypatch,
+                                                                     accounts, env):
+    monkeypatch.setenv("HERDR_PANE_ID", PANE)
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", "/home/u/.claude-2")
+    monkeypatch.setattr(hook, "claude_pid", os.getpid)
+    monkeypatch.setattr(hook, "account_dir", lambda n: "ACC" + str(n))
+    started = []
+    monkeypatch.setattr(hook.subprocess, "Popen", lambda args, **kw: started.append(args))
+    hook.ROOT.mkdir(parents=True, exist_ok=True)
+    (hook.ROOT / "accounts.json").write_text(json.dumps(accounts))
+
+    assert hook.start_respawn({"session_id": "s1"}, Path("L"), "claude-opus-5-5")
+
+    assert json.loads(started[0][-1])["env"] == env
+
+
 def test_herdr_stop_passes_the_sessions_lineage_to_the_respawn(hook, run, monkeypatch):
     monkeypatch.setattr(hook, "IN_HERDR", True)
     monkeypatch.setenv("HERDR_PANE_ID", PANE)
@@ -783,6 +811,18 @@ def test_account_switch_now_refuses_with_background_tasks(hook, switch, herdr_st
 
     assert hook.respawn(job) is False
     assert ["agent", "prompt", PANE, "/exit"] not in calls()
+
+
+def test_a_takeover_records_a_spill_move(hook, takeover, herdr_stub):
+    takeover.job.update(account="2", reason="spill")
+    (hook.ROOT / "accounts.json").write_text(json.dumps({"switch": {PANE: {
+        "account": "2", "when": "idle", "reason": "spill"}}}))
+
+    takeover()
+
+    acc = json.loads((hook.ROOT / "accounts.json").read_text())
+    assert acc["switch"] == {} and acc["moved"][PANE]["how"] == "handoff"
+    assert acc["moved"][PANE]["reason"] == "spill"
 
 
 def test_a_takeover_waits_for_a_dialog_on_the_new_account(hook, takeover, herdr_stub,

@@ -229,6 +229,17 @@ account 2 at the next pass. The account of each agent is read from its claude pr
 `--spill off` turns the rule off and drops the switches it queued. The rule and whether it has fired show in
 `orch account --json`, `orch status --json` and the gateway's fleet.
 
+On a machine with a spill rule, a takeover starts on the pending switch's account if there is one. Otherwise it
+starts on account 2 while the rule is active, and on the default account (`orch account --default`, 1 unless set)
+once account 1 is back under the threshold. New agents should start with `claude-acc $(orch account --for-new) ...`;
+an agent started on account 1 while the rule is active is moved by the watchdog anyway.
+
+The rule's progress shows as `spill` in `orch status --json` and the gateway's fleet (when it fired, `moved` of
+`total`). Each agent also gets a `spill` entry:
+- `moved_idle` or `moved_limit`, with how (handoff or resume) and when;
+- `waiting`, with what on: working, own job running, writing its handoff, or the next watchdog pass;
+- `cant_move`, with the error. A resume that failed is not retried until the rule fires again.
+
 ### Usage
 
 The statusline command gets the account's limits on stdin (`rate_limits.five_hour` and `rate_limits.seven_day`, each

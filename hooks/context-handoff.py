@@ -517,15 +517,24 @@ def start_respawn(data, lineage, model):
     effort = (data.get("effort") or {}).get("level") or os.environ.get("CLAUDE_EFFORT")
     pane = os.environ["HERDR_PANE_ID"]
     env = {k: os.environ[k] for k in ("CLAUDE_CONFIG_DIR",) if os.environ.get(k)}
-    switch = (load(ROOT / "accounts.json").get("switch") or {}).get(pane)
-    if switch:  # queued by `orch account <pane> N`: the fresh agent starts on account N
+    accounts = load(ROOT / "accounts.json")
+    switch = (accounts.get("switch") or {}).get(pane)
+    spill = accounts.get("spill")
+    # Queued by `orch account <pane> N` (or the spill rule): the fresh agent starts on account N.
+    # With a spill rule, a takeover otherwise starts on the rule's target while it is active,
+    # else on the default account (owner: until decided, this is the default).
+    target = (switch["account"] if switch
+              else spill["to"] if spill and spill.get("active")
+              else accounts.get("default") or "1" if spill else None)
+    if target is not None:
         env.pop("CLAUDE_CONFIG_DIR", None)
-        if str(switch["account"]) != "1":
-            env["CLAUDE_CONFIG_DIR"] = str(account_dir(switch["account"]))
+        if str(target) != "1":
+            env["CLAUDE_CONFIG_DIR"] = str(account_dir(target))
     job = {"pane": pane, "pid": pid, "dir": str(lineage),
            "args": relaunch_args([a.decode() for a in argv if a], model, effort),
            "env": {"HANDOFF_LINEAGE": str(lineage), **env},
            "account": switch["account"] if switch else None,
+           "reason": (switch or {}).get("reason"),
            "session": data.get("session_id"), "transcript": data.get("transcript_path"),
            "created": time.time()}
     subprocess.Popen([sys.executable, os.path.abspath(__file__), "--respawn", json.dumps(job)],
@@ -713,6 +722,10 @@ def respawn(job):
             accounts = load(path)
             if (accounts.get("switch") or {}).get(pane, {}).get("account") == account:
                 accounts["switch"].pop(pane)
+                if job.get("reason"):  # moved by the spill rule: the app shows it
+                    accounts.setdefault("moved", {})[pane] = {
+                        "account": account, "time": time.time(), "how": "handoff",
+                        "reason": job["reason"]}
                 path.write_text(json.dumps(accounts, indent=1))
             emit("account", f"Account switched: {pane}",
                  f"{name or 'agent'} took over on account {account}", pane, account=account,

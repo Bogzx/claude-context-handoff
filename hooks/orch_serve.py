@@ -170,7 +170,7 @@ def agent_json(v, agent, role, first_seen):
         "pane": v["pane"], "label": v["label"], "state": state,
         "agent_status": (agent or {}).get("agent_status") if agent else None,
         "since": since, "session": v["session"], "account": v["account"],
-        "context_tokens": v.get("context_tokens"),
+        "context_tokens": v.get("context_tokens"), "spill": v.get("spill"),
         "background_tasks": v["bg"], "last": v["last"],
         "park": {"reason": park.get("reason"), "since": park.get("since"),
                  "until": park.get("until")} if park else None,
@@ -350,7 +350,7 @@ class Gateway:
             "orchestrators": [self.orchestrator(p, r, ags, at, watchdog.get(p) or {}, nudges)
                               for p, r in leads],
             "accounts": self.accounts(at), "default_account": self.default_account(),
-            "spill": orch.load(orch.ROOT / "accounts.json").get("spill"),
+            "spill": orch.spill_summary(orch.load(orch.ROOT / "accounts.json")),
             "actions": self.recent_actions(at, ags),
         }
 

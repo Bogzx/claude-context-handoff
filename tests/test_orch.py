@@ -764,8 +764,10 @@ def test_spill_moves_account_one_agents_once_it_reaches_the_threshold(world, acc
     world.run("account", "--spill", "1:98:2")
     capsys.readouterr()
     world.run("account", "--json")
-    assert json.loads(capsys.readouterr().out)["spill"] == {
-        "from": "1", "at": 98, "to": "2", "time": T0, "active": None}
+    listed = json.loads(capsys.readouterr().out)
+    assert listed["spill"] == {"from": "1", "at": 98, "to": "2", "time": T0, "active": None,
+                               "since": None, "moved": 0, "total": 0}
+    assert listed["for_new"] == "1"
 
     usage_at(world, 97)
     world.run("watchdog")
@@ -812,6 +814,45 @@ def test_spill_off_drops_its_pending_switches_and_bad_rules_are_refused(world, a
     for bad in ("1:98", "1:98:1", "2:98:3", "pibo1:98:pibo2"):
         with pytest.raises(SystemExit):
             world.run("account", "--spill", bad)
+
+
+def test_spill_states_per_agent_and_the_runs_progress(world, accounts, capsys, tmp_path,
+                                                       monkeypatch):
+    monkeypatch.setattr(world.orch, "PROJECTS", tmp_path / "projects")
+    start_run(world)
+    world.agent(BOSS, "working")
+    idle_with_status(world, W1)  # 20K: resumed at the pass
+    world.agent(W2, "working")
+    world.turn_end(W2)
+    path = world.root / "agents" / f"{W2.replace(':', '-')}.json"
+    path.write_text(json.dumps(dict(json.loads(path.read_text()), pid=4242, account="1",
+                                    session="s-w1:p2", context_tokens=20_000)))
+    world.run("account", "--spill", "1:98:2")
+    usage_at(world, 98)
+
+    world.run("watchdog")
+    capsys.readouterr()
+    world.run("account", "--for-new")
+    assert capsys.readouterr().out.strip() == "2"
+    world.run("status", "--json")
+    status = json.loads(capsys.readouterr().out)
+    w1, w2 = status["workers"]
+    assert w1["spill"] == {"state": "moved_idle", "reason": "resume", "time": world.t,
+                           "account": "2"}
+    assert w2["spill"] == {"state": "waiting", "reason": "working", "time": world.t,
+                           "account": "2"}
+    assert status["spill"]["since"] == world.t
+    assert (status["spill"]["moved"], status["spill"]["total"]) == (1, 2)
+
+    world.agent(W2, "idle")  # done, but its resume fails
+    monkeypatch.setattr(world.orch, "run_switch", lambda job: type(
+        "R", (), {"returncode": 1, "stderr": "the new agent is at a dialog"})())
+    world.run("watchdog")
+    world.run("status", "--json")
+    w2 = json.loads(capsys.readouterr().out)["workers"][1]
+    assert w2["spill"]["state"] == "cant_move" and "at a dialog" in w2["spill"]["reason"]
+    world.run("watchdog")  # not queued again
+    assert W2 not in json.loads((world.root / "accounts.json").read_text())["switch"]
 
 
 def transcript(world, session, *entries):

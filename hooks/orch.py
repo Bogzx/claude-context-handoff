@@ -243,6 +243,7 @@ def view(pane, agent, run, at):
     session = ((agent or {}).get("agent_session") or {}).get("value")
     fresh = st if st and session and st.get("session") == session else {}
     park = ((run or {}).get("parked") or {}).get(pane)
+    accounts = load(ROOT / "accounts.json")
     seq = (agent or {}).get("completion_seq")
     if park and ((park.get("until") and at >= park["until"])
                  or (seq is not None and park.get("seq") is not None and seq > park["seq"])):
@@ -262,7 +263,8 @@ def view(pane, agent, run, at):
         "report": st.get("report"),  # the latest, whichever session wrote it (it has its time)
         "account": fresh.get("account"),
         "context_tokens": fresh.get("context_tokens"),
-        "switch": (load(ROOT / "accounts.json").get("switch") or {}).get(pane),  # pending
+        "switch": (accounts.get("switch") or {}).get(pane),  # pending
+        "spill": spill_state(pane, agent, fresh, accounts),
     }
 
 
@@ -504,7 +506,7 @@ def cmd_status(args):
         print(json.dumps({"run": run, "orchestrator": ags.get(orch), "workers": views,
                           "report": lead["report"], "account": lead["account"],
                           "switch": lead["switch"],
-                          "spill": load(ROOT / "accounts.json").get("spill"),
+                          "spill": spill_summary(load(ROOT / "accounts.json")),
                           "questions": [q for q in (run or {}).get("questions") or []
                                         if not q.get("answered")]},
                          indent=1))
@@ -924,7 +926,12 @@ def apply_switch(job):
         return (result.stderr or "").strip() or "see ~/.claude/handoffs/respawn.log"
     path = ROOT / "accounts.json"
     acc = load(path)
-    if (acc.get("switch") or {}).pop(job["pane"], None):
+    sw = (acc.get("switch") or {}).pop(job["pane"], None)
+    if (sw or {}).get("reason"):  # moved by the spill rule: the app shows it
+        acc.setdefault("moved", {})[job["pane"]] = {"account": job["account"], "time": now(),
+                                                    "how": "resume", "reason": sw["reason"]}
+        (acc.get("failed") or {}).pop(job["pane"], None)
+    if sw:
         save(path, acc)
     return None
 
@@ -1002,6 +1009,8 @@ def idle_switches(ags, claudes, dry_run):
         error = apply_switch(dict(job, when="idle"))
         if error:
             drop_switch(pane)
+            if sw.get("reason"):
+                path_failed(pane, sw["account"], error)
             emit("account", f"Account switch dropped: {pane}", error, pane,
                  account=sw["account"], when="idle")
 
@@ -1022,6 +1031,55 @@ def mark_switch(pane, **fields):
     if pane in (acc.get("switch") or {}):
         acc["switch"][pane].update(fields)
         save(path, acc)
+
+
+def path_failed(pane, account, error):
+    path = ROOT / "accounts.json"
+    acc = load(path)
+    acc.setdefault("failed", {})[pane] = {"account": account, "time": now(), "error": error}
+    save(path, acc)
+
+
+def spill_state(pane, agent, st, acc):
+    """Where the spill rule stands with this agent, for the app: moved (at idle or at the
+    limit), waiting (and on what), can't move (and why), or None when it isn't involved."""
+    sw = (acc.get("switch") or {}).get(pane) or {}
+    if sw.get("reason") in ("spill", "limit"):
+        status = (agent or {}).get("agent_status")
+        reason = ("no agent in the pane" if not agent else "at a dialog" if status == "blocked"
+                  else "working" if status == "working"
+                  else "own job running" if st.get("background_tasks")
+                  else "writing its handoff" if sw.get("handoff") else "the next watchdog pass")
+        return {"state": "cant_move" if not agent else "waiting", "reason": reason,
+                "time": sw.get("time"), "account": sw["account"]}
+    failed = (acc.get("failed") or {}).get(pane)
+    if failed:
+        return {"state": "cant_move", "reason": failed["error"], "time": failed["time"],
+                "account": failed["account"]}
+    moved = (acc.get("moved") or {}).get(pane)
+    if moved:
+        return {"state": "moved_limit" if moved.get("reason") == "limit" else "moved_idle",
+                "reason": moved.get("how"), "time": moved["time"], "account": moved["account"]}
+    return None
+
+
+def spill_summary(acc):
+    """The spill rule with its progress: since (when it fired), moved of total."""
+    rule = acc.get("spill")
+    if not rule:
+        return None
+    involved = ({p for p, sw in (acc.get("switch") or {}).items()
+                 if sw.get("reason") in ("spill", "limit")}
+                | set(acc.get("moved") or {}) | set(acc.get("failed") or {}))
+    return dict(rule, since=(rule.get("active") or {}).get("since"),
+                moved=len(acc.get("moved") or {}), total=len(involved))
+
+
+def account_for_new(acc):
+    """The account a new agent should start on: the spill target while the rule is active,
+    else the default."""
+    rule = acc.get("spill") or {}
+    return rule["to"] if rule.get("active") else acc.get("default") or "1"
 
 
 def drop_switch(pane):
@@ -1052,6 +1110,7 @@ def spill_pass(ags, claudes, dry_run):
                     and w["used_percentage"] >= rule["at"]), None)
         if hot and not rule.get("active"):
             rule["active"] = hot
+            acc["moved"], acc["failed"] = {}, {}
             emit("spill", f"Account {rule['from']} at {hot['used']}%: moving to {rule['to']}",
                  f"its {hot['window']} window reached {rule['at']}%; its agents move to account "
                  f"{rule['to']} at their next turn end or when idle", None, push=True, **hot)
@@ -1061,7 +1120,8 @@ def spill_pass(ags, claudes, dry_run):
                  "new agents on it stay there", None)
     switches = acc.setdefault("switch", {})
     for pane, agent in sorted(ags.items()):
-        if (claudes.get(pane) or (None, None))[1] != rule["from"]:
+        if ((claudes.get(pane) or (None, None))[1] != rule["from"]
+                or pane in (acc.get("failed") or {})):  # can't move: shown, not retried
             continue
         sw = switches.get(pane)
         limit = (agent.get("agent_status") in ("idle", "done")
@@ -1128,10 +1188,14 @@ def cmd_account(args):
     if args.spill:
         print(set_spill(args.spill))
         return 0
+    if args.for_new:
+        print(account_for_new(acc))
+        return 0
     if not args.pane:
         accounts = account_list()
         out = {"accounts": accounts, "default": acc.get("default") or "1",
-               "switch": acc.get("switch") or {}, "spill": acc.get("spill")}
+               "for_new": account_for_new(acc), "switch": acc.get("switch") or {},
+               "spill": spill_summary(acc)}
         if args.json:
             print(json.dumps(out, indent=1))
             return 0
@@ -1290,6 +1354,9 @@ def main(argv=None):
     acct.add_argument("--spill", metavar="FROM:PCT:TO",
                       help="move every agent on account FROM to account TO once FROM's week or "
                            "5-hour window reaches PCT%% (e.g. 1:98:2), or 'off'")
+    acct.add_argument("--for-new", action="store_true",
+                      help="print the account a new agent should start on (claude-acc N): the "
+                           "spill target while the rule is active, else the default")
     acct.add_argument("--json", action="store_true")
     acct.set_defaults(func=cmd_account)
 
