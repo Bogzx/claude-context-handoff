@@ -509,17 +509,19 @@ def test_decisions_parses_the_newest_log_of_the_pane(world, capsys):
     assert data["log"] == str(log)
     d = {e["id"]: e for e in data["decisions"]}
     assert [e["id"] for e in data["decisions"]] == [
-        "D1", "D5", "D6", "D9", "D10", "D2", "D3", "D4", "D7", "D8"]  # owner first
+        "D1", "D2", "D3", "D4", "D5", "D6", "D7", "D8", "D9", "D10"]  # log order
     assert d_of(data, "D9")["by"] == "user (checking in at 12:49)"
     assert d_of(data, "D9")["quote"] == "keep going"
-    assert d_of(data, "D10")["by"] == "" and d_of(data, "D10")["who"] == "user"
+    assert d_of(data, "D10")["by"] == "user" and d_of(data, "D10")["who"] == "user"
     assert d["D1"]["who"] == "user" and d["D1"]["quote"] == "Use the MCP tool, not a CLI"
     assert d["D1"]["what"] == "Agent built orch_mcp.py." and d["D1"]["time"] == "2026-11-05 10:40"
     assert d["D2"]["who"] == "agent" and d["D2"]["what"] == "question ids are random hex."
-    assert d["D2"]["why"] == "no counter file to lock."
-    assert d["D3"]["why"] == "The gateway samples state for the activity strip."
+    assert d["D2"]["why"] == "no counter file to lock"
+    assert d["D3"]["what"] == "poll herdr every 15 s. The gateway samples state for the activity strip."
+    assert d["D3"]["why"] == ""  # no "Why" or "because": nothing is a reason
     assert d["D4"]["by"] == "orchestrator" and d["D4"]["time"] == "12:05"
-    assert d["D4"]["why"] == "15 s cost too much CPU." and d["D4"]["generation"] == 2
+    assert d["D4"]["what"] == "sample every 30 s instead of D3."
+    assert d["D4"]["why"] == "15 s cost too much CPU" and d["D4"]["generation"] == 2
     assert d["D5"]["who"] == "user" and d["D5"]["by"] == "the user (Alex)"
     assert {k: d[k]["superseded_by"] for k in d if d[k]["superseded_by"]} == {
         "D1": "D5", "D2": "D5", "D3": "D4"}
@@ -528,6 +530,55 @@ def test_decisions_parses_the_newest_log_of_the_pane(world, capsys):
     assert (d["D7"]["who"], d["D7"]["time"], d["D7"]["what"]) == ("agent", "2026-11-05 12:30 EET",
                                                                   "shipped.")
     assert (d["D8"]["by"], d["D8"]["what"]) == ("agent", "tagged v1.")
+
+
+# Real entries (an orchestrator's log, 2026-11-05) that the first parser got wrong; project, account,
+# machine and app names replaced.
+REAL = """\
+- **D5** 2026-11-05 11:05, agent: decision log onboarding = full log up to 30 KB, else index (first 160 chars of each entry) + latest 1-2 generations up to 60 KB. Ruled out keeping "read in full" (140-190K tokens per takeover) and model-written summaries (lossy, the reason the log exists).
+- **D25** 2026-11-05 12:15, user created Firebase project my-app-123 (owner owner@example.com) in the console. Agent registered Android app com.example.app (App ID 1:000000000000:android:0000) and saved google-services.json to ~/.config/orch/google-services.json (600, outside git). The earlier GCP-only project my-app (created by the agent, empty) is left in place; user not asked yet whether to delete it. Service account key + Firestore come with the push/relay task.
+- **D29** 2026-11-05 12:33, user: "it's okay" (to: keep the All page before the per-orchestrator pages, app opens on it when something needs him). Forwarded to ui to mark decided in DESIGN.md.
+- **D34** 2026-11-05 12:49, user: "1 ok as you reccomend": production deploy 'yes' from a notification opens the app's hold-to-confirm; staging stays one tap after unlock. Live Update on lock screen = progress only (agent default, user did not answer explicitly). Sent to ui and native.
+- **D36** 2026-11-05 13:20, user: "make sure to use main fully". So no early move to spare: backend task 3 part A = orch account --spill 1:98:2 (watchdog moves agents at idle once main 7d/5h >= 98%, fresh takeover from handoff preferred over --resume, immediate switch if a limit message is hit), installed + enabled on box1/box2 (not box3, different login); part B = cloud setup (FCM, Firestore eur3, anonymous auth, orch-push SA key in ~/.config/orch on 3 machines) + push sender/relay/pairing + docs/PUSH.md. Committed ui task 3 (82a743c: setup/pairing, settings, widgets + QS tile, light theme, N14 prod deploy opens app). ui task 4: spill-over UI, then APP-QA.
+- **D37** 2026-11-05 13:21, agent: at the 400K handoff threshold, stopped my background tasks (orch wait, the demo http.server on 127.0.0.1:8765) and relaunched emulator-5554 detached (setsid nohup, log ~/Android/emulator-OnePlus13R.log) because the takeover waits for background tasks and native depends on the emulator; told native. orch-serve branch is pushed but no PR is open for it yet (deliberately held until the app tests against the gateway). Handoff written to handoff.md in this lineage.
+"""
+
+
+def test_decisions_keep_log_order_and_take_only_explicit_reasons(world):
+    d = {e["id"]: e for e in world.orch.parse_decisions(REAL)}
+    assert [e["id"] for e in world.orch.parse_decisions(REAL)] == [
+        "D5", "D25", "D29", "D34", "D36", "D37"]
+    assert [d[k]["line"] for k in d] == [1, 2, 3, 4, 5, 6]
+    # D5: "the reason the log exists" is not a reason; "Ruled out ..." stays with the decision
+    assert d["D5"]["why"] == "" and d["D5"]["what"].endswith("(lossy, the reason the log exists).")
+    assert d["D5"]["what"].startswith("decision log onboarding = full log up to 30 KB")
+    # D25: no "user:" prefix, but the entry is the user's
+    assert (d["D25"]["who"], d["D25"]["by"], d["D25"]["why"]) == ("user", "user", "")
+    assert d["D25"]["what"].startswith("user created Firebase project my-app-123")
+    # D29, D34: after the quote, no ": " or "(" tying it to the quote
+    assert d["D29"]["quote"] == "it's okay"
+    assert d["D29"]["what"] == ("to: keep the All page before the per-orchestrator pages, app opens "
+                                "on it when something needs him. Forwarded to ui to mark decided in "
+                                "DESIGN.md.")
+    assert d["D34"]["quote"] == "1 ok as you reccomend"
+    assert d["D34"]["what"].startswith("production deploy 'yes' from a notification")
+    assert d["D34"]["what"].endswith("Sent to ui and native.") and d["D34"]["why"] == ""
+    # D36: the commit note at the end is not the reason
+    assert d["D36"]["quote"] == "make sure to use main fully" and d["D36"]["why"] == ""
+    assert d["D36"]["what"].startswith("So no early move to spare: backend task 3 part A")
+    assert d["D36"]["what"].endswith("ui task 4: spill-over UI, then APP-QA.")
+    # D37: the "because" clause is the reason; the rest of its sentence stays in `what`
+    assert d["D37"]["why"] == ("the takeover waits for background tasks and native depends on the "
+                               "emulator")
+    assert d["D37"]["what"] == (
+        "at the 400K handoff threshold, stopped my background tasks (orch wait, the demo http.server "
+        "on 127.0.0.1:8765) and relaunched emulator-5554 detached (setsid nohup, log "
+        "~/Android/emulator-OnePlus13R.log); told native. orch-serve branch is pushed but no PR is "
+        "open for it yet (deliberately held until the app tests against the gateway). Handoff "
+        "written to handoff.md in this lineage.")
+    for e in d.values():
+        assert e["by"] and (e["who"] == "user") == ("user" in e["by"] or "owner" in e["by"])
+        assert not e["what"].startswith((":", "("))
 
 
 def test_decisions_without_a_log(world):

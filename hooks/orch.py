@@ -779,7 +779,9 @@ QUOTE = re.compile(r"\s*([\"\u201c])(.*?)[\"\u201d]\.?\s*", re.DOTALL)
 REPLACES = re.compile(r"\b(?:replaces|replacing|supersedes|superseding|instead of|overrides|"
                       r"overriding)\s+((?:\*\*)?D\d+(?:\*\*)?(?:\s*(?:,|and|&|/)\s*(?:\*\*)?D\d+"
                       r"(?:\*\*)?)*)", re.IGNORECASE)
-WHY = re.compile(r"\b(?:why|because|reason)\b:?\s*", re.IGNORECASE)
+# A reason is only what an entry marks as one: "Why: ...", a sentence starting "Why", "because ..."
+WHY = re.compile(r"(?:(?:^|(?<=[.!?;]\s))why\b|\bwhy(?=:))\s*:?\s*|\bbecause\s+", re.IGNORECASE)
+SENTENCE_END = re.compile(r"[.!?](?=\s+[A-Z\"(`]|\s*$)")
 
 
 def lineage_of(pane):
@@ -789,13 +791,44 @@ def lineage_of(pane):
     return max(logs, key=lambda p: p.stat().st_mtime) if logs else None
 
 
-def sentences(text):
-    return [x for x in re.split(r"(?<=[.!?])\s+(?=[A-Z\"(`])", text.strip()) if x]
+def split_why(body):
+    """(what, why) of an entry's text. `why` is only an explicit reason: the rest of a "Why:" (or
+    "Why ...") sentence, or a "because" clause up to its ";" or full stop. Everything else stays
+    in `what`."""
+    m = WHY.search(body)
+    if not m:
+        return body.strip(), ""
+    because = m.group(0).lower().startswith("because")
+    rest = body[m.end():]
+    stop = SENTENCE_END.search(rest)
+    end = stop.start() if stop else len(rest)
+    if because and 0 <= rest.find(";") < end:
+        end = rest.find(";")
+    why, before, after = rest[:end].strip(), body[:m.start()].rstrip(), rest[end:]
+    if because:  # "X because Y; Z." -> "X; Z."
+        what = before.rstrip(" ,") + after
+    else:  # the "Why: ..." sentence goes whole, its full stop with it
+        what = " ".join(x for x in (before, after[1:].strip() if after[:1] in ".!?" else
+                                    after.strip()) if x)
+    return what.strip(), why
+
+
+def after_quote(body):
+    """The text after a quoted user line, without the ": " or "( ... )" that tie it to the quote."""
+    body = re.sub(r"^\s*[:\u2013\u2014-]\s*", "", body)
+    if body.startswith("("):
+        depth = 0
+        for i, ch in enumerate(body):
+            depth += {"(": 1, ")": -1}.get(ch, 0)
+            if depth == 0:
+                return (body[1:i] + body[i + 1:]).strip()
+    return body.strip()
 
 
 def parse_decisions(text):
-    """Entries of a decision log: id, time, who (user or agent), by (as written), quote (the
-    user's words), what (first sentence), why, superseded_by, generation, line."""
+    """Entries of a decision log, in log order: id, time, who (user or agent), by (as written,
+    else who), quote (the user's words), what (the entry, without its reason), why (only an
+    explicit reason), superseded_by, generation, line."""
     entries, generation, current = [], 1, None
     for number, line in enumerate(text.splitlines(), 1):
         if line.startswith("#"):
@@ -819,16 +852,15 @@ def parse_decisions(text):
         who = WHO.match(rest)
         e["by"] = who.group(1).strip() if who else ""
         rest = rest[who.end():] if who else rest
-        user = bool(re.search(r"\b(?:user|owner)\b", e["by"], re.IGNORECASE) if e["by"] else
-                    re.match(r"(?:the\s+)?(?:user|owner)\b", rest, re.IGNORECASE))
+        lead = None if e["by"] else re.match(r"(?:the\s+)?(?:user|owner)\b", rest, re.IGNORECASE)
+        user = bool(re.search(r"\b(?:user|owner)\b", e["by"], re.IGNORECASE) if e["by"] else lead)
         e["who"] = "user" if user else "agent"
+        e["by"] = e["by"] or (lead.group(0) if lead else "agent")
         quote = QUOTE.match(rest) if user else None
         e["quote"] = quote.group(2).strip() if quote else None
-        body = rest[quote.end():] if quote else rest
-        parts = sentences(body) or sentences(e["quote"] or "")
-        e["what"] = parts[0] if parts else body.strip()
-        why = WHY.search(body)
-        e["why"] = (body[why.end():] if why else " ".join(parts[1:])).strip()[:1000]
+        body = after_quote(rest[quote.end():]) if quote else rest
+        what, why = split_why(body)
+        e["what"], e["why"] = what or e["quote"] or "", why[:1000]
         e["superseded_by"] = None
         for ref in REPLACES.findall(rest):
             for old in re.findall(r"D\d+", ref):
@@ -836,7 +868,7 @@ def parse_decisions(text):
                     latest[old]["superseded_by"] = e["id"]
         latest[e["id"]] = e
         out.append(e)
-    return sorted(out, key=lambda e: e["who"] != "user")  # owner rules first, then log order
+    return out
 
 
 def cmd_decisions(args):
