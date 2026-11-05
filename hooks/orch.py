@@ -700,14 +700,15 @@ def default_answers(ags, dry_run):
                 print(f"{q['id']}: {e.text}", file=sys.stderr)
 
 
-def keep_plan(report, last):
+def keep_plan(report, last, since=0):
     """`report`, with the plan of `last` (an earlier report) if it has no `roadmap` of its own:
     the plan outlives the turn, with the time it was written and its `source`. `roadmap: []` is
-    a plan too, the empty one. Everything else in a report belongs to its turn."""
-    if "roadmap" in report or "roadmap" not in last:
+    a plan too, the empty one. Everything else in a report belongs to its turn. A plan from
+    before `since` (the run's start) isn't kept: an old plan under a new goal misleads."""
+    written = last.get("roadmap_time") or last.get("time") or 0
+    if "roadmap" in report or "roadmap" not in last or written < since:
         return report
-    return dict(report, roadmap=last["roadmap"],
-                roadmap_time=last.get("roadmap_time") or last.get("time"),
+    return dict(report, roadmap=last["roadmap"], roadmap_time=written or None,
                 **({"source": last["source"]} if "source" in last else {}))
 
 
@@ -719,7 +720,8 @@ def write_report(pane, report):
     st = load(path) or {"pane": pane}
     if "roadmap" in report:
         report = dict(report, roadmap_time=report.get("time") or now())
-    st["report"] = keep_plan(report, st.get("report") or {})
+    st["report"] = keep_plan(report, st.get("report") or {},
+                             (run_of(pane)[0] or {}).get("created") or 0)
     save(path, st)
     emit("report", f"{report.get('role', 'agent').capitalize()} report: {pane}",
          report.get("summary") or "", pane, report=report)

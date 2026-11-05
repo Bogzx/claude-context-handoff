@@ -621,7 +621,7 @@ class Gateway:
         agent = ags.get(pane)
         v = orch.view(pane, agent, None, at)
         if v["report"] and plan:  # a session's MCP server keeps the write_report it started with
-            v["report"] = orch.keep_plan(v["report"], plan)
+            v["report"] = orch.keep_plan(v["report"], plan, (run or {}).get("created") or 0)
         lead = agent_json(v, agent, "orchestrator", first)
         workers = [agent_json(orch.view(p, ags.get(p), run, at), ags.get(p), "worker", first)
                    for p in (run or {}).get("workers") or {}]
@@ -1354,6 +1354,16 @@ def background(gateway, stop):
                     traceback.print_exc()
 
 
+def watch_events(gateway, stop):
+    """Apart from background(), whose jobs wait on the usage scan, Google and relay actions: a
+    question shouldn't. A look that fails leaves its events to the next pass."""
+    while not stop.wait(orch_push.WATCH_EVERY):
+        try:
+            gateway.pusher.watch()
+        except Exception:  # noqa: BLE001
+            traceback.print_exc()
+
+
 # --- commands ------------------------------------------------------------------------------------
 
 def serve(args):
@@ -1371,6 +1381,7 @@ def serve(args):
              else ""), flush=True)
     stop = threading.Event()
     threading.Thread(target=background, args=(gateway, stop), daemon=True).start()
+    threading.Thread(target=watch_events, args=(gateway, stop), daemon=True).start()
     try:
         server.serve_forever()
     except KeyboardInterrupt:
