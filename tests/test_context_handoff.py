@@ -3,6 +3,7 @@ import importlib.util
 import io
 import json
 import os
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -491,11 +492,15 @@ RESULT = entry("user", [{"type": "tool_result", "tool_use_id": "t", "content": "
 
 @pytest.fixture
 def in_run(hook, tmp_path, monkeypatch, capsys):
-    """This pane is a worker of an active run, the orch MCP server is registered, and stop()
-    ends a turn whose transcript is the given entries."""
+    """This pane is a worker of an active run, its session (this process standing in for
+    claude) has the orch MCP server loaded as a child process, and stop() ends a turn whose
+    transcript is the given entries. stop.unload() ends the server."""
     monkeypatch.setattr(hook, "IN_HERDR", True)
-    monkeypatch.setattr(hook, "claude_pid", lambda: None)
+    monkeypatch.setattr(hook, "claude_pid", os.getpid)
     monkeypatch.setenv("HERDR_PANE_ID", PANE)
+    server = tmp_path / "orch_mcp.py"
+    server.write_text("import time\ntime.sleep(120)\n")
+    child = subprocess.Popen([sys.executable, str(server)])  # returns after the exec
     config = tmp_path / "config"
     config.mkdir()
     (config / ".claude.json").write_text(json.dumps({"mcpServers": {"orch": {"command": "x"}}}))
@@ -514,9 +519,14 @@ def in_run(hook, tmp_path, monkeypatch, capsys):
         hook.main()
         out = capsys.readouterr().out
         return json.loads(out) if out.strip() else None
+    def unload():
+        child.kill()
+        child.wait()
     stop.run = run
     stop.config = config
-    return stop
+    stop.unload = unload
+    yield stop
+    unload()
 
 
 def test_a_working_turn_without_a_report_is_blocked_once(in_run):
@@ -558,9 +568,25 @@ def test_no_report_is_asked_outside_an_active_run(in_run):
     assert in_run(*turn) is None
 
 
-def test_no_report_is_asked_when_the_orch_server_is_missing(in_run):
-    (in_run.config / ".claude.json").write_text(json.dumps({"mcpServers": {}}))
+def test_no_report_is_asked_when_the_session_has_not_loaded_the_orch_server(in_run):
+    # Registered in the account's config (the fixture's .claude.json) but not running in this
+    # session: it started before the install, so it can't call the tool.
+    in_run.unload()
     assert in_run(entry("user", "fix #12"), tool("Bash"), RESULT) is None
+
+
+def test_orch_loaded_needs_the_server_as_a_child_of_that_claude_process(hook, in_run):
+    assert hook.orch_loaded(os.getpid())
+    assert not hook.orch_loaded(os.getppid())
+    assert not hook.orch_loaded(None)
+    # A shell command that only mentions the file is not the server.
+    shell = subprocess.Popen(["sh", "-c", "sleep 120; echo orch_mcp.py"])
+    try:
+        in_run.unload()
+        assert not hook.orch_loaded(os.getpid())
+    finally:
+        shell.kill()
+        shell.wait()
 
 
 def test_no_report_is_asked_while_a_handoff_is_underway(hook, in_run):
