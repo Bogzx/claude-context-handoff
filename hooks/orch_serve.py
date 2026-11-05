@@ -744,7 +744,8 @@ class Gateway:
             if acc in accounts and "seven_day" in accounts[acc]["windows"]:
                 accounts[acc]["windows"]["seven_day"].update(
                     agents=week.get("agents") or {}, machine_cost_usd=week.get("machine_cost_usd"))
-            if week.get("machine_cost_usd") and week.get("used_percentage") is not None:
+            if (week.get("points_known") and week.get("machine_cost_usd")
+                    and week.get("used_percentage") is not None):
                 ratio[acc] = week["used_percentage"] / week["machine_cost_usd"]
         agents, other = [], {}
         for a in rep["agents"]:

@@ -447,6 +447,10 @@ Not in the gateway yet: the diff view, the activity lanes and the per-agent mode
 - `run.cost_usd` and `run.week_points` in `/v1/fleet` and `state` pushes come from the background usage pass, every 5
   minutes, so they lag by up to that and are missing until its first pass after a gateway start. `week_points` is
   null while the run's orchestrator has no use in the transcripts here.
+- `week_points`, and each agent's and `other`'s `points_last_hour`, `points_today` and `points_7d`, are null while the
+  account's week window opened before its capture began on this machine (`capture_since` in `usage.json`). The
+  sessions from before the capture have no account, so their cost is missing and the points per USD would read high.
+  The window's next reset ends this.
 - `/v1/usage` `runs` also has `hours` (from its start to now or its end), `max_workers` (from its settings, else the
   workers it has now) and `account` (its orchestrator's). `other` has `cost_usd`, and `account: null` for sessions from
   before the account capture.

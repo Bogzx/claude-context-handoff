@@ -452,8 +452,8 @@ def busy_fleet(w):
     (w.root / "watchdog.json").write_text(json.dumps(
         {BOSS: {"first_seen": {f"{W2}:blocked:s-{W2}:1": w.t - 11 * 60}}}))
     (w.root / "usage.json").write_text(json.dumps({"accounts": {"1": {
-        "read_at": w.t - 30, "windows": {"seven_day": {"used_percentage": 80,
-                                                    "resets_at": w.t + 86400}}}}}))
+        "read_at": w.t - 30, "capture_since": w.t - 30 * 86400,
+        "windows": {"seven_day": {"used_percentage": 80, "resets_at": w.t + 86400}}}}}))
     with open(w.root / "usage-history.jsonl", "w") as f:
         f.writelines(json.dumps({"time": w.t - 3600 + i * 900, "account": "1", "windows": {
                 "seven_day": {"used_percentage": 77 + i, "resets_at": w.t + 86400}}}) + "\n" for i in range(4))
@@ -762,6 +762,61 @@ def test_an_earlier_session_with_no_account_doesnt_hide_the_agents_account(world
     assert lead["account"] == "1" and lead["points_7d"] is not None
     [run] = out["runs"].values()
     assert run["account"] == "1" and run["week_points"] is not None
+
+
+def set_reading(world, **fields):
+    path = world.root / "usage.json"
+    usage = json.loads(path.read_text())
+    usage["accounts"]["1"].update(fields)
+    path.write_text(json.dumps(usage))
+
+
+def test_points_are_null_while_the_window_opened_before_the_capture_began(world):
+    costly_run(world)
+    spend(world, "s-other", assistant(world.t - 600, "m4", 500_000))
+    usage = json.loads((world.root / "usage.json").read_text())
+    usage["sessions"] = {"s-other": {"account": "1", "time": world.t}}
+    (world.root / "usage.json").write_text(json.dumps(usage))
+    set_reading(world, capture_since=world.t - 3600)  # the window opened 6 days ago
+    gw = world.serve.Gateway()
+    world.serve.warm_usage(gw)
+
+    status, out = world.get(gw, "/v1/usage?hours=168")
+    assert status == 200
+    conforms(out, USAGE)
+    periods = ("points_last_hour", "points_today", "points_7d")
+    for row in [*out["agents"], *out["other"]]:
+        assert [row[k] for k in periods] == [None, None, None]
+    assert out["other"][0]["cost_usd"] == 10.0  # the dollars are still right
+    for agent in out["accounts"]["1"]["windows"]["seven_day"]["agents"].values():
+        assert agent["estimated_points"] is None
+    run = next(iter(out["runs"].values()))
+    assert run["week_points"] is None and run["cost"] == 40.01 and run["account"] == "1"
+    fleet = gw.fleet()[1]
+    conforms(fleet, FLEET)
+    assert fleet["orchestrators"][0]["run"]["week_points"] is None
+    assert fleet["orchestrators"][0]["run"]["cost_usd"] == 40.01
+
+
+def test_points_come_back_with_the_first_window_opened_after_the_capture_began(world):
+    costly_run(world)
+    set_reading(world, capture_since=world.t - 3600)
+    gw = world.serve.Gateway()
+    assert gw.usage(168)["agents"][0]["points_7d"] is None
+    set_reading(world, windows={"seven_day": {"used_percentage": 10,  # opened 30 minutes ago
+                                              "resets_at": world.t + 7 * 86400 - 1800}})
+    spend(world, f"s-{BOSS}", assistant(world.t - 1800, "m1", 1_000_000),
+          assistant(world.t - 60, "m5", 1_000_000))
+    [lead] = [a for a in gw.usage(168)["agents"] if a["pane"] == BOSS]
+    assert lead["points_7d"] == pytest.approx(6.7, abs=0.05)  # 2 of its 3 messages' cost
+
+
+def test_a_reading_with_no_capture_time_has_no_points(world):
+    costly_run(world)
+    set_reading(world, capture_since=None)
+    out = world.serve.Gateway().usage(168)
+    assert out["agents"][0]["points_7d"] is None
+    assert next(iter(out["runs"].values()))["week_points"] is None
 
 
 def test_a_state_push_carries_the_run_cost(world, cloud):
