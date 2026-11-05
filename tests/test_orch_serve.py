@@ -460,12 +460,15 @@ def test_history_has_the_runs_events_newest_first_and_the_generations(world):
     world.t += 60
     world.orch.emit("report", "Worker report", "PR #12", W1)
     world.orch.emit("report", "Elsewhere", "x", LOOSE)
+    world.orch.emit("pair", "Phone paired", "x", None)  # machine-wide, not the run's
     world.t += 60
+    world.orch.emit("spill", "Account 1 at 98%: moving to 2", "its agents move", None)
     world.orch.emit("nudge", "Watchdog nudged", "go", BOSS)
     status, out = world.get(gw, f"/v1/orchestrators/{BOSS}/history")
     assert status == 200
     conforms(out, HISTORY)
-    assert [e["kind"] for e in out["events"]] == ["nudge", "report", "run-start"]
+    assert [e["kind"] for e in out["events"]] == ["nudge", "spill", "report", "run-start"]
+    assert out["events"][1]["pane"] is None
     since = world.get(gw, f"/v1/orchestrators/{BOSS}/history?since={world.t - 90}&limit=1")[1]
     assert [e["kind"] for e in since["events"]] == ["nudge"]
     [gen] = out["generations"]

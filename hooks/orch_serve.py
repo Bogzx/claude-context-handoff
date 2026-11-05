@@ -572,10 +572,13 @@ class Gateway:
                      "decisions": orch.parse_decisions(log.read_text(errors="replace"))}
 
     def history(self, pane, since, limit):
+        """The events of the orchestrator and its workers, and the machine's `spill` events
+        (no pane: they move every agent of the account)."""
         panes = {pane, *(orch.load_run(pane).get("workers") or {})}
         machine, local = self.machine(), socket.gethostname()  # the hooks log the hostname
         events = [dict(e, host=machine) if e.get("host") == local else e for e in read_events()
-                  if e.get("pane") in panes and (e.get("time") or 0) >= since]
+                  if (e.get("pane") in panes or e.get("kind") == "spill")
+                  and (e.get("time") or 0) >= since]
         return {"events": events[::-1][:max(1, min(limit, 2000))],
                 "generations": generations(pane)}
 
