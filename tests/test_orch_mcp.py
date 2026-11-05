@@ -106,6 +106,80 @@ def test_report_takes_the_apps_suggestions_and_why_a_roadmap_item_is_blocked(mcp
     assert saved["suggestions"] == ["Deploy to staging", "Wrap up by 15:00"]
 
 
+PLAN = [{"title": "Deploy 2.14", "status": "next"}]
+
+
+@pytest.fixture
+def reports(mcp, monkeypatch):
+    """report(at, **fields) through the tool, at a fake time: the stored report back."""
+    def report(at, **fields):
+        monkeypatch.setattr(mcp.module.orch, "now", lambda: at)
+        [resp] = mcp(call(1, "report", dict({"role": "orchestrator", "summary": "s"}, **fields)))
+        assert not resp["result"]["isError"]
+        return json.loads((mcp.root / "agents" / "w1-p0.json").read_text())["report"]
+    return report
+
+
+def logged(mcp):
+    lines = (mcp.root / "events.jsonl").read_text().splitlines()
+    return [json.loads(x)["report"] for x in lines]
+
+
+def test_a_report_without_a_roadmap_keeps_the_plan_and_the_time_it_was_written(reports):
+    first = reports(100, roadmap=PLAN, next=["deploy"], risks=["disk"],
+                    waiting_on=[{"who": "qa", "what": "a run"}], state="working")
+    assert first["roadmap_time"] == 100 == first["time"]
+
+    second = reports(200, summary="still going", state="waiting_on_owner")
+    assert second["roadmap"] == PLAN and second["roadmap_time"] == 100
+    assert second["time"] == 200 and second["summary"] == "still going"
+    assert second["state"] == "waiting_on_owner"
+    assert not {"next", "risks", "waiting_on"} & set(second)  # those belong to their turn
+
+    assert reports(300)["roadmap_time"] == 100  # and the one after it
+
+
+def test_a_newer_roadmap_replaces_the_plan_and_its_time(reports):
+    reports(100, roadmap=PLAN)
+    reports(200)
+    newer = [{"title": "Roll back", "status": "doing"}]
+    saved = reports(300, roadmap=newer)
+    assert saved["roadmap"] == newer and saved["roadmap_time"] == 300
+
+
+def test_an_empty_roadmap_clears_the_plan_and_it_stays_cleared(reports):
+    reports(100, roadmap=PLAN)
+    cleared = reports(200, roadmap=[])
+    assert cleared["roadmap"] == [] and cleared["roadmap_time"] == 200
+    later = reports(300)
+    assert later["roadmap"] == [] and later["roadmap_time"] == 200
+
+
+def test_a_report_with_no_plan_before_it_has_no_plan_fields(reports):
+    assert not {"roadmap", "roadmap_time"} & set(reports(100, status="done"))
+
+
+def test_a_plan_stored_before_roadmap_time_existed_is_dated_by_its_report(mcp, reports):
+    path = mcp.root / "agents" / "w1-p0.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps({"pane": PANE, "report": {"time": 50, "summary": "old",
+                                                         "roadmap": PLAN}}))
+    assert reports(200)["roadmap_time"] == 50
+
+
+def test_the_log_has_what_the_agent_sent_not_the_plan_again(mcp, reports):
+    reports(100, roadmap=PLAN)
+    reports(200)
+    with_plan, without = logged(mcp)
+    assert with_plan["roadmap"] == PLAN and with_plan["roadmap_time"] == 100
+    assert not {"roadmap", "roadmap_time"} & set(without)
+
+
+def test_the_report_tool_tells_an_agent_a_roadmap_can_be_left_out(mcp):
+    report = next(t for t in mcp.module.TOOLS if t["name"] == "report")
+    assert "left out it stays" in report["description"] and "[] clears it" in report["description"]
+
+
 def test_ask_owner_logs_a_question_with_options(mcp):
     [resp] = mcp(call(1, "ask_owner", {"question": "Deploy to prod?",
                                        "options": [{"label": "Deploy", "danger": "prod"},

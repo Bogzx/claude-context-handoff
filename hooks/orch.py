@@ -702,10 +702,20 @@ def default_answers(ags, dry_run):
 
 def write_report(pane, report):
     """Store an agent's turn-end report in its status file (keeping the Stop hook's fields)
-    and log it."""
+    and log it. The plan outlives the turn: a report without `roadmap` keeps the last one, with
+    the time it was written and its `source`, and `roadmap: []` clears it. Everything else in a
+    report belongs to its turn. The log has what the agent sent, not a copy of the plan each
+    time."""
     path = ROOT / "agents" / f"{slug(pane)}.json"
     st = load(path) or {"pane": pane}
+    last = st.get("report") or {}
+    if "roadmap" in report:
+        report = dict(report, roadmap_time=report.get("time") or now())
     st["report"] = report
+    if "roadmap" in last and "roadmap" not in report:
+        st["report"] = dict(report, roadmap=last["roadmap"],
+                            roadmap_time=last.get("roadmap_time") or last.get("time"),
+                            **({"source": last["source"]} if "source" in last else {}))
     save(path, st)
     emit("report", f"{report.get('role', 'agent').capitalize()} report: {pane}",
          report.get("summary") or "", pane, report=report)

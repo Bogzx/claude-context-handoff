@@ -232,8 +232,8 @@ ORCH_REPORT = {"time": NUM, "summary": str,
                "waiting_on?": [{"who": str, "what": str, "eta?": str}], "next?": [str],
                "roadmap?": [{"id?": str, "title": str, "owner?": str, "eta?": str, "why?": str,
                              "status": {"done", "doing", "next", "later", "blocked"}}],
-               "risks?": [str], "milestones?": [dict], "suggestions?": [str],
-               "source": {"report", "handoff"}}
+               "roadmap_time?": NUM, "risks?": [str], "milestones?": [dict],
+               "suggestions?": [str], "source": {"report", "handoff"}}
 WORKER_REPORT = {"time": NUM, "summary": str, "status?": {"done", "partial", "blocked"},
                  "tests?": [{"cmd": str, "passed?": int, "failed?": int}],
                  "changed_files?": [{"path": str, "added?": int, "removed?": int}],
@@ -706,6 +706,34 @@ def test_an_agent_herdr_cant_read_is_unknown_not_working(world):
     assert builder["state"] == "unknown" and builder["agent_status"] == "unknown"
     assert lead["agent"]["state"] == "unknown"
     assert lead["activity"] == "working" and lead["stall"] is None  # nothing shows it stopped
+
+
+def test_the_fleet_keeps_a_plan_across_reports_and_says_where_it_came_from(world):
+    """`source` says where the plan came from, so it goes with the plan and not with the report
+    that happens to be the latest."""
+    busy_fleet(world)
+    gw = world.serve.Gateway()
+    lead = lambda: gw.fleet()[1]["orchestrators"][0]["report"]  # noqa: E731
+    written = world.t - 400
+    assert lead()["roadmap_time"] == written and lead()["source"] == "report"
+    conforms(lead(), ORCH_REPORT)
+
+    world.t += 60
+    world.orch.write_report(BOSS, {"role": "orchestrator", "time": world.t, "summary": "5 of 9"})
+    assert [r["title"] for r in lead()["roadmap"]] == ["flaky test"]
+    assert lead()["roadmap_time"] == written and lead()["time"] == world.t
+    conforms(lead(), ORCH_REPORT)
+
+    path = world.root / "agents" / "w1-p0.json"
+    status = json.loads(path.read_text())
+    status["report"]["source"] = "handoff"
+    path.write_text(json.dumps(status))
+    world.orch.write_report(BOSS, {"role": "orchestrator", "time": world.t, "summary": "6 of 9"})
+    assert lead()["source"] == "handoff"
+
+    world.orch.write_report(BOSS, {"role": "orchestrator", "time": world.t, "summary": "7 of 9",
+                                   "roadmap": [{"title": "ship", "status": "next"}]})
+    assert lead()["source"] == "report" and lead()["roadmap_time"] == world.t
 
 
 def test_the_fleet_has_the_run_cost_from_the_background_pass_only(world, monkeypatch):
