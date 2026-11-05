@@ -162,10 +162,13 @@ def check(opts, strict=False):
     if opts.get("worktree"):
         if not (folder / ".git").exists():
             orch.die(f"{tilde(str(folder))} is not a git checkout: no worktree")
-        name = name or folder.name
+        name = name or free_name(folder, slug(goal) or folder.name)
         cwd = folder.parent / f"{folder.name}-{name}"
         if cwd.exists():
             orch.die(f"{tilde(str(cwd))} exists already: pick another name for the worktree")
+        if has_branch(folder, f"orch/{name}"):
+            orch.die(f"{tilde(str(folder))} has a branch orch/{name} already: pick another name "
+                     "for the worktree")
     if strict:
         env = orch.read_env()
         roots, machine = paths(env.get("ORCH_START_ROOTS")), orch.machine_name(env)
@@ -192,6 +195,30 @@ def check(opts, strict=False):
             "tab": None, "pane": None, "lineage": None,
             "brief": str(orch.STARTS / sid / "brief.md"), "step": None, "status": "accepted",
             "steps": [], "error": None}
+
+
+def slug(goal):
+    """The goal's first three words, lowercase, letters and digits joined by "-", at most 24
+    characters: a worktree's name when none is given, as the app names it (UI-SPEC 4.30)."""
+    words = re.sub(r"[^a-z0-9]+", " ", goal.lower()).split()
+    return "-".join(words[:3])[:24].rstrip("-")
+
+
+def has_branch(repo, branch):
+    return subprocess.run(["git", "-C", str(repo), "show-ref", "--verify", "--quiet",
+                           f"refs/heads/{branch}"], check=False, timeout=30).returncode == 0
+
+
+def free_name(repo, base):
+    """base, else base-2, base-3, ...: the first name with no worktree folder next to the repo
+    and no orch/<name> branch in it, so a second start in a repo doesn't fail on the first's."""
+    n = 1
+    while True:
+        name = base if n == 1 else f"{base}-{n}"
+        if not ((repo.parent / f"{repo.name}-{name}").exists()
+                or has_branch(repo, f"orch/{name}")):
+            return name
+        n += 1
 
 
 def accept(rec):

@@ -344,6 +344,29 @@ def test_a_worktree_start_works_in_a_new_branch_next_to_the_folder(world, tmp_pa
         world.run("--id", "r2", "--worktree", "--name", "beta")
 
 
+def test_a_worktree_without_a_name_is_named_after_the_goal_and_unique_in_the_repo(world,
+                                                                                capsys):
+    repo = world.folder
+    git = ["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@example.com"]
+    subprocess.run([*git, "init", "-q"], check=True)
+    subprocess.run([*git, "commit", "-q", "--allow-empty", "-m", "init"], check=True)
+    subprocess.run([*git, "branch", "orch/ship-the-beta-2"], check=True)  # someone's branch
+
+    assert world.run("--id", "r1", "--worktree") == 0
+    world.herdr.agent, world.herdr.prompts = None, []  # the next tab's pane is a new one
+    assert world.run("--id", "r2", "--worktree") == 0  # the same goal again: no clash
+
+    assert [(world.record(s)["name"], world.record(s)["cwd"]) for s in ("r1", "r2")] == [
+        ("ship-the-beta", str(repo.parent / "my-app-ship-the-beta")),
+        ("ship-the-beta-3", str(repo.parent / "my-app-ship-the-beta-3"))]
+    assert world.new.slug("Fix: the 2FA login, then deploy!") == "fix-the-2fa"
+    assert world.new.slug("Évaluer ça") == "valuer-a"
+    assert world.new.slug("Refactor authentication middleware") == "refactor-authentication"
+    with pytest.raises(SystemExit):  # a name given: never renamed, refused before any step
+        world.run("--id", "r3", "--worktree", "--name", "ship-the-beta-2")
+    assert "has a branch orch/ship-the-beta-2 already" in capsys.readouterr().err
+
+
 def test_dry_run_prints_every_step_and_changes_nothing(world, capsys):
     assert world.run("--dry-run", "--plan-first", "--rules", "No pushes to main") == 0
 

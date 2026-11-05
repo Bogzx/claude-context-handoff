@@ -1615,7 +1615,8 @@ def main(argv=None):
                     help="an owner rule, written at the top of its decision log (repeatable)")
     nw.add_argument("--name", help="the herdr agent's name (and the worktree's)")
     nw.add_argument("--worktree", action="store_true",
-                    help="work in a new git worktree <cwd>-<name> on branch orch/<name>")
+                    help="work in a new git worktree <cwd>-<name> on branch orch/<name>; "
+                         "with no --name, named after the goal's first three words")
     nw.add_argument("--worker-model", help="the model its workers start on (in its brief)")
     nw.add_argument("--max-workers", type=int, help="how many workers at a time (in its brief)")
     nw.add_argument("--id", help="the request's id: the same id again starts nothing")

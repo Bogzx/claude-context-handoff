@@ -838,8 +838,24 @@ def target(pane):
     return {"pane": pane, "change": agent.get("state_change_seq")}
 
 
+def typable(pane):
+    """Refuse typed input to a new orchestrator's pane until Claude runs there and its
+    folder-trust question is answered: before that a shell reads the text, and during the
+    dialog the keys and Enter could answer it without the app's hold."""
+    start = orch.start_of(pane)
+    if not start or orch.start_cancelled(start):
+        return
+    steps = {s["step"]: s["status"] for s in start.get("steps") or []}
+    if steps.get("trust") == "doing":
+        raise Reject(f"{pane} is a new orchestrator at Claude's folder-trust question: "
+                     "answer that first")
+    if steps.get("claude") != "ok" or start.get("restart"):
+        raise Reject(f"{pane} is a new orchestrator whose Claude isn't running yet")
+
+
 def act_prompt(gw, body, rec):
     pane, text = need(body, "pane"), need(body, "text")
+    typable(pane)
     out = target(pane)
     if not orch.prompt(pane, text):
         raise Reject(f"could not prompt {pane}", 502, "failed")
@@ -849,13 +865,16 @@ def act_prompt(gw, body, rec):
 def act_answer(gw, body, rec):
     qid, text = need(body, "question"), need(body, "text")
     run, q = orch.find_question(qid)
-    out = target((q or {}).get("pane") or (run or {}).get("orchestrator") or "")
+    pane = (q or {}).get("pane") or (run or {}).get("orchestrator") or ""
+    typable(pane)
+    out = target(pane)
     orch.answer(qid, text)
     return out
 
 
 def act_interrupt(gw, body, rec):
     pane = need(body, "pane")
+    typable(pane)
     out = target(pane)
     result = orch.herdr("pane", "send-keys", pane, "esc")
     if not result or result.returncode != 0:
@@ -896,6 +915,7 @@ def act_run(gw, body, rec):
 
 def act_nudge(gw, body, rec):
     lead, text = need(body, "orchestrator"), need(body, "text")
+    typable(lead)
     out = target(lead)
     if not orch.prompt(lead, text):
         raise Reject(f"could not prompt {lead}", 502, "failed")

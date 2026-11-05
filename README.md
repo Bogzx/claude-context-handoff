@@ -313,7 +313,10 @@ the next one under a second.
 `orch new --cwd DIR --goal TEXT --until T` starts an orchestrator in a new herdr tab in `DIR` and prints its pane
 first. The gateway's `start` action runs the same code. Each step is `doing`, `ok` or `failed`:
 
-1. `pane`: with `--worktree`, `git worktree add <DIR>-<name> -b orch/<name>` first. Then a herdr tab in the folder
+1. `pane`: with `--worktree`, `git worktree add <DIR>-<name> -b orch/<name>` first. Without `--name` the name is
+   the goal's first three words in lowercase, joined by `-`, at most 24 characters (`add-csv-export`). If that
+   folder or branch exists already, `-2`, `-3`, ... is added. A given name whose folder or branch exists is refused
+   before any step. Then a herdr tab in the folder
    (its root pane is the orchestrator's), a new decision log for that pane that starts with the goal (D1) and each
    `--rules` text (D2, ...) as the owner's entries, and a brief at `~/.claude/orch/new/<id>/brief.md` with the goal,
    the rules, the run and the worker limits (`--worker-model`, `--max-workers`).
@@ -407,6 +410,8 @@ question), the diff view, the activity lanes and the per-agent model.
   while that start is at its `trust` step: `allow` picks "Yes", `deny` picks "No" (Claude exits) and cancels the
   start. The gateway checks that the agent is still blocked at the same `change` and that the screen shows a trust
   question with Yes and No, and it logs who answered (a `trust` event). Any other dialog is answered in the pane.
+- `prompt`, `nudge`, `interrupt` and `answer` are refused (409) for a start's pane until Claude runs there and its
+  folder-trust question is answered. Before that, a shell would read the text, or its keys could answer the dialog.
 - `/v1/health` has `can_start` and, when false, `cannot_start`: ORCH_START_ROOTS not set, herdr not running, or
   claude-acc missing.
 - `/v1/fleet` shows an unfinished start (the last day's, until `brief` or `plan` is ok) as an orchestrator with

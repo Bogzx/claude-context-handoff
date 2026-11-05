@@ -916,6 +916,38 @@ def test_a_start_at_the_trust_dialog_shows_a_trust_dialog(world, monkeypatch):
     assert "kind" not in dialog  # another dialog of the same agent
 
 
+def test_a_starting_orchestrator_takes_no_typed_input_until_claude_runs_and_trust_is_answered(
+        world, monkeypatch):
+    allow_starts(world, monkeypatch, run_it=False)
+    gw = world.serve.Gateway()
+    world.post(gw, **start_action(id="st1"))
+    rec = world.orch.load(world.orch.STARTS / "st1" / "new.json")
+    rec["pane"] = NEW
+    world.orch.start_step(rec, "pane", "ok")
+    world.agent(NEW, "idle")  # herdr sees the pane's shell before Claude runs
+
+    def typed(n):
+        return [world.post(gw, id=f"p{n}", kind="prompt", pane=NEW, text="y"),
+                world.post(gw, id=f"i{n}", kind="interrupt", pane=NEW),
+                world.post(gw, id=f"n{n}", kind="nudge", orchestrator=NEW, text="y")]
+
+    keys = len(world.herdr_calls)
+    for status, out in typed(1):
+        assert status == 409 and out["error"].endswith("whose Claude isn't running yet")
+    world.orch.start_step(rec, "claude", "doing")
+    world.orch.start_step(rec, "trust", "doing")
+    world.agent(NEW, "blocked")
+    for status, out in typed(2):
+        assert status == 409 and "folder-trust question: answer that first" in out["error"]
+    assert world.prompts == [] and world.herdr_calls[keys:] == []  # nothing reached the pane
+    world.orch.start_step(rec, "trust", "ok")
+    world.orch.start_step(rec, "claude", "ok")
+    world.agent(NEW, "idle")
+    assert [status for status, _ in typed(3)] == [202, 202, 202]
+    world.orch.save(world.orch.STARTS / "st1" / "new.json", dict(rec, restart=True))  # retry
+    assert world.post(gw, id="p4", kind="prompt", pane=NEW, text="y")[0] == 409
+
+
 def from_phone(w, gw, **action):
     """An action from the paired phone (127.0.0.1 is its tailnet node in the world)."""
     action.setdefault("id", f"a{len(w.events())}-{action.get('kind')}")
