@@ -359,7 +359,8 @@ on Python 3.8; the push and relay code (`hooks/orch_push.py`) also needs the `cr
 - The gateway appends every action, refused ones included, to `events.jsonl` as kind `action` with `source: "app"`
   (or `"relay"`).
 - `install.sh` installs `orch-serve.service` (systemd user unit) enabled but not started. It only runs once
-  `~/.config/orch/.env` exists: `orch pair`, then `systemctl --user start orch-serve`.
+  `~/.config/orch/.env` has the token: `orch pair`, then `systemctl --user start orch-serve`. Before that the file
+  may hold other settings (`ORCH_START_ROOTS`), and a start of the unit is skipped.
 
 Not in the gateway yet: answering a permission dialog (`dialog` is refused), the diff view, the activity lanes and the
 per-agent model.

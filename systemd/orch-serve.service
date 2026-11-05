@@ -1,9 +1,11 @@
 [Unit]
 Description=orch serve: the gateway for the owner's phone app, on the Tailscale IP only
-# Not before `orch pair` has created the token.
+# Not before `orch pair` has written the token. The file may hold other settings before that
+# (ORCH_START_ROOTS): without a token the start is skipped, not failed and retried.
 ConditionPathExists=%h/.config/orch/.env
 
 [Service]
+ExecCondition=/bin/grep -Eq "^ *ORCH_TOKEN *= *[^ ]" %h/.config/orch/.env
 Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
 ExecStart=/usr/bin/env python3 %h/.claude/hooks/orch.py serve
 Restart=on-failure
