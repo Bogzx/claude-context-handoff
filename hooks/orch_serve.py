@@ -38,6 +38,7 @@ from urllib.parse import parse_qs, unquote, urlencode, urlsplit
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import orch
+import orch_new
 import orch_push
 import orch_usage
 
@@ -50,6 +51,7 @@ RECENT_RUN = 86400  # a run that ended this long ago still shows in the fleet
 MAX_BODY = 64 * 1024
 WHOIS_TTL = 60
 EVENTS_TAIL = 8 << 20  # bytes of events.jsonl read for history and the last nudge
+PANE_WAIT = 20  # seconds the start action waits for the new orchestrator's pane
 
 
 def warm_usage(gateway):
@@ -180,7 +182,7 @@ def agent_json(v, agent, role, first_seen):
 def question_json(q):
     return {"id": q.get("id"), "pane": q.get("pane"), "time": q.get("time"),
             "text": q.get("text") or "", "options": q.get("options") or [],
-            "evidence": q.get("evidence") or [], "rule": q.get("rule"),
+            "evidence": q.get("evidence") or [], "rule": q.get("rule"), "kind": q.get("kind"),
             "answer": q.get("answer"), "answered": q.get("answered")}
 
 
@@ -253,6 +255,61 @@ def generations(pane):
 
 
 # --- the gateway ---------------------------------------------------------------------------------
+
+def git_dir(path):
+    """The git directory of a checkout (.git) or a worktree (.git file: "gitdir: ..."), or None."""
+    dot = path / ".git"
+    if dot.is_dir():
+        return dot
+    try:
+        text = dot.read_text()
+    except OSError:
+        return None
+    if not text.startswith("gitdir:"):
+        return None
+    gd = Path(text[len("gitdir:"):].strip())
+    return gd if gd.is_absolute() else (path / gd).resolve()
+
+
+def branch_of(gitdir):
+    try:
+        head = (gitdir / "HEAD").read_text().strip()
+    except OSError:
+        return None
+    return head[len("ref: refs/heads/"):] if head.startswith("ref: refs/heads/") else head[:8]
+
+
+def mtime(path):
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return 0
+
+
+def last_work(path, gitdir):
+    """The latest of a commit, checkout or staging in the checkout and a Claude transcript of
+    the folder (~/.claude/projects/<the path with every other character as ->)."""
+    times = [mtime(gitdir / "index"), mtime(gitdir / "HEAD"), mtime(gitdir / "logs" / "HEAD")]
+    project = orch.PROJECTS / re.sub(r"[^A-Za-z0-9]", "-", str(path))
+    if project.is_dir():
+        times += [mtime(t) for t in project.glob("*.jsonl")]
+    return max(times) or None
+
+
+def trusted(account):
+    """Folders Claude Code was told to trust on the account (its .claude.json project list)."""
+    path = (Path.home() / ".claude.json" if str(account) == "1"
+            else orch.account_dir(account) / ".claude.json")
+    projects = orch.load(path).get("projects") or {}
+    return {Path(p) for p, v in projects.items()
+            if isinstance(v, dict) and v.get("hasTrustDialogAccepted")}
+
+
+def lead_name(pane, run, agent, cwd=""):
+    """An orchestrator's name: its herdr agent name, else its run's folder, else the pane."""
+    cwd = (run or {}).get("cwd") or (agent or {}).get("cwd") or cwd or ""
+    return (agent or {}).get("name") or os.path.basename(cwd.rstrip("/")) or pane
+
 
 class Reject(Exception):
     def __init__(self, text, code=409, status="rejected"):
@@ -341,6 +398,9 @@ class Gateway:
                 return 200, {"pane": parts[1], "time": orch.now(), "lines": text}
             if len(parts) == 2 and parts[0] == "actions":
                 return self.action_status(parts[1])
+            if parts == ["folders"]:
+                return 200, self.folders(arg.get("q") or "",
+                                         max(1, min(200, int(arg.get("limit") or 50))))
         except ValueError:
             return 400, {"error": "bad query parameter"}
         return 404, {"error": "not found"}
@@ -442,16 +502,31 @@ class Gateway:
         nudges = {e.get("pane"): e.get("time") for e in read_events() if e.get("kind") == "nudge"}
         leads = [(r["orchestrator"], r) for r in runs] + [(p, None) for p in sorted(ags)
                                                           if p not in busy]
+        starts = self.starts(at)
+        leads += [(p, None) for p in sorted(starts) if p not in {lead for lead, _ in leads}]
         return 200, {
             "version": 1, "machine": self.machine(), "time": at,
-            "orchestrators": [self.orchestrator(p, r, ags, at, watchdog.get(p) or {}, nudges)
+            "orchestrators": [self.orchestrator(p, r, ags, at, watchdog.get(p) or {}, nudges,
+                                                starts.get(p))
                               for p, r in leads],
             "accounts": self.accounts(at), "default_account": self.default_account(),
             "spill": orch.spill_summary(orch.load(orch.ROOT / "accounts.json")),
             "actions": self.recent_actions(at, ags),
         }
 
-    def orchestrator(self, pane, run, ags, at, ws, nudges):
+    @staticmethod
+    def starts(at):
+        """Pane -> its unfinished start (orch new or the `start` action) of the last day."""
+        out = {}
+        for path in sorted(orch.STARTS.glob("*/new.json")) if orch.STARTS.is_dir() else ():
+            rec = orch.load(path)
+            if (rec.get("pane") and (rec.get("time") or 0) >= at - orch.START_SHOWN
+                    and not orch.start_done(rec)
+                    and (rec.get("time") or 0) >= (out.get(rec["pane"]) or {}).get("time", 0)):
+                out[rec["pane"]] = rec
+        return out
+
+    def orchestrator(self, pane, run, ags, at, ws, nudges, start=None):
         first = ws.get("first_seen") or {}
         agent = ags.get(pane)
         v = orch.view(pane, agent, None, at)
@@ -470,20 +545,68 @@ class Gateway:
             activity, since = ("stalled" if reasons else "waiting"), lead["since"]
             if reasons:
                 stall = stall_json(reasons, workers, v["report"], nudges.get(pane))
-        cwd = (run or {}).get("cwd") or (agent or {}).get("cwd") or ""
-        folder = os.path.basename(cwd.rstrip("/"))  # the run's folder names an unnamed one
+        dialogs = [dialog_json(a, ags.get(a["pane"])) for a in [lead, *workers]
+                   if a["state"] == "blocked"]
+        if start:  # a new orchestrator: its start's steps until the brief or the plan's OK
+            activity, since, stall = "starting", start.get("time"), None
+            if any(s["step"] == "trust" and s["status"] == "doing" for s in start["steps"]):
+                for d in dialogs:
+                    if d["pane"] == pane:
+                        d.update(kind="trust", cwd=start.get("cwd"))
         return {
-            "pane": pane, "name": (agent or {}).get("name") or folder or pane,
+            "pane": pane, "name": lead_name(pane, run, agent, (start or {}).get("cwd")),
             "machine": self.machine(),
-            "cwd": (agent or {}).get("cwd") or (run or {}).get("cwd"),
+            "cwd": (agent or {}).get("cwd") or (run or {}).get("cwd") or (start or {}).get("cwd"),
             "activity": activity, "activity_since": since, "agent": lead,
-            "run": {k: run.get(k) for k in ("goal", "created", "until", "ended")} if run else None,
+            "run": dict({k: run.get(k) for k in ("goal", "created", "until", "ended")},
+                        **({"settings": run["settings"]} if run.get("settings") else {}))
+                   if run else None,
             "report": lead["report"],
             "questions": [question_json(q) for q in orch.shown_questions(run, at)],
-            "dialogs": [dialog_json(a, ags.get(a["pane"])) for a in [lead, *workers]
-                        if a["state"] == "blocked"],
-            "stall": stall, "workers": workers,
+            "dialogs": dialogs, "stall": stall, "workers": workers,
+            "start": {"action": start["id"], "goal": start.get("goal"),
+                      "plan_first": bool(start.get("plan_first")), "until": start.get("until"),
+                      "steps": start.get("steps") or []} if start else None,
         }
+
+    def folders(self, q, limit):
+        """GET /v1/folders: the git checkouts a start may use (ORCH_START_ROOTS and their
+        children, and the herdr panes' checkouts under them, never under ORCH_START_EXCLUDE),
+        newest work first, with the orchestrator working there and whether Claude trusts it."""
+        env = read_env(self.config)
+        roots = orch_new.paths(env.get("ORCH_START_ROOTS"))
+        exclude = orch_new.paths(env.get("ORCH_START_EXCLUDE"))
+        ags = orch.agents() or {}
+        found = set()
+        for root in roots:
+            try:
+                children = sorted(root.iterdir()) if root.is_dir() else []
+            except OSError:
+                children = []
+            found |= {p.resolve() for p in [root, *children] if p.is_dir() and git_dir(p)}
+        for agent in ags.values():  # a checkout deeper under a root that an agent works in
+            path = Path(agent.get("cwd") or "/").resolve()
+            while not git_dir(path) and path.parent != path:
+                path = path.parent
+            if git_dir(path) and any(orch_new.under(path, r) for r in roots):
+                found.add(path)
+        at = orch.now()
+        runs = {Path(r["cwd"]).resolve(): r for r in orch.all_runs()
+                if r.get("cwd") and r.get("orchestrator") and orch.active(r, at)}
+        trust = trusted(orch.account_for_new(orch.load(orch.ROOT / "accounts.json")))
+        out = []
+        for path in found:
+            shown = orch_new.tilde(str(path))
+            if any(orch_new.under(path, x) for x in exclude) or q.lower() not in shown.lower():
+                continue
+            gd, run = git_dir(path), runs.get(path)
+            lead = (run or {}).get("orchestrator")
+            out.append({"path": shown, "branch": branch_of(gd), "last_activity": last_work(path, gd),
+                        "orchestrator": {"pane": lead, "name": lead_name(lead, run, ags.get(lead))}
+                        if run else None,
+                        "trusted": any(t in trust for t in [path, *path.parents])})
+        out.sort(key=lambda f: -(f["last_activity"] or 0))
+        return out[:limit]
 
     def default_account(self):
         return orch.load(orch.ROOT / "accounts.json").get("default") or "1"
@@ -594,7 +717,10 @@ class Gateway:
 
     @staticmethod
     def status_json(rec):
-        return {k: rec.get(k) for k in ("id", "status", "delivered_at", "picked_at", "error")}
+        out = {k: rec.get(k) for k in ("id", "status", "delivered_at", "picked_at", "error")}
+        if rec.get("kind") == "start":  # the new orchestrator's pane, once it exists
+            out["pane"] = rec.get("pane")
+        return out
 
     def picked(self, log, ags, at):
         """Mark delivered actions whose target agent has started a turn since (its herdr
@@ -812,6 +938,28 @@ def act_push_token(gw, body, rec):
     orch_push.save_phones(phones)
 
 
+def act_start(gw, body, rec):
+    """A new orchestrator (orch_new): checked here, then run detached; answered once its pane
+    exists (or after PANE_WAIT seconds), the rest arrives as `start` pushes."""
+    opts = {k: body.get(k) for k in ("folder", "worktree", "name", "goal", "until", "account",
+                                     "model", "effort", "worker_model", "max_workers", "rules",
+                                     "plan_first")}
+    start = orch_new.check(dict(opts, id=rec["id"], by="phone"), strict=True)
+    if not orch_new.accept(start):
+        raise Reject(f"a start {rec['id']} exists already on {gw.machine()}")
+    orch_new.spawn(start["id"])
+    deadline = orch.now() + PANE_WAIT
+    while True:
+        now = orch.load(orch.STARTS / start["id"] / "new.json")
+        if now.get("pane"):
+            return {"pane": now["pane"]}
+        if now.get("status") == "failed":
+            raise Reject(now.get("error") or "the start failed", 502, "failed")
+        if orch.now() >= deadline:
+            return {"pane": None}
+        orch.sleep(0.2)
+
+
 def act_dialog(gw, body, rec):
     raise Reject("answering a dialog from the app is not supported by this gateway yet", 400)
 
@@ -820,7 +968,7 @@ ACTIONS = {"prompt": act_prompt, "answer": act_answer, "interrupt": act_interrup
            "park": act_park, "unpark": act_park, "run": act_run, "nudge": act_nudge,
            "account": act_account, "default_account": act_default_account, "ack": act_ack,
            "spill": act_spill, "push_token": act_push_token,
-           "dialog": act_dialog}
+           "dialog": act_dialog, "start": act_start}
 
 
 # --- HTTP ----------------------------------------------------------------------------------------

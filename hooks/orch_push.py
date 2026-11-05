@@ -38,7 +38,7 @@ TOKEN_URI = "https://oauth2.googleapis.com/token"
 SCOPES = "https://www.googleapis.com/auth/firebase.messaging https://www.googleapis.com/auth/datastore"
 FIRESTORE = "https://firestore.googleapis.com/v1"
 DATA_LIMIT = 4000  # FCM data messages hold 4096 bytes of keys and values
-HIGH = {"question", "dialog"}  # pushes that post an alerting notification
+HIGH = {"question", "dialog"}  # pushes that post an alerting notification (and a failed start)
 COLLAPSIBLE = {"state", "accounts", "heartbeat"}  # carry the current value; don't raise seq
 ACTIONABLE = {"question", "dialog", "stall", "usage", "test"}  # an answer may follow soon
 TTL = {"heartbeat": 900, "test": 300, "actions": 3600}
@@ -206,8 +206,8 @@ class Google:
             self.access = None
         return status, out
 
-    def send(self, fcm_token, data, kind, collapse):
-        android = {"priority": "HIGH" if kind in HIGH else "NORMAL",
+    def send(self, fcm_token, data, kind, collapse, high=None):
+        android = {"priority": "HIGH" if (kind in HIGH if high is None else high) else "NORMAL",
                    "ttl": f"{TTL.get(kind, DEFAULT_TTL)}s"}
         if collapse:
             android["collapse_key"] = collapse
@@ -260,6 +260,12 @@ def save_phones(phones):
 
 
 # --- fitting a message into 4 KB -----------------------------------------------------------------
+
+def urgent(message):
+    """High priority: a question, a dialog, or a start that failed."""
+    return message["kind"] in HIGH or (message["kind"] == "start"
+                                       and (message.get("body") or {}).get("status") == "failed")
+
 
 def _agents(o):
     return [o["agent"], *(o.get("workers") or [])] if isinstance(o.get("agent"), dict) else []
@@ -469,6 +475,9 @@ class Pusher:
                     out.append(("question", *found))
             elif kind in ENDED and pane in orchs:
                 out.append(("ended", pane, orchs[pane]))
+            elif kind == "start" and e.get("action"):
+                out.append(("start", pane, {k: e.get(k) for k in
+                                            ("action", "pane", "step", "status", "error", "time")}))
             elif kind == "spill":
                 out.append(("spill", None, {"title": e.get("title"), "text": e.get("body"),
                                             "spill": (fleet or {}).get("spill")}))
@@ -569,7 +578,8 @@ class Pusher:
             sent = orch.now()
             status, out = google.send(phone["fcm_token"],
                                       seal(key, "push", self.machine, dict(message, sent=sent)),
-                                      message["kind"], self.collapse_key(message))
+                                      message["kind"], self.collapse_key(message),
+                                      urgent(message))
             if status == 200:
                 st["last_sent"] = sent
                 if message["kind"] == "heartbeat":

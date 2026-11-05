@@ -3,6 +3,7 @@ The shapes are checked against orch-app docs/API.md (v1, draft 2026-11-05)."""
 import importlib.util
 import json
 import os
+import re
 import socket
 import stat
 import sys
@@ -17,6 +18,7 @@ import pytest
 
 HOOKS = Path(__file__).resolve().parent.parent / "hooks"
 BOSS, W1, W2, LOOSE = "w1:p0", "w1:p1", "w1:p2", "w1:p9"
+NEW = "w1:p5"  # the pane `herdr tab create` opens
 T0 = datetime(2026, 11, 5, 10, 0).timestamp()  # noqa: DTZ001 orch works in local time
 TOKEN = "t0ken-for-tests"
 
@@ -30,6 +32,8 @@ class World:
         self.prompts = []
         self.prompt_ok = True
         self.herdr_calls = []
+        self.tab_ok = True  # whether `herdr tab create` opens NEW
+        self.tab_cwd = None
         self.screen = "Bash command\n  rm saves/tmp/x.lsv\nDo you want to proceed?\n"
         self.whois = {"127.0.0.1": {"Node": {"StableID": "nPHONE", "ComputedName": "phone",
                                              "Name": "phone.tail.ts.net."}},
@@ -53,8 +57,17 @@ class World:
         self.herdr_calls.append(args)
         if args[:2] == ("agent", "read"):
             return SimpleNamespace(returncode=0 if args[2] in self.agents else 1,
-                                   stdout=self.screen)
-        return SimpleNamespace(returncode=0, stdout="")
+                                   stdout=self.screen, stderr="")
+        if args[:2] == ("tab", "create"):
+            if not self.tab_ok:
+                return SimpleNamespace(returncode=1, stdout="", stderr="no such workspace")
+            self.tab_cwd = args[args.index("--cwd") + 1]
+            return SimpleNamespace(returncode=0, stderr="", stdout=json.dumps(
+                {"result": {"tab": {"tab_id": "w1:t9"}, "root_pane": {"pane_id": NEW}}}))
+        if args[:2] == ("pane", "run"):  # Claude comes up idle in the new tab's folder
+            self.agent(args[2], "idle")
+            self.agents[args[2]]["cwd"] = self.tab_cwd
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     def tailscale(self, *args):
         if args == ("ip", "-4"):
@@ -93,6 +106,8 @@ def world(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.delenv("ORCH_NOTIFY_CMD", raising=False)
     monkeypatch.setattr(orch, "ROOT", w.root)
+    monkeypatch.setattr(orch, "STARTS", home / ".claude" / "orch" / "new")
+    monkeypatch.setattr(orch, "PROJECTS", home / ".claude" / "projects")
     monkeypatch.setattr(orch, "now", lambda: w.t)
     monkeypatch.setattr(orch, "agents", lambda: dict(w.agents))
     monkeypatch.setattr(orch, "prompt",
@@ -143,9 +158,11 @@ WORKER_REPORT = {"time": NUM, "summary": str, "status?": {"done", "partial", "bl
                  "needs_live_test?": [str], "issues_for_others?": [str]}
 QUESTION = {"id": str, "pane": str, "time": NUM, "text": str,
             "options": [{"label": str, "danger": {"none", "deploy", "prod", "destructive"}}],
-            "evidence": [dict], "rule?": str, "answer?": str, "answered?": NUM}
+            "evidence": [dict], "rule?": str, "kind?": {"plan"}, "answer?": str,
+            "answered?": NUM}
 DIALOG = {"pane": str, "label": str, "since?": NUM, "change": int, "tool?": str,
-          "command?": str, "cwd?": str, "doing?": str, "danger": bool, "text": str}
+          "command?": str, "cwd?": str, "doing?": str, "danger": bool, "text": str,
+          "kind?": {"trust"}}
 STALL = {"nudged_at?": NUM, "reasons": [{"key": str, "kind": str, "pane?": str, "text": str,
                                          "fix?": str, "message?": str, "picked": bool}]}
 WINDOW = {"used_percentage": NUM, "resets_at": NUM, "burn_per_hour?": NUM, "basis_minutes?": NUM,
@@ -154,13 +171,19 @@ ACCOUNT = {"id": str, "name": str, "config_dir": str, "logged_in": bool, "update
            "stale": bool, "pct_per_100k_uncached?": NUM, "windows": {"seven_day?": WINDOW,
                                                                       "five_hour?": WINDOW}}
 ACTION_STATUS = {"id": str, "status": {"delivered", "picked", "rejected", "failed"},
-                 "delivered_at?": NUM, "picked_at?": NUM, "error?": str}
+                 "delivered_at?": NUM, "picked_at?": NUM, "error?": str, "pane?": str}
 ORCHESTRATOR = {"pane": str, "name": str, "machine": str, "cwd?": str,
-                "activity": {"working", "waiting", "stalled", "done", "offline"},
+                "activity": {"working", "waiting", "stalled", "done", "offline", "starting"},
                 "activity_since?": NUM, "agent": AGENT,
-                "run?": {"goal": str, "created": NUM, "until": NUM, "ended?": NUM},
+                "run?": {"goal": str, "created": NUM, "until": NUM, "ended?": NUM,
+                         "settings?": dict},
                 "report?": ORCH_REPORT, "questions": [QUESTION], "dialogs": [DIALOG],
-                "stall?": STALL, "workers": [AGENT], "lanes?": dict}
+                "stall?": STALL, "workers": [AGENT], "lanes?": dict,
+                "start?": {"action": str, "goal": str, "plan_first": bool, "until": NUM,
+                           "steps": [{"step": {"pane", "claude", "trust", "run", "read",
+                                               "brief", "plan"},
+                                      "status": {"doing", "ok", "failed"}, "time": NUM,
+                                      "error?": str}]}}
 SPILL = {"from": str, "at": NUM, "to": str, "time": NUM,
          "active?": {"window": {"seven_day", "five_hour"}, "used": NUM, "since": NUM}}
 FLEET = {"version": int, "machine": str, "time": NUM, "orchestrators": [ORCHESTRATOR],
@@ -687,6 +710,215 @@ def test_an_account_switch_now_runs_in_the_background(world, monkeypatch):
     assert world.get(gw, "/v1/actions/n2")[1]["status"] == "picked"
 
 
+# --- starting a new orchestrator (the `start` action, orch_new.py) and the folders --------------
+
+def allow_starts(w, monkeypatch, run_it=True, **env):
+    """Starts from the app under ~/Repo; the detached start (orch_new.spawn) runs in-process,
+    or not at all. Returns the folder ~/Repo/my-app, a git checkout."""
+    w.serve.write_env(dict(w.serve.read_env(), ORCH_START_ROOTS="~/Repo", **env))
+    new = w.serve.orch_new
+    monkeypatch.setattr(new, "spawn", lambda sid: run_it and new.start(
+        w.orch.load(w.orch.STARTS / sid / "new.json")))
+    monkeypatch.setattr(w.orch, "sleep", lambda s: setattr(w, "t", w.t + s))
+    app = w.home / "Repo" / "my-app"
+    (app / ".git").mkdir(parents=True, exist_ok=True)
+    return app
+
+
+def lead_of(w, gw, pane):
+    [lead] = [o for o in w.get(gw, "/v1/fleet")[1]["orchestrators"] if o["pane"] == pane]
+    return lead
+
+
+def start_action(**kw):
+    return dict({"kind": "start", "folder": "~/Repo/my-app", "goal": "Ship the beta",
+                 "until": "+8h", "account": "2", "model": "sonnet", "effort": "high",
+                 "worker_model": "haiku", "max_workers": 3, "rules": ["No pushes to main"],
+                 "plan_first": True}, **kw)
+
+
+def test_a_start_answers_with_its_pane_and_the_fleet_shows_its_steps_until_the_plan_is_ok(
+        world, monkeypatch):
+    app = allow_starts(world, monkeypatch)
+    gw = world.serve.Gateway()
+    status, out = world.post(gw, **start_action(id="st1"))
+    assert status == 202 and out["status"] == "delivered" and out["pane"] == NEW
+    conforms(out, ACTION_STATUS)
+    assert world.get(gw, "/v1/actions/st1")[1]["pane"] == NEW
+    rec = world.orch.load(world.orch.STARTS / "st1" / "new.json")
+    assert rec["by"] == "phone" and rec["folder"] == str(app) and rec["account"] == "2"
+    assert world.prompts == [(NEW, f"Read {rec['brief']} and do it.")]
+    [action] = [e for e in world.events() if e["kind"] == "action"]
+    assert action["pane"] == NEW and action["status"] == "delivered"
+    fleet = world.get(gw, "/v1/fleet")[1]
+    conforms(fleet, FLEET)
+    [lead] = [o for o in fleet["orchestrators"] if o["pane"] == NEW]
+    assert lead["activity"] == "starting" and lead["activity_since"] == rec["time"]
+    assert lead["name"] == "my-app" and lead["cwd"] == str(app) and lead["stall"] is None
+    assert {k: lead["start"][k] for k in ("action", "goal", "plan_first", "until")} == {
+        "action": "st1", "goal": "Ship the beta", "plan_first": True, "until": rec["until"]}
+    assert [(s["step"], s["status"]) for s in lead["start"]["steps"]] == [
+        ("pane", "ok"), ("claude", "ok"), ("run", "ok"), ("read", "doing")]
+    assert lead["run"]["settings"] == {
+        "folder": str(app), "worktree": False, "model": "sonnet", "effort": "high",
+        "worker_model": "haiku", "max_workers": 3, "plan_first": True, "account": "2"}
+    # the plan: the new orchestrator asks, the owner approves with the `answer` action
+    qid = world.orch.ask(NEW, "Plan ready", [{"label": "Approve and start workers"},
+                                             {"label": "Cancel the run"}], kind="plan")
+    lead = lead_of(world, gw, NEW)
+    [q] = lead["questions"]
+    conforms(q, QUESTION)
+    assert q["kind"] == "plan" and lead["activity"] == "starting"
+    assert [(s["step"], s["status"]) for s in lead["start"]["steps"]][-2:] == [
+        ("read", "ok"), ("plan", "doing")]
+    assert world.post(gw, kind="answer", question=qid, text="Approve and start workers")[0] == 202
+    lead = lead_of(world, gw, NEW)
+    assert lead["pane"] == NEW and lead["activity"] != "starting" and lead["start"] is None
+
+
+def test_a_start_is_refused_outside_the_roots_in_excluded_or_busy_folders(world, monkeypatch,
+                                                                          tmp_path):
+    gw = world.serve.Gateway()
+    app = allow_starts(world, monkeypatch, ORCH_START_EXCLUDE="~/Repo/live")
+    (world.home / "Repo" / "live").mkdir()
+    (world.home / "Other").mkdir()
+    world.serve.write_env({k: v for k, v in world.serve.read_env().items()
+                           if k != "ORCH_START_ROOTS"})
+    off = world.post(gw, **start_action(id="r0"))
+    assert off[0] == 409 and "starts from the app are off on box1" in off[1]["error"]
+    world.serve.write_env(dict(world.serve.read_env(), ORCH_START_ROOTS="~/Repo"))
+    outside = world.post(gw, **start_action(id="r1", folder="~/Other"))
+    assert outside[0] == 409 and outside[1]["error"] == (
+        "~/Other is outside the start folders on box1 (~/Repo)")
+    live = world.post(gw, **start_action(id="r2", folder="~/Repo/live"))
+    assert live[0] == 409 and "~/Repo/live is excluded from starts on box1" in live[1]["error"]
+    missing = world.post(gw, **start_action(id="r3", folder="~/Repo/nope"))
+    assert missing[0] == 409 and "is not a folder on box1" in missing[1]["error"]
+    monkeypatch.chdir(app)
+    start_run(world)  # BOSS works in ~/Repo/my-app
+    busy = world.post(gw, **start_action(id="r4"))
+    assert busy[0] == 409 and busy[1]["error"].startswith(f"{BOSS} works in ~/Repo/my-app")
+    bad = world.post(gw, **start_action(id="r5", folder="~/Other", max_workers=99))
+    assert bad[0] == 409 and "max_workers 99" in bad[1]["error"]
+    assert not [c for c in world.herdr_calls if c[:2] == ("tab", "create")]
+    assert not world.orch.STARTS.exists()
+
+
+def test_a_start_runs_once_per_id(world, monkeypatch):
+    allow_starts(world, monkeypatch)
+    gw = world.serve.Gateway()
+    first = world.post(gw, **start_action(id="st1"))
+    assert world.post(gw, **start_action(id="st1")) == first  # the app's retry
+    other = world.post(gw, **start_action(id="st1", goal="Something else"))
+    assert other[0] == 409 and "already used" in other[1]["error"]
+    (world.root / "gateway-actions.json").unlink()  # the action log forgot it: the start didn't
+    busy = world.post(gw, **start_action(id="st1"))
+    assert busy[0] == 409 and busy[1]["error"].startswith(f"{NEW} works in ~/Repo/my-app")
+    world.orch.main(["--orch", NEW, "run", "stop"])
+    (world.root / "gateway-actions.json").unlink()
+    again = world.post(gw, **start_action(id="st1"))
+    assert again[0] == 409 and again[1]["error"] == "a start st1 exists already on box1"
+    assert len([c for c in world.herdr_calls if c[:2] == ("tab", "create")]) == 1
+
+
+def test_a_start_without_a_pane_fails_or_answers_without_it(world, monkeypatch):
+    allow_starts(world, monkeypatch)
+    gw = world.serve.Gateway()
+    world.tab_ok = False
+    status, out = world.post(gw, **start_action(id="f1"))
+    assert status == 502 and out["status"] == "failed" and out["pane"] is None
+    assert out["error"] == "herdr couldn't open a tab: no such workspace"
+    world.tab_ok = True
+    allow_starts(world, monkeypatch, run_it=False)  # the start runs on but has no pane yet
+    t0 = world.t
+    status, out = world.post(gw, **start_action(id="s2"))
+    assert status == 202 and out["pane"] is None
+    assert world.t - t0 == pytest.approx(world.serve.PANE_WAIT, abs=0.5)
+
+
+def test_a_start_at_the_trust_dialog_shows_a_trust_dialog(world, monkeypatch):
+    app = allow_starts(world, monkeypatch, run_it=False)
+    gw = world.serve.Gateway()
+    world.post(gw, **start_action(id="st1"))
+    rec = world.orch.load(world.orch.STARTS / "st1" / "new.json")
+    rec["pane"] = NEW
+    for step, status in [("pane", "ok"), ("claude", "doing"), ("trust", "doing")]:
+        world.orch.start_step(rec, step, status)
+    world.agent(NEW, "blocked", change=4)
+    lead = lead_of(world, gw, NEW)
+    assert lead["activity"] == "starting" and lead["run"] is None
+    [dialog] = lead["dialogs"]
+    conforms(dialog, DIALOG)
+    assert dialog["kind"] == "trust" and dialog["cwd"] == str(app) and dialog["change"] == 4
+    world.orch.start_step(rec, "trust", "ok")
+    [dialog] = lead_of(world, gw, NEW)["dialogs"]
+    assert "kind" not in dialog  # another dialog of the same agent
+
+
+def git_checkout(path, head="ref: refs/heads/main", at=None, worktree=None):
+    """A checkout's .git (a folder, or a worktree's .git file) with HEAD written at `at`."""
+    path.mkdir(parents=True, exist_ok=True)
+    gd = path / ".git"
+    if worktree:
+        worktree.mkdir(parents=True)
+        (path / ".git").write_text(f"gitdir: {worktree}\n")
+        gd = worktree
+    else:
+        gd.mkdir()
+    (gd / "HEAD").write_text(head + "\n")
+    if at:
+        os.utime(gd / "HEAD", (at, at))
+    return gd
+
+
+def test_folders_lists_the_checkouts_under_the_roots_newest_work_first(world, tmp_path,
+                                                                        monkeypatch):
+    gw = world.serve.Gateway()
+    repo, work = world.home / "Repo", world.home / "work"
+    assert world.get(gw, "/v1/folders") == (200, [])  # no roots: starts are off
+    world.serve.write_env(dict(world.serve.read_env(), ORCH_START_ROOTS="~/Repo, ~/work",
+                               ORCH_START_EXCLUDE="~/Repo/live"))
+    git_checkout(repo / "app", at=world.t - 3600)
+    git_checkout(repo / "app-wt", head="0123456789abcdef", at=world.t - 7200,
+                 worktree=repo / "app" / ".git" / "worktrees" / "app-wt")
+    git_checkout(repo / "live", at=world.t)  # excluded
+    (repo / "live-link").symlink_to(repo / "live")  # the same checkout under another name
+    (repo / "notes").mkdir()  # not a checkout
+    git_checkout(work / "deep" / "lib", at=world.t - 9000)  # too deep, but an agent works there
+    (work / "deep" / "lib" / "src").mkdir()
+    world.agent(LOOSE, "working")
+    world.agents[LOOSE]["cwd"] = str(work / "deep" / "lib" / "src")
+    git_checkout(work / "old", at=world.t - 86400)
+    transcripts = world.orch.PROJECTS / re.sub(r"[^A-Za-z0-9]", "-", str(work / "old"))
+    transcripts.mkdir(parents=True)
+    (transcripts / "s1.jsonl").write_text("{}\n")
+    os.utime(transcripts / "s1.jsonl", (world.t - 60, world.t - 60))  # Claude worked there
+    monkeypatch.chdir(repo / "app")
+    start_run(world)  # BOSS ("Website") works in ~/Repo/app
+    (world.home / ".claude.json").write_text(json.dumps({"projects": {
+        str(repo / "app"): {"hasTrustDialogAccepted": True},
+        str(work): {"hasTrustDialogAccepted": True},  # trusts the folders under it
+        str(repo / "app-wt"): {"hasTrustDialogAccepted": False}}}))
+    (world.home / ".claude-2" / ".claude.json").write_text(json.dumps({"projects": {}}))
+    status, folders = world.get(gw, "/v1/folders")
+    assert status == 200
+    conforms(folders, [{"path": str, "branch": str, "last_activity": NUM,
+                        "orchestrator?": {"pane": str, "name": str}, "trusted": bool}])
+    assert [(f["path"], f["branch"], f["last_activity"], f["trusted"]) for f in folders] == [
+        ("~/work/old", "main", world.t - 60, True),
+        ("~/Repo/app", "main", world.t - 3600, True),
+        ("~/Repo/app-wt", "01234567", world.t - 7200, False),
+        ("~/work/deep/lib", "main", world.t - 9000, True)]
+    assert folders[1]["orchestrator"] == {"pane": BOSS, "name": "Website"}
+    assert [f["orchestrator"] for f in folders if f["path"] != "~/Repo/app"] == [None] * 3
+    assert [f["path"] for f in world.get(gw, "/v1/folders?q=APP&limit=1")[1]] == ["~/Repo/app"]
+    assert world.get(gw, "/v1/folders?limit=x")[0] == 400
+    # a new agent would start on account 2 (the default): its trust list counts
+    (world.root / "accounts.json").write_text(json.dumps(dict(
+        world.orch.load(world.root / "accounts.json"), default="2")))
+    assert not any(f["trusted"] for f in world.get(gw, "/v1/folders")[1])
+
+
 # --- pairing, health, pushes and the relay (orch_push.py; needs `cryptography`) ------------------
 
 KEY = bytes(range(32))
@@ -931,6 +1163,36 @@ def test_events_become_pushes_and_old_ones_are_skipped(world, cloud):
     assert sorted(k for k in cloud.kinds() if k != "state") == ["ended", "heartbeat"]
     [ended] = [p for p in cloud.pushes if p["message"]["kind"] == "ended"]
     assert ended["message"]["orchestrator"] == BOSS and ended["message"]["body"]["pane"] == BOSS
+
+
+def test_start_steps_become_start_pushes_high_only_when_one_failed(world, cloud, monkeypatch):
+    allow_starts(world, monkeypatch)
+    gw = world.serve.Gateway()
+    pair(world, gw)
+    gw.pusher.cycle()
+    cloud.pushes.clear()
+    world.post(gw, **start_action(id="st1", plan_first=False))
+    gw.pusher.cycle()
+    starts = [p for p in cloud.pushes if p["message"]["kind"] == "start"]
+    assert [(p["message"]["body"]["step"], p["message"]["body"]["status"]) for p in starts] == [
+        ("pane", "ok"), ("claude", "doing"), ("claude", "ok"), ("run", "ok"), ("brief", "ok")]
+    assert {p["android"]["priority"] for p in starts} == {"NORMAL"}
+    assert starts[0]["android"] == {"priority": "NORMAL", "ttl": "86400s"}  # not collapsed
+    assert starts[0]["message"]["orchestrator"] == NEW
+    assert starts[0]["message"]["body"] == {"action": "st1", "pane": NEW, "step": "pane",
+                                            "status": "ok", "error": None, "time": world.t}
+    seqs = [p["message"]["seq"] for p in starts]
+    assert seqs == sorted(set(seqs))  # each counts
+    cloud.pushes.clear()
+    world.tab_ok = False
+    (world.home / "Repo" / "two" / ".git").mkdir(parents=True)  # my-app has its orchestrator
+    assert world.post(gw, **start_action(id="st2", folder="~/Repo/two"))[0] == 502
+    gw.pusher.cycle()
+    [failed] = [p for p in cloud.pushes if p["message"]["kind"] == "start"]
+    assert failed["android"]["priority"] == "HIGH" and failed["message"]["orchestrator"] is None
+    assert failed["message"]["body"]["status"] == "failed"
+    assert failed["message"]["body"]["error"] == "herdr couldn't open a tab: no such workspace"
+    assert "system" not in cloud.kinds()  # the failure goes once, as a start push
 
 
 def test_the_relay_runs_each_action_once_and_pushes_its_status(world, cloud):
