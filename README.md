@@ -40,7 +40,7 @@ decision log.
 At the first Stop after the handoff has been written, the hook starts a detached process
 (`context-handoff.py --respawn <job>`) that:
 
-1. reads the herdr agent name of the pane and waits until the agent has really stopped working (up to 30 minutes:
+1. reads the herdr agent name of the pane and waits until the agent is no longer working (up to 30 minutes:
    another Stop hook, such as `/goal`'s, can keep the turn going). If it is still working, is at a dialog, or started
    background tasks after the handoff, the takeover is postponed: the hook's state is reset, so the next turn end
    tries again;
@@ -132,11 +132,11 @@ the whole fleet overnight (11.8 h), and "today's work is done" with three worker
 | `orch status [--json]`, `orch last <pane>` | The fleet, and a worker's last message and background tasks. |
 | `orch watchdog [--dry-run]` | One watchdog pass. A systemd user timer runs it every 5 minutes. |
 
-What tells a finished worker from one waiting on its own job: inside herdr, the Stop hook writes
-`~/.claude/handoffs/agents/<pane>.json` at every turn end, holding the session, the background tasks still running and
-the last message. SessionStart writes it too. A file from another session than the pane's current agent is ignored.
+Inside herdr, the Stop hook writes `~/.claude/handoffs/agents/<pane>.json` at every turn end, with the session, the
+background tasks still running and the last message. SessionStart writes it too. This is how `orch` tells a finished
+worker from one waiting on its own job. A file from another session than the pane's current agent is ignored.
 
-The watchdog only looks at registered, unexpired runs, so it costs nothing elsewhere. When a run's orchestrator is idle,
+The watchdog only looks at registered, unexpired runs and does nothing for any other pane. When a run's orchestrator is idle,
 it prompts it if any of these hold:
 
 - an unparked worker has been idle for 10 minutes with nothing running;
