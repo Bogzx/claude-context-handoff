@@ -1,0 +1,2 @@
+# bash can't run a script with CRLF line ends, which core.autocrlf gives it on Windows.
+*.sh text eol=lf

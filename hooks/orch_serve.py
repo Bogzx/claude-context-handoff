@@ -39,6 +39,7 @@ from urllib.parse import parse_qs, unquote, urlencode, urlsplit
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import orch
 import orch_new
+import orch_os
 import orch_push
 import orch_usage
 
@@ -89,7 +90,7 @@ def write_env(values, path=None):
     fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w") as f:
         f.write("".join(f"{k}={v}\n" for k, v in values.items()))
-    os.replace(tmp, path)
+    orch_os.replace(tmp, path)
 
 
 def items(text):
@@ -805,7 +806,7 @@ class Gateway:
                             - (win.get("resets_at") or 0)) < 120]
             out[acc] = {"id": acc, "name": orch.account_name(acc, names),
                         "login": (known.get(acc) or {}).get("login"),
-                        "config_dir": "~/.claude" if acc == "1" else f"~/.claude-{acc}",
+                        "config_dir": orch_new.tilde(str(orch_os.account_dir(acc))),
                         "logged_in": (known.get(acc) or {}).get("logged_in", False),
                         "updated": w["updated"], "stale": w["stale"], "windows": w["windows"]}
         return out
@@ -1497,5 +1498,6 @@ def pair(args):
           f"pushes: off until the service account key is at {orch_push.SA_FILE}")
     print(f"allowed tailnet nodes: {env.get('ORCH_ALLOW') or 'none yet (orch pair --allow NODE)'}")
     print(f"config: {CONFIG}")
-    print("start the gateway: systemctl --user start orch-serve")
+    print("start the gateway: " + ("Start-ScheduledTask orch-serve" if orch_os.WINDOWS
+                                   else "systemctl --user start orch-serve"))
     return 0

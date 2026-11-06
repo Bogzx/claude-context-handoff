@@ -6,32 +6,41 @@ Deploy or update another machine from this one:
     ssh HOST python3 .claude/hooks/context-handoff-install.py
 """
 import json
+import os
 import shutil
+import sys
 import time
 from pathlib import Path
 
-SETTINGS = Path.home() / ".claude" / "settings.json"
-COMMAND = f"python3 {Path.home()}/.claude/hooks/context-handoff.py"
+WINDOWS = os.name == "nt"
+HOOK = f"{Path.home().as_posix()}/.claude/hooks/context-handoff.py"
+# Windows: no python3 to count on, and UTF-8 only if asked for. Each profile has its own settings
+# there, where Linux links them to ~/.claude.
+COMMAND = f'"{Path(sys.executable).as_posix()}" -X utf8 "{HOOK}"' if WINDOWS else f"python3 {HOOK}"
+PROFILES = [Path.home() / ".claude"] + (
+    sorted((Path.home() / ".claude-accounts").glob("acc*")) if WINDOWS else [])
 # A 633K window compacts at ~600K (Claude Code keeps ~33K in reserve).
 ENV = {"CLAUDE_CODE_AUTO_COMPACT_WINDOW": "633000", "CLAUDE_CODE_IDLE_COMPACT_MIN_TOKENS": "400000"}
 GROUPS = {"SessionStart": "^(startup|clear|compact)$", "PostToolUse": None, "Stop": None}
 
-before = SETTINGS.read_text() if SETTINGS.exists() else "{}"
-settings = json.loads(before)
-settings.setdefault("env", {}).update(ENV)
-hooks = settings.setdefault("hooks", {})
-for event, matcher in GROUPS.items():
-    groups = hooks.setdefault(event, [])
-    if any(h.get("command") == COMMAND for g in groups for h in g.get("hooks", [])):
-        continue
-    group = {"hooks": [{"type": "command", "command": COMMAND, "timeout": 10}]}
-    groups.append({"matcher": matcher, **group} if matcher else group)
-after = json.dumps(settings, indent=2) + "\n"
-if json.loads(after) == json.loads(before):
-    print(f"{SETTINGS}: already up to date")
-else:
-    if SETTINGS.exists():
-        shutil.copy2(SETTINGS, SETTINGS.with_name(
-            f"settings.json.bak-{time.strftime('%Y%m%d-%H%M%S')}"))
-    SETTINGS.write_text(after)
-    print(f"{SETTINGS}: updated")
+for profile in PROFILES:
+    SETTINGS = profile / "settings.json"
+    before = SETTINGS.read_text() if SETTINGS.exists() else "{}"
+    settings = json.loads(before)
+    settings.setdefault("env", {}).update(ENV)
+    hooks = settings.setdefault("hooks", {})
+    for event, matcher in GROUPS.items():
+        groups = hooks.setdefault(event, [])
+        if any(h.get("command") == COMMAND for g in groups for h in g.get("hooks", [])):
+            continue
+        group = {"hooks": [{"type": "command", "command": COMMAND, "timeout": 10}]}
+        groups.append({"matcher": matcher, **group} if matcher else group)
+    after = json.dumps(settings, indent=2) + "\n"
+    if json.loads(after) == json.loads(before):
+        print(f"{SETTINGS}: already up to date")
+    else:
+        if SETTINGS.exists():
+            shutil.copy2(SETTINGS, SETTINGS.with_name(
+                f"settings.json.bak-{time.strftime('%Y%m%d-%H%M%S')}"))
+        SETTINGS.write_text(after)
+        print(f"{SETTINGS}: updated")

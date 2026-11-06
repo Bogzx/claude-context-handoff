@@ -24,7 +24,7 @@ def call(mid, name, arguments):
 
 
 def test_stdio_round_trip_writes_the_report(tmp_path):
-    env = dict(os.environ, HOME=str(tmp_path), HERDR_ENV="1", HERDR_PANE_ID=PANE,
+    env = dict(os.environ, HOME=str(tmp_path), USERPROFILE=str(tmp_path), HERDR_ENV="1", HERDR_PANE_ID=PANE,
                ORCH_NOTIFY_CMD="true", PATH="/usr/bin:/bin")
     report = {"summary": "4 of 9 fixes merged", "state": "waiting_on_workers",
               "progress": {"done": 4, "total": 9, "label": "fixes"},

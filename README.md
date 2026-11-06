@@ -10,6 +10,8 @@ as the backstop.
 Decisions don't go in the handoff. They go in an append-only decision log that every agent taking over the same work
 reads and adds to (see [Decision log](#decision-log)).
 
+Runs on Linux and Windows; the OS is detected (see [Windows](#windows)).
+
 `orch` (in `hooks/orch.py`) keeps a herdr orchestration moving across those takeovers: a run registered per
 orchestrator pane, one shared wait, parked workers and a watchdog timer (see [Orchestration runs](#orchestration-runs-orch)).
 
@@ -540,15 +542,18 @@ one-line pointer to an unread handoff.
 
 ## Install
 
-Requirements: Linux (`/proc`), Python 3.8 or newer (Ubuntu 20.04 has 3.8, so keep the scripts 3.8-compatible), and herdr for
+Requirements: Linux or Windows, Python 3.8 or newer (Ubuntu 20.04 has 3.8, so keep the scripts 3.8-compatible), and herdr for
 the takeover.
 
 ```bash
 git clone https://github.com/Bogzx/claude-context-handoff.git
 cd claude-context-handoff
-./install.sh                          # this machine
-./install.sh user@host2 user@host3   # other machines over ssh
+./install.sh                          # this machine, Linux or Windows (Git Bash)
+./install.sh user@host2 user@host3   # other machines over ssh (Linux hosts)
 ```
+
+The OS is detected: `install.sh` hands over to `install.ps1` on Windows, and `hooks/orch_os.py` holds what differs at
+run time. See [Windows](#windows) for what that changes.
 
 `install.sh` copies `hooks/` into `~/.claude/hooks/`, links `~/.local/bin/orch` to `orch.py`, installs and starts the
 `orch-watchdog.timer` systemd user unit, installs `orch-serve.service` enabled but not started (see Gateway), registers the `orch` MCP server at user scope in every account
@@ -568,6 +573,39 @@ to `~/.claude`. Its MCP servers live in its own `~/.claude-2/.claude.json`, whic
 in each account.
 
 To change the hook, edit it here, commit, then run both install commands above.
+
+### Windows
+
+From PowerShell, `powershell -ExecutionPolicy Bypass -File install.ps1`; from Git Bash, `./install.sh`. It takes the
+same steps as on Linux, with these differences:
+
+| | Linux | Windows |
+| --- | --- | --- |
+| Watchdog | `orch-watchdog.timer` | scheduled task `orch-watchdog`, every 5 minutes while logged on |
+| Gateway | `orch-serve.service` | scheduled task `orch-serve`, at logon; after `orch pair`, `Start-ScheduledTask orch-serve` |
+| `orch` | link in `~/.local/bin` | `orch.cmd` and an `orch` shell script for Git Bash, in `~/.local/bin` |
+| Processes | `/proc` | Win32 API through ctypes, 64-bit python only |
+| Typed into a pane | `K=v claude ...` | the same line in the pane's own shell: PowerShell (herdr's default), cmd or bash |
+| Account N | `claude-acc N`, `~/.claude-N` | `~/.claude-accounts/accN` if it exists (where `claude-accN.cmd` keeps it), else `~/.claude-N`; `claude` starts with its `CLAUDE_CONFIG_DIR` set |
+| Settings | `~/.claude/settings.json`, linked by the accounts | merged into `~/.claude` and each `~/.claude-accounts/accN` |
+
+Each command runs python with `-X utf8`, because herdr and the logs speak UTF-8 and Windows defaults to cp1252. The tasks
+run under `conhost --headless`, so no window flashes. To remove them: `Unregister-ScheduledTask orch-watchdog,orch-serve`.
+
+Not the same as on Linux:
+
+- `--dangerously-skip-permissions`: there is no `claude-acc` to add it, so `orch new` starts an orchestrator with
+  permission prompts unless you run it another way. A takeover and an account switch keep the flags the agent had.
+- `/v1/health`'s `capacity` is null: it reads `/proc`, and Windows has no load average.
+- `orch usage` and the limit check read `~/.claude/projects` only, so they miss transcripts of a profile in
+  `~/.claude-accounts`, which keeps its own `projects` folder. Linux links them.
+- The usage capture is a line in your statusline command (see Usage), with `python` for `python3`. The installer leaves
+  the statusline alone.
+- `~/.config/orch/.env` and `phones.json` rely on your profile folder's permissions: the mode 600 means nothing on NTFS.
+- `$ORCH_NOTIFY_CMD` is split by Windows' rules, and `orch wait --check` runs under cmd. An extensionless
+  `~/.claude/handoffs/notify` can't run on Windows: set the variable instead.
+- A `claude` installed through npm shows up as `node`, so the hooks don't find it: use the native installer.
+- `./install.sh HOST` installs on Linux hosts only.
 
 ## Configuration
 
@@ -614,6 +652,7 @@ All under `~/.claude/handoffs/`:
 ```bash
 uv run --no-project --with pytest --with cryptography pytest -q        # offline tests
 uv run --python 3.8 --no-project --with pytest --with cryptography==2.8 pytest -q  # the oldest Python and cryptography
+# on Windows, the same in PowerShell; tests/conftest.py keeps them out of the real home and lists what it skips
 tail ~/.claude/handoffs/respawn.log ~/.claude/handoffs/events.jsonl
 systemctl --user list-timers orch-watchdog.timer
 orch watchdog --dry-run

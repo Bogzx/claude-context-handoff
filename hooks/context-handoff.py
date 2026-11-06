@@ -35,7 +35,6 @@ Thresholds can be overridden per project in that project's .claude/settings.loca
 import json
 import os
 import re
-import shlex
 import shutil
 import signal
 import socket
@@ -43,6 +42,9 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import orch_os
 
 
 def tokens_env(name, default):
@@ -359,19 +361,8 @@ def last_text(transcript, limit=4000):
     return ""
 
 
-def account_of(config_dir):
-    """The account a CLAUDE_CONFIG_DIR belongs to (claude-acc N), as a string: unset is "1"."""
-    if not config_dir:
-        return "1"
-    path = os.path.normpath(os.path.expanduser(config_dir))
-    if path == str(Path.home() / ".claude"):
-        return "1"
-    name = os.path.basename(path)
-    return name[len(".claude-"):] if name.startswith(".claude-") else path
-
-
-def account_dir(account):
-    return Path.home() / (".claude" if str(account) == "1" else f".claude-{account}")
+account_of = orch_os.account_of
+account_dir = orch_os.account_dir
 
 
 def write_status(data, event):
@@ -398,8 +389,7 @@ def write_status(data, event):
     pid = claude_pid()
     if pid:
         try:
-            argv = [a.decode() for a in Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")[1:]
-                    if a]
+            argv = orch_os.argv(pid)[1:]
         except OSError:
             argv = None
         if argv is not None:
@@ -412,7 +402,7 @@ def write_status(data, event):
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f".{path.name}.{os.getpid()}")
     tmp.write_text(json.dumps(status))
-    os.replace(tmp, path)
+    orch_os.replace(tmp, path)
 
 
 def write_context(session, tokens, step):
@@ -427,7 +417,7 @@ def write_context(session, tokens, step):
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f".{path.name}.{os.getpid()}")
     tmp.write_text(json.dumps({"session": session, "context_tokens": tokens, "time": time.time()}))
-    os.replace(tmp, path)
+    orch_os.replace(tmp, path)
 
 
 def active_goal(transcript):
@@ -471,7 +461,7 @@ def emit(kind, title, body, pane=None, push=False, **extra):
         str(ROOT / "notify") if os.access(ROOT / "notify", os.X_OK) else "")
     if push and notify:
         try:
-            subprocess.run(shlex.split(notify) + [title, body], capture_output=True, timeout=20,
+            subprocess.run(orch_os.split(notify) + [title, body], capture_output=True, timeout=20,
                            env=dict(os.environ, ORCH_EVENT_KIND=kind, ORCH_EVENT=json.dumps(event)),
                            check=False)
         except (OSError, subprocess.SubprocessError):
@@ -506,14 +496,12 @@ def claude_pid():
     a takeover's SIGTERM stopped that daemon."""
     if background():
         return None
-    pid = os.getppid()
-    while pid > 1:
-        try:
-            if Path(f"/proc/{pid}/comm").read_text().strip() == "claude":
-                return pid
-            pid = int(Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[1])
-        except (OSError, ValueError, IndexError):
-            break
+    pid, seen = os.getppid(), set()
+    while pid > 1 and pid not in seen:  # seen: Windows reuses a dead parent's pid, so it can loop
+        seen.add(pid)
+        if orch_os.comm(pid) == "claude":
+            return pid
+        pid = orch_os.parent(pid)
     return None
 
 
@@ -549,7 +537,7 @@ def start_respawn(data, lineage, model):
     pid = claude_pid()
     if not pid:
         return False
-    argv = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")[1:]
+    argv = orch_os.argv(pid)[1:]
     effort = (data.get("effort") or {}).get("level") or os.environ.get("CLAUDE_EFFORT")
     env = {k: os.environ[k] for k in ("CLAUDE_CONFIG_DIR",) if os.environ.get(k)}
     accounts = load(ROOT / "accounts.json")
@@ -566,15 +554,15 @@ def start_respawn(data, lineage, model):
         if str(target) != "1":
             env["CLAUDE_CONFIG_DIR"] = str(account_dir(target))
     job = {"pane": pane, "pid": pid, "dir": str(lineage),
-           "args": relaunch_args([a.decode() for a in argv if a], model, effort),
+           "args": relaunch_args(argv, model, effort),
            "env": {"HANDOFF_LINEAGE": str(lineage), **env},
            "account": switch["account"] if switch else None,
            "reason": (switch or {}).get("reason"),
            "session": data.get("session_id"), "transcript": data.get("transcript_path"),
            "created": time.time()}
-    subprocess.Popen([sys.executable, os.path.abspath(__file__), "--respawn", json.dumps(job)],
-                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                     stderr=subprocess.DEVNULL, start_new_session=True)
+    orch_os.spawn_detached([sys.executable, os.path.abspath(__file__), "--respawn", json.dumps(job)],
+                           stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL)
     return True
 
 
@@ -594,14 +582,11 @@ def respawn(job):
             f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {pane} {text}\n")
 
     def herdr(*args, timeout=120):
-        return subprocess.run([herdr_bin, *args], capture_output=True, text=True,
-                              timeout=timeout, check=False)
+        return subprocess.run([herdr_bin, *args], capture_output=True, encoding="utf-8",
+                              errors="replace", timeout=timeout, check=False)
 
     def alive():
-        try:
-            return Path(f"/proc/{pid}/comm").read_text().strip() == "claude"
-        except OSError:
-            return False
+        return orch_os.comm(pid) == "claude"
 
     def fail(text):
         say("FAILED: " + text)
@@ -686,7 +671,8 @@ def respawn(job):
             return postpone(f"{len(last['background_tasks'])} background task(s) were started "
                             "after the handoff")
         herdr("agent", "prompt", pane, "/exit")
-        for sig, wait in ((None, 20), (signal.SIGTERM, 10), (signal.SIGKILL, 5)):
+        for sig, wait in ((None, 20), (signal.SIGTERM, 10),
+                          (getattr(signal, "SIGKILL", signal.SIGTERM), 5)):  # no SIGKILL on Windows
             if sig and alive():
                 os.kill(pid, sig)
             for _ in range(wait):
@@ -708,10 +694,10 @@ def respawn(job):
         if resume:
             # claude-acc adds --dangerously-skip-permissions itself and sets the account's
             # CLAUDE_CONFIG_DIR; the session's lineage stays in its state file.
-            acc = shutil.which("claude-acc") or str(Path.home() / ".local" / "bin" / "claude-acc")
-            args = [a for a in job["args"] if a != "--dangerously-skip-permissions"]
-            command = " ".join(shlex.quote(a) for a in [acc, str(account), "--resume", resume,
-                                                        *args])
+            args = [a for a in job["args"]
+                    if orch_os.WINDOWS or a != "--dangerously-skip-permissions"]
+            env, argv = orch_os.account_command(account, ["--resume", resume, *args])
+            command = orch_os.pane_line(pane, env, argv)
             saved = None
         else:
             lineage = Path(job["dir"])
@@ -722,8 +708,7 @@ def respawn(job):
             # Typed into the pane's shell, like the original launch; the env prefix keeps the
             # account that claude-acc selected (or the one queued by orch account), and the
             # lineage, for this session only.
-            prefix = "".join(f"{k}={shlex.quote(v)} " for k, v in job.get("env", {}).items())
-            command = prefix + " ".join(shlex.quote(a) for a in ["claude", *job["args"]])
+            command = orch_os.pane_line(pane, job.get("env", {}), ["claude", *job["args"]])
         herdr("pane", "run", pane, command)
         blocked, waiting = 0, False
         deadline = time.time() + 90
@@ -909,18 +894,15 @@ def orch_loaded(pid):
     started before the server was registered has it in .claude.json but not loaded."""
     if not pid:
         return False
-    for proc in Path("/proc").iterdir():
-        if not proc.name.isdigit():
-            continue
+    for proc in orch_os.pids():
         try:
-            argv = [a.decode(errors="replace")
-                    for a in (proc / "cmdline").read_bytes().split(b"\0") if a]
-            if not (argv and os.path.basename(argv[0]).startswith("python")
-                    and any(os.path.basename(a) == "orch_mcp.py" for a in argv[1:])):
+            if orch_os.parent(proc) != pid:
                 continue
-            if int((proc / "stat").read_text().rsplit(")", 1)[1].split()[1]) == pid:
+            argv = orch_os.argv(proc)
+            if (argv and os.path.basename(argv[0]).startswith("python")
+                    and any(os.path.basename(a) == "orch_mcp.py" for a in argv[1:])):
                 return True
-        except (OSError, ValueError, IndexError):
+        except OSError:
             continue
     return False
 
@@ -1067,7 +1049,7 @@ def switch_due(data, state_path, base):
 def request_handoff(job):
     """`orch` (watchdog) asks an idle agent for the handoff of a pending switch: prints the
     prompt to send it, or exits 1 while a handoff is already underway."""
-    base = ROOT / (job.get("cwd") or "unknown").strip("/").replace("/", "-").replace(":", "-")
+    base = ROOT / orch_os.project_slug(job.get("cwd") or "unknown")
     message = prepare_switch(ROOT / "state" / f"{job['session']}.json", base, job["session"],
                              job["pane"], job["account"], job["why"])
     if not message:
@@ -1136,7 +1118,7 @@ def main():
     if IN_HERDR and event in ("Stop", "SessionStart"):
         write_status(data, event)
     project = os.environ.get("CLAUDE_PROJECT_DIR") or data.get("cwd") or os.getcwd()
-    base = ROOT / project.strip("/").replace("/", "-").replace(":", "-")
+    base = ROOT / orch_os.project_slug(project)
     state_path = ROOT / "state" / f"{data.get('session_id') or 'unknown'}.json"
     if event == "SessionStart":
         out = session_start(data.get("source"), base, state_path)
