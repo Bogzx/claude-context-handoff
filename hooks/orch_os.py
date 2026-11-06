@@ -128,6 +128,24 @@ def pids():
     return [int(p.name) for p in Path("/proc").iterdir() if p.name.isdigit()]
 
 
+def named(name):
+    """The pids of the processes with this name, in one look at the process table on Windows."""
+    if WINDOWS:
+        return [pid for pid, (_, exe) in _table().items() if exe == name]
+    return [pid for pid in pids() if comm(pid) == name]
+
+
+def children(pid):
+    """The process's children. On Windows also those of a cmd child: Claude starts its MCP servers
+    through `cmd /d /s /c`."""
+    if WINDOWS:
+        table = _table()
+        direct = [p for p, (up, _) in table.items() if up == pid]
+        return direct + [p for p, (up, _) in table.items()
+                         if up in direct and table[up][1] == "cmd"]
+    return [p for p in pids() if parent(p) == pid]
+
+
 def argv(pid):
     """The process's arguments, its program first. OSError when it can't be read."""
     if WINDOWS:

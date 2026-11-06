@@ -668,6 +668,11 @@ verified live on 2026-10-26 after installing on all three machines: a Sonnet age
 logged two decisions and wrote its handoff, and its replacement got the same lineage through `HANDOFF_LINEAGE`, read
 the log and then `gen-01.md`, and found the `## Generation 2` line the hook had added.
 
+Verified on Windows 11 on 2026-11-06 in a throwaway herdr tab with PowerShell: a Haiku agent was replaced with the same
+flags, model and effort and read its handoff, the hook found its `orch` MCP server, its `report` reached the status file,
+the watchdog task ran, and the gateway answered on the tailnet IP (run by hand, with a temporary home). Not tried live: a
+second account, `orch new` beyond `--dry-run`, and the gateway through its scheduled task or a phone.
+
 ## Known gaps
 
 - Inline env vars other than `CLAUDE_CONFIG_DIR` are not carried over, nor are mid-session `/fast` or

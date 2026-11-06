@@ -1361,7 +1361,7 @@ def claude_processes():
     """The /proc folder (on Windows, the pid) of every claude process on this machine, in a herdr
     pane or not."""
     if orch_os.WINDOWS:
-        yield from (pid for pid in orch_os.pids() if orch_os.comm(pid) == "claude")
+        yield from orch_os.named("claude")
         return
     for proc in PROC.iterdir():
         try:

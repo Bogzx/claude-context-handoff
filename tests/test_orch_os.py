@@ -103,6 +103,32 @@ def test_this_process_can_be_read():
     assert not orch_os.running(child.pid) and orch_os.comm(child.pid) is None
 
 
+def test_children_and_names_are_found_also_through_cmd():
+    me, code = os.getpid(), "import time; time.sleep(60)"
+    child = subprocess.Popen([sys.executable, "-c", code])
+    wrapped = None
+    if orch_os.WINDOWS:  # as Claude starts an MCP server
+        wrapped = subprocess.Popen(f'cmd /d /s /c ""{sys.executable}" -c "{code}" orch_mcp.py"')
+    try:
+        assert child.pid in orch_os.children(me)
+        assert child.pid not in orch_os.children(child.pid)
+        assert orch_os.comm(me) and me in orch_os.named(orch_os.comm(me))
+        if wrapped:
+            deadline = time.time() + 15
+            while time.time() < deadline and not [
+                    p for p in orch_os.children(me) if orch_os.parent(p) == wrapped.pid]:
+                time.sleep(0.05)
+            [inner] = [p for p in orch_os.children(me) if orch_os.parent(p) == wrapped.pid]
+            assert orch_os.comm(inner) != "cmd"
+    finally:
+        child.kill()
+        child.wait()
+        if wrapped:
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(wrapped.pid)], capture_output=True,
+                           check=False)
+            wrapped.wait()
+
+
 def test_checking_a_process_does_not_signal_it():
     child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
     try:

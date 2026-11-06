@@ -894,10 +894,8 @@ def orch_loaded(pid):
     started before the server was registered has it in .claude.json but not loaded."""
     if not pid:
         return False
-    for proc in orch_os.pids():
+    for proc in orch_os.children(pid):
         try:
-            if orch_os.parent(proc) != pid:
-                continue
             argv = orch_os.argv(proc)
             if (argv and os.path.basename(argv[0]).startswith("python")
                     and any(os.path.basename(a) == "orch_mcp.py" for a in argv[1:])):
