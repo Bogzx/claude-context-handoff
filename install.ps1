@@ -13,10 +13,11 @@ New-Item -ItemType Directory -Force $hooks, $bin | Out-Null
 Copy-Item hooks\*.py $hooks -Force
 
 # orch for PowerShell and cmd (orch.cmd) and for Git Bash, the shell of Claude's Bash tool (orch).
-# WriteAllText: no BOM, and sh needs its LF.
+# WriteAllText: no BOM, and sh needs its LF. The exports stop Git Bash rewriting an argument that
+# starts with / into a Windows path, so `orch answer ID /exit` stays /exit.
 $orch = Join-Path $hooks 'orch.py'
 [IO.File]::WriteAllText("$bin\orch.cmd", "@`"$python`" -X utf8 `"$orch`" %*`r`n")
-[IO.File]::WriteAllText("$bin\orch", "#!/bin/sh`nexec `"$($python -replace '\\', '/')`" -X utf8 `"$($orch -replace '\\', '/')`" `"`$@`"`n")
+[IO.File]::WriteAllText("$bin\orch", "#!/bin/sh`nexport MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*'`nexec `"$($python -replace '\\', '/')`" -X utf8 `"$($orch -replace '\\', '/')`" `"`$@`"`n")
 if (($env:PATH -split ';') -notcontains $bin) { Write-Warning "$bin is not on PATH: orch won't be found" }
 
 & $python -X utf8 (Join-Path $hooks 'context-handoff-install.py')
