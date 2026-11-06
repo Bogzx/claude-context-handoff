@@ -2,10 +2,16 @@
 # Install or update the context-handoff hooks, orch, its MCP server and its watchdog timer.
 #   ./install.sh                  this machine
 #   ./install.sh HOST [HOST ...]  other machines over ssh, e.g. ./install.sh user@host2 user@host3
+# On Windows (Git Bash) "this machine" is install.ps1; the ssh form still installs on Linux hosts.
 set -euo pipefail
 cd "$(dirname "$0")"
+if [ $# -eq 0 ]; then
+  case "$(uname -s)" in
+    MINGW*|MSYS*|CYGWIN*) exec powershell.exe -NoProfile -ExecutionPolicy Bypass -File install.ps1 ;;
+  esac
+fi
 hooks=(hooks/context-handoff.py hooks/context-handoff-install.py hooks/orch.py hooks/orch_mcp.py
-       hooks/orch_usage.py hooks/orch_serve.py hooks/orch_push.py hooks/orch_new.py)
+       hooks/orch_usage.py hooks/orch_serve.py hooks/orch_push.py hooks/orch_new.py hooks/orch_os.py)
 units=(systemd/orch-watchdog.service systemd/orch-watchdog.timer systemd/orch-serve.service)
 files=("${hooks[@]}" "${units[@]}" install.sh)
 if [ $# -eq 0 ]; then

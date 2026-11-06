@@ -30,6 +30,7 @@ from types import SimpleNamespace
 from urllib.parse import quote, urlencode
 
 import orch
+import orch_os
 
 V = "1"  # envelope version
 SA_FILE = Path.home() / ".config" / "orch" / "firebase-sa.json"
@@ -260,7 +261,7 @@ def save_phones(phones):
     fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w") as f:
         json.dump(phones, f, indent=1)
-    os.replace(tmp, PHONES)
+    orch_os.replace(tmp, PHONES)
 
 
 # --- fitting a message into 4 KB -----------------------------------------------------------------

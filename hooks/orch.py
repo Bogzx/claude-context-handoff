@@ -12,7 +12,8 @@ at every turn end (background tasks still running, last message). From those two
   orch park       a worker on standby, with a reason (and an end); unparked workers don't idle.
   orch ask        a question for the owner, with options: logged and pushed, the fleet keeps
                   working; `orch answer <id> <text>` records the answer and prompts the asker.
-  orch watchdog   run every 5 minutes by a systemd user timer, outside any Claude session:
+  orch watchdog   run every 5 minutes by a systemd user timer (a scheduled task on Windows),
+                  outside any Claude session:
                   prompts an idle orchestrator whose workers sit idle, and alerts the owner
                   when it is gone, blocked or not acting.
   orch decisions  the pane's current decision log, parsed (who, what, why, superseded).
@@ -37,7 +38,6 @@ import hashlib
 import json
 import os
 import re
-import shlex
 import shutil
 import socket
 import subprocess
@@ -45,6 +45,9 @@ import sys
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import orch_os
 
 ROOT = Path.home() / ".claude" / "handoffs"
 IDLE_GRACE = 10 * 60  # a worker idle this long with nothing assigned gets the orchestrator nudged
@@ -115,7 +118,7 @@ def save(path, data):
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f".{path.name}.{os.getpid()}")
     tmp.write_text(json.dumps(data, indent=1))
-    os.replace(tmp, path)
+    orch_os.replace(tmp, path)
 
 
 class Refused(SystemExit):
@@ -135,7 +138,8 @@ def die(text):
 
 def herdr(*args, timeout=60):
     binary = shutil.which("herdr") or str(Path.home() / ".local" / "bin" / "herdr")
-    return subprocess.run([binary, *args], capture_output=True, text=True, timeout=timeout,
+    return subprocess.run([binary, *args], capture_output=True, encoding="utf-8", errors="replace",
+                          timeout=timeout,
                           check=False)
 
 
@@ -348,7 +352,7 @@ def emit(kind, title, body, pane=None, push=False, **extra):
         str(ROOT / "notify") if os.access(ROOT / "notify", os.X_OK) else "")
     if command:
         try:
-            subprocess.run(shlex.split(command) + [title, body], capture_output=True, timeout=20,
+            subprocess.run(orch_os.split(command) + [title, body], capture_output=True, timeout=20,
                            env=dict(os.environ, ORCH_EVENT_KIND=kind, ORCH_EVENT=json.dumps(event)),
                            check=False)
         except (OSError, subprocess.SubprocessError):
@@ -392,8 +396,7 @@ def status_of(pane):
 
 # --- accounts (claude-acc N: account 1 is ~/.claude, account N is ~/.claude-N) ----------------
 
-def account_dir(account):
-    return Path.home() / (".claude" if str(account) == "1" else f".claude-{account}")
+account_dir = orch_os.account_dir
 
 
 def parse_until(text, at):
@@ -1355,7 +1358,11 @@ def set_name(account, name):
 
 
 def claude_processes():
-    """The /proc folder of every claude process on this machine, in a herdr pane or not."""
+    """The /proc folder (on Windows, the pid) of every claude process on this machine, in a herdr
+    pane or not."""
+    if orch_os.WINDOWS:
+        yield from orch_os.named("claude")
+        return
     for proc in PROC.iterdir():
         try:
             if proc.name.isdigit() and (proc / "comm").read_text().strip() == "claude":
@@ -1371,15 +1378,15 @@ def pane_claudes():
     import orch_usage
     out = {}
     for proc in claude_processes():
+        pid = proc if orch_os.WINDOWS else int(proc.name)
         try:
-            env = dict(x.split("=", 1) for x in
-                       (proc / "environ").read_bytes().decode(errors="replace").split("\0")
-                       if "=" in x)
+            env = orch_os.environ(pid) if orch_os.WINDOWS else dict(
+                x.split("=", 1) for x in
+                (proc / "environ").read_bytes().decode(errors="replace").split("\0") if "=" in x)
         except OSError:
             continue
         if env.get("HERDR_PANE_ID"):
-            out[env["HERDR_PANE_ID"]] = (int(proc.name),
-                                         orch_usage.account_of(env.get("CLAUDE_CONFIG_DIR")))
+            out[env["HERDR_PANE_ID"]] = (pid, orch_usage.account_of(env.get("CLAUDE_CONFIG_DIR")))
     return out
 
 
@@ -1448,8 +1455,8 @@ def switch_job(pane, account, agent):
 
 def is_claude(pid):
     try:
-        return Path(f"/proc/{int(pid)}/comm").read_text().strip() == "claude"
-    except (OSError, TypeError, ValueError):
+        return orch_os.comm(int(pid)) == "claude"
+    except (TypeError, ValueError):
         return False
 
 
