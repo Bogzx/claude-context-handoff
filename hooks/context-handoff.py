@@ -722,7 +722,10 @@ def respawn(job):
             # Typed into the pane's shell, like the original launch; the env prefix keeps the
             # account that claude-acc selected (or the one queued by orch account), and the
             # lineage, for this session only.
-            prefix = "".join(f"{k}={shlex.quote(v)} " for k, v in job.get("env", {}).items())
+            env = job.get("env", {})
+            prefix = "".join(f"{k}={shlex.quote(v)} " for k, v in env.items())
+            if "CLAUDE_CONFIG_DIR" not in env:  # unset means account 1: drop the shell's export
+                prefix = "env -u CLAUDE_CONFIG_DIR " + prefix
             command = prefix + " ".join(shlex.quote(a) for a in ["claude", *job["args"]])
         herdr("pane", "run", pane, command)
         blocked, waiting = 0, False
