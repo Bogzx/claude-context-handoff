@@ -37,6 +37,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import orch
+import orch_os
 
 READY_WAIT = 90  # seconds for the new agent to come up, as a takeover's
 EXIT_WAIT = 15  # seconds for a Claude to quit (cancel, or a restart on another account)
@@ -112,7 +113,9 @@ def one_line(text):
 
 def tilde(path):
     home = str(Path.home())
-    return "~" + path[len(home):] if path == home or path.startswith(home + "/") else path
+    if path == home or path.startswith(home + os.sep):
+        return "~" + path[len(home):].replace(os.sep, "/")
+    return path
 
 
 def under(path, root):
@@ -234,9 +237,8 @@ def accept(rec):
 def spawn(sid):
     """Run the saved start detached (the gateway: it may wait 15 minutes at a dialog)."""
     with open(orch.STARTS / sid / "start.log", "a") as log:
-        subprocess.Popen([sys.executable, str(Path(__file__).resolve()), sid],
-                         stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
-                         start_new_session=True)
+        orch_os.spawn_detached([sys.executable, str(Path(__file__).resolve()), sid],
+                               stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT)
 
 
 def log_entries(goal, rules, at):
@@ -347,7 +349,7 @@ def start(rec, dry=False):
                     return 1
                 rec.update(tab=(result.get("tab") or {}).get("tab_id"), pane=pane)
             h = hook()
-            base = orch.ROOT / rec["cwd"].strip("/").replace("/", "-").replace(":", "-")
+            base = orch.ROOT / orch_os.project_slug(rec["cwd"])
             if dry:
                 rec["lineage"] = str(base / f"{pane}-<time>-{rec['session'][:8]}")
                 print(brief_text(rec))
@@ -376,9 +378,8 @@ def start(rec, dry=False):
                 args = ["--session-id", rec["session"]]
                 args += ["--model", rec["model"]] if rec["model"] else []
                 args += ["--effort", rec["effort"]] if rec["effort"] else []
-                command = (f"HANDOFF_LINEAGE={shlex.quote(rec['lineage'])} "
-                           + " ".join(shlex.quote(a) for a in [claude_acc(), rec["account"],
-                                                               *args]))
+                env, argv = orch_os.account_command(rec["account"], args)
+                command = orch_os.pane_line(pane, {"HANDOFF_LINEAGE": rec["lineage"], **env}, argv)
                 if not dry:
                     orch.herdr("pane", "run", pane, command)
                 step("claude", "doing", command)
@@ -595,13 +596,7 @@ def running(pid):
     """Whether the start's process is alive (a start left `doing` by a killed process is not)."""
     if not pid:
         return True  # not recorded: assume it runs
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except OSError:
-        return True
-    return True
+    return orch_os.running(pid)
 
 
 def cannot_start(env):
@@ -610,6 +605,8 @@ def cannot_start(env):
         return "starts from the app are off: ORCH_START_ROOTS is not set in ~/.config/orch/.env"
     if orch.agents() is None:
         return "herdr isn't running"
+    if orch_os.WINDOWS:  # starts claude itself: orch_os.account_command
+        return None if shutil.which("claude") else "claude is not installed"
     if not os.access(claude_acc(), os.X_OK):
         return "claude-acc is not installed"
     return None

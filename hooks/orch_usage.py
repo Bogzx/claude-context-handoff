@@ -14,13 +14,15 @@ mapped session -> pane -> run through the status files, lineage folders, herdr a
 Costs are API-equivalent estimates from PRICES, not what a subscription bills.
 """
 import calendar
-import fcntl
 import json
 import os
 import socket
 import sys
 import time
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import orch_os
 
 HISTORY_EVERY = 5 * 60  # usage-history.jsonl: at most one line per account this often
 WINDOWS = {"five_hour": 5 * 3600, "seven_day": 7 * 86400}
@@ -67,18 +69,10 @@ def save(path, data, indent=1):
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f".{path.name}.{os.getpid()}")
     tmp.write_text(json.dumps(data, indent=indent))
-    os.replace(tmp, path)
+    orch_os.replace(tmp, path)
 
 
-def account_of(config_dir):
-    """The account a CLAUDE_CONFIG_DIR belongs to (claude-acc N), as a string: unset is "1"."""
-    if not config_dir:
-        return "1"
-    path = os.path.normpath(os.path.expanduser(config_dir))
-    if path == str(Path.home() / ".claude"):
-        return "1"
-    name = os.path.basename(path)
-    return name[len(".claude-"):] if name.startswith(".claude-") else path
+account_of = orch_os.account_of
 
 
 # --- capture (statusline) ----------------------------------------------------------------------
@@ -343,7 +337,7 @@ def scan(root, projects, at, agents):
     session; returns the cache."""
     root.mkdir(parents=True, exist_ok=True)
     with open(root / ".usage-cache.lock", "w") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
+        orch_os.lock(lock)
         cache = load(root / "usage-cache.json")
         if cache.get("version") != 1:
             cache = {"version": 1, "files": {}, "buckets": {}, "sessions": {}}
