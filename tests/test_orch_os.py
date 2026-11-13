@@ -25,6 +25,17 @@ def test_shell_lines_set_the_env_for_the_command_alone():
     assert orch_os.shell_line({}, ["claude"], "powershell") == "& 'claude'"
 
 
+def test_a_command_runs_without_a_variable_the_shell_exports():
+    command = orch_os.without_env("ORCH_T", ["sh", "-c", "echo \"[$ORCH_T]\""])
+    if orch_os.WINDOWS:  # shortcut: no unset for one command there
+        assert command == ["sh", "-c", "echo \"[$ORCH_T]\""]
+        return
+    line = orch_os.shell_line({"A": "1"}, command)
+    out = subprocess.run(["sh", "-c", line], env={**os.environ, "ORCH_T": "/home/u/.claude-2"},
+                         capture_output=True, text=True, timeout=20, check=True).stdout
+    assert out == "[]\n"
+
+
 @windows
 def test_a_pane_line_is_in_the_panes_own_shell(monkeypatch):
     for shell, start in (("powershell", "$env:A='1'; & 'claude'"), ("cmd", 'set "A=1" & claude'),

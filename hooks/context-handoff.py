@@ -708,7 +708,11 @@ def respawn(job):
             # Typed into the pane's shell, like the original launch; the env prefix keeps the
             # account that claude-acc selected (or the one queued by orch account), and the
             # lineage, for this session only.
-            command = orch_os.pane_line(pane, job.get("env", {}), ["claude", *job["args"]])
+            env = job.get("env", {})
+            argv = ["claude", *job["args"]]
+            if "CLAUDE_CONFIG_DIR" not in env:  # unset means account 1: drop the shell's export
+                argv = orch_os.without_env("CLAUDE_CONFIG_DIR", argv)
+            command = orch_os.pane_line(pane, env, argv)
         herdr("pane", "run", pane, command)
         blocked, waiting = 0, False
         deadline = time.time() + 90
