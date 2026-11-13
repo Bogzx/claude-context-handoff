@@ -64,7 +64,8 @@ The relaunch keeps the original command-line flags but drops the session identit
 `--session-id`, `--fork-session`) and the old initial prompt. The model is taken from the transcript, so a `/model`
 switch carries over, and the effort comes from the hook input or `$CLAUDE_EFFORT`. The account carries over through
 `CLAUDE_CONFIG_DIR`, which `claude-acc N` sets for accounts above 1. It goes in as a prefix on the
-command only, so a later command in the same pane is not affected.
+command only, so a later command in the same pane is not affected. Account 1 is the unset default, so on Linux its
+command starts with `env -u CLAUDE_CONFIG_DIR`: a shell that exports another account's folder would otherwise win.
 
 Every takeover is logged in `~/.claude/handoffs/respawn.log` and `events.jsonl`. A failure is logged there too,
 raises a herdr notification and goes to the owner's notify command (see [Alerts](#alerts)). A postponed takeover is

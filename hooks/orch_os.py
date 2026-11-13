@@ -306,6 +306,13 @@ def shell_line(env, command, shell="sh"):
             + " ".join(shlex.quote(a) for a in command))
 
 
+def without_env(name, command):
+    """`command`, run without the variable `name` even when the pane's shell exports it.
+    shortcut: Linux only; Windows' shells have no unset for one command, and no Windows pane has
+    been seen to keep a CLAUDE_CONFIG_DIR."""
+    return command if WINDOWS else ["env", "-u", name, *command]
+
+
 def pane_line(pane, env, command):
     """shell_line for what runs in this herdr pane. Only Windows has to ask which shell that is."""
     return shell_line(env, command, pane_shell(pane) if WINDOWS else "sh")

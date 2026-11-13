@@ -368,6 +368,16 @@ def test_respawn_archives_into_the_lineage_and_relaunches_with_it(hook, takeover
     assert event["kind"] == "respawn" and event["pane"] == PANE
 
 
+def test_respawn_of_account_1_clears_the_shells_config_dir(hook, takeover, herdr_stub):
+    calls, _ = herdr_stub
+    takeover.job["env"].pop("CLAUDE_CONFIG_DIR")  # account 1 is the unset default
+    lineage = takeover()
+
+    [command] = [c[3] for c in calls() if c[:2] == ["pane", "run"]]
+    assert command == (f"HANDOFF_LINEAGE={lineage} env -u CLAUDE_CONFIG_DIR "
+                       "claude --model claude-opus-5-5")
+
+
 def test_respawn_presses_enter_when_the_prompt_did_not_start_the_agent(hook, takeover,
                                                                        herdr_stub):
     calls, configure = herdr_stub

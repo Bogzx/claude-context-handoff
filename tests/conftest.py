@@ -36,6 +36,7 @@ if os.name == "nt":
     SKIP = {
         "test_account_of[/opt/other-/opt/other]": "a POSIX path",
         "test_respawn_archives_into_the_lineage_and_relaunches_with_it": LINE,
+        "test_respawn_of_account_1_clears_the_shells_config_dir": LINE,
         "test_a_queued_account_switch_applies_at_the_takeover": LINE,
         "test_account_switch_now_resumes_the_session_on_the_other_account": LINE,
         "test_new_starts_an_orchestrator_with_its_brief_log_and_run": LINE,
